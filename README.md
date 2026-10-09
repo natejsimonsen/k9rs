@@ -20,11 +20,15 @@ brew install natejsimonsen/k9rs/k9rs
 ### Flox
 
 ```sh
-flox install natejsimonsen/k9rs
+flox install 'github:natejsimonsen/k9rs'
 ```
 
-Apple Silicon Macs only for now. On other systems, use Homebrew, Cargo or a
-prebuilt binary.
+### Nix
+
+```sh
+nix run github:natejsimonsen/k9rs              # run once
+nix profile install github:natejsimonsen/k9rs  # install
+```
 
 ### Cargo
 

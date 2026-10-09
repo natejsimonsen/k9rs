@@ -8,7 +8,7 @@ repository = "https://github.com/natejsimonsen/k9rs"
 readme = "README.md"
 keywords = ["kubernetes", "k8s", "tui", "k9s", "cli"]
 categories = ["command-line-utilities"]
-exclude = [".github", ".flox", "Formula", "ownership.yaml"]
+exclude = [".github", ".flox", "Formula", "ownership.yaml", "flake.nix", "flake.lock"]
 default-run = "k9rs"
 
 [lib]
