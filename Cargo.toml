@@ -1,0 +1,90 @@
+[package]
+name = "k9rs"
+version = "0.50.18"
+edition = "2021"
+description = "A Rust port of k9s, the Kubernetes terminal UI"
+license = "Apache-2.0"
+repository = "https://github.com/natejsimonsen/k9rs"
+readme = "README.md"
+keywords = ["kubernetes", "k8s", "tui", "k9s", "cli"]
+categories = ["command-line-utilities"]
+exclude = [".github", ".flox", "Formula", "ownership.yaml"]
+default-run = "k9rs"
+
+[lib]
+name = "k9rs"
+path = "src/lib.rs"
+
+[[bin]]
+name = "k9rs"
+path = "src/main.rs"
+
+[dependencies]
+# async runtime
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+tokio-stream = "0.1"
+futures = "0.3"
+async-trait = "0.1"
+# kubernetes
+kube = { version = "4", features = ["client", "runtime", "derive", "ws", "config"] }
+k8s-openapi = { version = "0.28", features = ["v1_34"] }
+# tui
+ratatui = "0.30"
+crossterm = { version = "0.29", features = ["event-stream"] }
+unicode-width = "0.2"
+arboard = "3"
+# cli / config
+clap = { version = "4", features = ["derive", "env"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+dirs = "6"
+shlex = "1"
+which = "7"
+# text / matching
+regex = "1"
+fuzzy-matcher = "0.3"
+chrono = { version = "0.4", features = ["serde"] }
+humantime = "2"
+# errors / logging
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-appender = "0.2"
+# misc
+http = "1"
+bytes = "1"
+rand = "0.9"
+semver = "1"
+hyper = { version = "1", features = ["client", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+base64 = "0.22"
+rustls-native-certs = "0.8"
+secrecy = "0.10"
+tempfile = "3"
+libc = "0.2"
+jiff = "0.2"
+
+[dev-dependencies]
+pretty_assertions = "1"
+tower-test = "0.4"
+tower = "0.5"
+hyper = { version = "1", features = ["server", "http1"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+# Keep dev/test artifacts small: no debuginfo, no incremental cache.
+[profile.dev]
+debug = 0
+incremental = false
+
+[profile.test]
+debug = 0
+incremental = false

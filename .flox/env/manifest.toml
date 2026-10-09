@@ -1,0 +1,20 @@
+schema-version = "1.14.0"
+
+[install]
+cargo.pkg-path = "cargo"
+rustc.pkg-path = "rustc"
+libiconv.pkg-path = "libiconv"
+libiconv.systems = ["aarch64-darwin", "x86_64-darwin"]
+
+[build.k9rs]
+description = "A Rust port of k9s, the Kubernetes terminal UI"
+version = "0.50.18"
+license = ["Apache-2.0"]
+command = '''
+  cargo build --release --locked
+  mkdir -p $out/bin
+  cp target/release/k9rs $out/bin/k9rs
+'''
+
+[options]
+systems = ["aarch64-darwin", "x86_64-darwin", "aarch64-linux", "x86_64-linux"]
