@@ -23,6 +23,9 @@ brew install natejsimonsen/k9rs/k9rs
 flox install natejsimonsen/k9rs
 ```
 
+Apple Silicon Macs only for now. On other systems, use Homebrew, Cargo or a
+prebuilt binary.
+
 ### Cargo
 
 Needs a Rust toolchain ([rustup.rs](https://rustup.rs)).
