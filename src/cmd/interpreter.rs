@@ -18,8 +18,6 @@ pub(crate) const CONTEXT_KEY: &str = "context";
 const FUZZY_FLAG: &str = "-f";
 const FILTER_FLAG: &str = "/";
 const CONTEXT_FLAG: &str = "@";
-const NS_FLAG: &str = "-n";
-const LABEL_FLAG: &str = "-l";
 const LABEL_FLAGS: [&str; 5] = ["=", "==", "!=", " in ", " notin "];
 
 const COW_CMD: &str = "cow";
@@ -146,17 +144,8 @@ impl Interpreter {
                 }
             } else if let Some(c) = a.strip_prefix(CONTEXT_FLAG) {
                 args.set(CONTEXT_KEY, c.to_string());
-            } else if a == NS_FLAG && i + 1 < aa.len() {
-                // k9rs: explicit `-n ns`.
-                i += 1;
-                args.set(NS_KEY, aa[i].trim().to_lowercase());
-            } else if a == LABEL_FLAG && i + 1 < aa.len() {
-                // k9rs: explicit `-l selector`.
-                i += 1;
-                args.set(LABEL_KEY, aa[i].trim().to_lowercase());
             } else if is_label_arg(a) {
-                let l = a.strip_prefix(LABEL_FLAG).unwrap_or(a);
-                args.set(LABEL_KEY, l.to_lowercase());
+                args.set(LABEL_KEY, a.to_lowercase());
             } else if self.is_context_cmd() {
                 args.set(CONTEXT_KEY, a.to_string());
             } else if self.is_dir_cmd() {
@@ -577,14 +566,14 @@ mod tests {
                 args(&[(CONTEXT_KEY, "Dev")]),
             ),
             (Interpreter::new("apply -f"), vec![], args(&[])),
-            // k9rs extensions.
+            // k9s has no -n/-l flags: they land in the ns slot (last wins).
             (po.clone(), s(&["-n", "Fred"]), args(&[(NS_KEY, "fred")])),
             (
                 po.clone(),
                 s(&["-l", "app=x"]),
-                args(&[(LABEL_KEY, "app=x")]),
+                args(&[(NS_KEY, "-l"), (LABEL_KEY, "app=x")]),
             ),
-            (po.clone(), s(&["-lapp=x"]), args(&[(LABEL_KEY, "app=x")])),
+            (po.clone(), s(&["-lapp=x"]), args(&[(LABEL_KEY, "-lapp=x")])),
         ];
         for (i, aa, e) in cases {
             assert_eq!(i.new_args(&aa), e, "{aa:?}");

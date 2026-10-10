@@ -3,35 +3,52 @@
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 
 use super::text::{draw_segs, fill, seg, segs_width, Align, Seg};
 use crate::config::Styles;
 
 /// Split a plain title (`name(ns)[count] <filter>`) into k9s colored segments.
-pub(crate) fn title_segs(title: &str, filter: &str, styles: &Styles) -> Vec<Seg> {
+/// `title_fg` is the view's box title color, used for `default` skin colors.
+pub(crate) fn title_segs(title: &str, filter: &str, title_fg: Color, styles: &Styles) -> Vec<Seg> {
+    // A `default` skin color is `-` in k9s markup: the box title color.
+    let fg = |c: Color| if c == Color::Reset { title_fg } else { c };
+    let bg = if styles.title_bg == Color::Reset {
+        styles.bg
+    } else {
+        styles.title_bg
+    };
     // `[fg:bg:-]` resets attributes, so the bold border does not leak in.
     let base = Style::default()
-        .fg(styles.title_fg)
-        .bg(styles.title_bg)
+        .fg(fg(styles.title_fg))
+        .bg(bg)
         .remove_modifier(Modifier::all());
     let bold = base.add_modifier(Modifier::BOLD);
     let hilite = Style::default()
-        .fg(styles.title_highlight)
-        .bg(styles.title_bg)
+        .fg(fg(styles.title_highlight))
+        .bg(bg)
         .add_modifier(Modifier::BOLD);
     let counter = Style::default()
-        .fg(styles.title_counter)
-        .bg(styles.title_bg)
+        .fg(fg(styles.title_counter))
+        .bg(bg)
         .add_modifier(Modifier::BOLD);
     let filter_style = Style::default()
-        .fg(styles.title_filter)
-        .bg(styles.title_bg)
+        .fg(fg(styles.title_filter))
+        .bg(bg)
         .add_modifier(Modifier::REVERSED);
 
     let t = title.trim();
     if t.is_empty() {
         return Vec::new();
+    }
+    // view/help.go helpTitleFmt " [aqua::b]%s ": palette aqua, not the skin.
+    if t == "Help" {
+        // No bg in the tag: the help table background (body bg).
+        let aqua = Style::default()
+            .fg(Color::LightCyan)
+            .bg(styles.bg)
+            .add_modifier(Modifier::BOLD);
+        return vec![seg(" ", base.bg(styles.bg)), seg(t, aqua), seg(" ", aqua)];
     }
     let (main, mut filt) = split_filter(t);
     if filt.is_none() && !filter.is_empty() {
@@ -166,15 +183,21 @@ pub(crate) fn draw_frame(
 
 /// tview Box without focus: a frame a view drew in the focus color gets
 /// the plain border color (the `:`/`/` prompt or a dialog has focus).
-pub(crate) fn blur_frame(buf: &mut Buffer, area: Rect, styles: &Styles) {
+pub(crate) fn blur_frame(buf: &mut Buffer, area: Rect, styles: &Styles, color: Color) {
     if area.width < 2 || area.height < 2 {
         return;
     }
     let (l, r, t, b) = (area.left(), area.right() - 1, area.top(), area.bottom() - 1);
     let mut fix = |x: u16, y: u16| {
         if let Some(c) = buf.cell_mut((x, y)) {
-            if c.fg == styles.border_focus {
-                c.fg = styles.border;
+            // Border glyphs only: title text may share the focus color.
+            let line = c
+                .symbol()
+                .chars()
+                .next()
+                .is_some_and(|ch| ('\u{2500}'..='\u{257F}').contains(&ch));
+            if line && c.fg == styles.border_focus {
+                c.fg = color;
             }
         }
     };
@@ -200,7 +223,7 @@ mod tests {
     #[test]
     fn parses_k9s_titles() {
         let st = Styles::default();
-        let s = title_segs(" pods(default)[12] ", "", &st);
+        let s = title_segs(" pods(default)[12] ", "", st.fg, &st);
         assert_eq!(text(&s), " pods(default)[12] ");
         assert_eq!(s[1].style.fg, Some(st.title_fg));
         assert_eq!(s[2].text, "default");
@@ -210,32 +233,33 @@ mod tests {
         assert!(s[3].style.sub_modifier.contains(Modifier::BOLD));
         assert!(s[1].style.add_modifier.contains(Modifier::BOLD));
 
-        let s = title_segs("nodes[3]", "", &st);
+        let s = title_segs("nodes[3]", "", st.fg, &st);
         assert_eq!(text(&s), " nodes[3] ");
 
-        let s = title_segs("pods(all)[1] </nginx>", "", &st);
+        let s = title_segs("pods(all)[1] </nginx>", "", st.fg, &st);
         assert_eq!(text(&s), " pods(all)[1] </nginx> ");
         let f = s.iter().find(|s| s.text == "/nginx").unwrap();
         assert_eq!(f.style.fg, Some(st.title_filter));
         assert!(f.style.add_modifier.contains(Modifier::REVERSED));
 
-        let s = title_segs("Describe(default/nginx)", "", &st);
+        let s = title_segs("Describe(default/nginx)", "", st.fg, &st);
         assert_eq!(text(&s), " Describe(default/nginx) ");
 
-        let s = title_segs("Help", "", &st);
+        let s = title_segs("Help", "", st.fg, &st);
         assert_eq!(text(&s), " Help ");
         assert!(s[1].style.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(s[1].style.fg, Some(ratatui::style::Color::LightCyan));
 
-        let s = title_segs("pods(default)[2]", "fred", &st);
+        let s = title_segs("pods(default)[2]", "fred", st.fg, &st);
         assert_eq!(text(&s), " pods(default)[2] </fred> ");
-        assert!(title_segs("", "", &st).is_empty());
+        assert!(title_segs("", "", st.fg, &st).is_empty());
     }
 
     #[test]
     fn frame_border_and_title() {
         let st = Styles::default();
         let mut buf = Buffer::empty(Rect::new(0, 0, 30, 5));
-        let t = title_segs("pods(default)[1]", "", &st);
+        let t = title_segs("pods(default)[1]", "", st.fg, &st);
         let inner = {
             let a = buf.area;
             draw_frame(&mut buf, a, &t, true, &st)
@@ -247,7 +271,7 @@ mod tests {
         assert_eq!(fg(&buf, 0, 0), st.border_focus);
         {
             let a = buf.area;
-            blur_frame(&mut buf, a, &st);
+            blur_frame(&mut buf, a, &st, st.border);
         }
         assert_eq!(fg(&buf, 0, 0), st.border);
         assert_eq!(row(&buf, 4), format!("└{}┘", "─".repeat(28)));
@@ -257,5 +281,40 @@ mod tests {
             draw_frame(&mut buf, a, &t, false, &st)
         };
         assert_eq!(fg(&buf, 0, 0), st.border);
+    }
+
+    /// Blur recolors border glyphs only, even when the title shares the
+    /// focus color (solarized-16: title fg == focusColor).
+    #[test]
+    fn blur_keeps_title_colors() {
+        let mut st = Styles::default();
+        st.title_fg = st.border_focus;
+        let mut buf = Buffer::empty(Rect::new(0, 0, 30, 5));
+        let t = title_segs("pods(default)[1]", "", st.fg, &st);
+        let a = buf.area;
+        draw_frame(&mut buf, a, &t, true, &st);
+        blur_frame(&mut buf, a, &st, st.border);
+        let (x, y) = find(&buf, "pods(").unwrap();
+        assert_eq!(fg(&buf, x, y), st.border_focus);
+        assert_eq!(fg(&buf, 0, 0), st.border);
+    }
+
+    /// `default` skin colors (`-` in k9s markup) take the box title color.
+    #[test]
+    fn default_colors_use_title_color() {
+        let mut st = Styles {
+            title_fg: Color::Reset,
+            title_counter: Color::Reset,
+            title_bg: Color::Reset,
+            ..Default::default()
+        };
+        let s = title_segs("pods(default)[2]", "", Color::LightCyan, &st);
+        assert_eq!(s[1].style.fg, Some(Color::LightCyan));
+        assert_eq!(s[5].style.fg, Some(Color::LightCyan));
+        assert_eq!(s[1].style.bg, Some(st.bg));
+        // Help: [aqua::b] on the table (body) background.
+        st.title_bg = Color::Rgb(1, 2, 3);
+        let s = title_segs("Help", "", st.fg, &st);
+        assert_eq!(s[1].style.bg, Some(st.bg));
     }
 }

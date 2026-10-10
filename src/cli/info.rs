@@ -8,6 +8,8 @@ use crate::config::Config;
 
 /// ANSI cyan (color.Cyan).
 pub const CYAN: u8 = 36;
+/// ANSI red (color.Red).
+pub const RED: u8 = 31;
 
 /// color.Colorize.
 pub fn colorize(s: &str, c: u8) -> String {
@@ -22,6 +24,13 @@ fn print_logo(out: &mut dyn Write, c: u8) -> std::io::Result<()> {
         writeln!(out, "{}", colorize(l, c))?;
     }
     writeln!(out)
+}
+
+/// cmd/root.go recover: red logo, then `Boom!! <err>.`.
+pub fn print_boom(out: &mut dyn Write, err: &str) -> std::io::Result<()> {
+    print_logo(out, RED)?;
+    write!(out, "{}", colorize("Boom!! ", RED))?;
+    writeln!(out, "{err}.")
 }
 
 /// printTuple: `color` 0 prints plain.
@@ -84,6 +93,20 @@ pub fn print_info(
     print_tuple(out, w, "ScreenDumps", &p(screen_dumps), CYAN)
 }
 
+/// Go *fs.PathError text, e.g. `open /x: no such file or directory`.
+pub fn go_path_error(op: &str, path: &Path, e: &std::io::Error) -> String {
+    let mut msg = e.to_string();
+    if let Some(i) = msg.find(" (os error ") {
+        msg.truncate(i);
+    }
+    let mut cs = msg.chars();
+    let msg = match cs.next() {
+        Some(c) => c.to_lowercase().chain(cs).collect(),
+        None => msg,
+    };
+    format!("{op} {}: {msg}", path.display())
+}
+
 /// getScreenDumpDirForInfo: the config file `screenDumpDir`, else `dumps`.
 pub fn screen_dump_dir_for_info(config_file: Option<&Path>, dumps: &Path) -> PathBuf {
     let Some(f) = config_file.filter(|f| !f.as_os_str().is_empty()) else {
@@ -92,7 +115,8 @@ pub fn screen_dump_dir_for_info(config_file: Option<&Path>, dumps: &Path) -> Pat
     let bb = match std::fs::read_to_string(f) {
         Ok(b) => b,
         Err(e) => {
-            tracing::error!(error = %e, "Unable to reads k9s config file");
+            let e = go_path_error("open", f, &e);
+            tracing::error!(error = %e, "Unable to reads k9rs config file");
             return dumps.to_path_buf();
         }
     };
@@ -105,7 +129,7 @@ pub fn screen_dump_dir_for_info(config_file: Option<&Path>, dumps: &Path) -> Pat
         Ok(Some(k)) => Config { k9s: k },
         Ok(None) => return dumps.to_path_buf(),
         Err(e) => {
-            tracing::error!(error = %e, "Unable to unmarshal k9s config file");
+            tracing::error!(error = %e, "Unable to unmarshal k9rs config file");
             return dumps.to_path_buf();
         }
     };
@@ -133,6 +157,15 @@ mod tests {
         assert_eq!(screen_dump_dir_for_info(Some(Path::new("")), d), d);
         assert_eq!(screen_dump_dir_for_info(Some(Path::new("invalid")), d), d);
         assert_eq!(screen_dump_dir_for_info(Some(&td("k9s1.yaml")), d), d);
+    }
+
+    #[test]
+    fn go_errors() {
+        let e = std::fs::read("/definitely/not/here").unwrap_err();
+        assert_eq!(
+            go_path_error("open", Path::new("/definitely/not/here"), &e),
+            "open /definitely/not/here: no such file or directory"
+        );
     }
 
     fn colored(sec: &str, val: &str, width: usize) -> String {
@@ -207,5 +240,17 @@ mod tests {
         }
         assert_eq!(lines[7], "\x1b[36mVersion:\x1b[0m           v0.50.18");
         assert_eq!(colorize("x", 0), "x");
+    }
+
+    #[test]
+    fn boom_message() {
+        let mut out = Vec::new();
+        print_boom(&mut out, "index out of bounds").unwrap();
+        let s = String::from_utf8(out).unwrap();
+        assert!(s.starts_with("\x1b[31m ____  __ ________"), "{s:?}");
+        assert!(
+            s.ends_with("\x1b[31mBoom!! \x1b[0mindex out of bounds.\n"),
+            "{s:?}"
+        );
     }
 }

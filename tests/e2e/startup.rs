@@ -146,18 +146,13 @@ async fn pod_menu_hints() {
     }
 }
 
-/// ui/splash.go LogoSmall.
+/// The K9rs logo in k9s's LogoSmall style: same height, equal-width rows,
+/// the header logo column fits it.
 #[test]
-fn logo_matches_k9s() {
-    assert_eq!(
-        k9rs::logo::LOGO_SMALL,
-        [
-            r" ____  __ ________       ",
-            r"|    |/  /   __   \______",
-            r"|       /\____    /  ___/",
-            r"|    \   \  /    /\___  \",
-            r"|____|\__ \/____//____  /",
-            r"         \/           \/ ",
-        ]
-    );
+fn logo_is_k9rs() {
+    let l = k9rs::logo::LOGO_SMALL;
+    assert_eq!(l.len(), 6);
+    assert!(l.iter().all(|r| r.len() == l[0].len()));
+    assert_eq!(l[1], r"|    |/  /   __   \_______  ______");
+    assert_eq!(l[4], r"|____|\__ \/____/   |__|  /____  /");
 }

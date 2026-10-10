@@ -16,6 +16,7 @@ pub(crate) mod prompt;
 pub(crate) mod splash;
 pub(crate) mod text;
 pub(crate) mod title;
+pub(crate) mod watch;
 
 use super::{Ctx, Hint, View, ViewId};
 
@@ -28,5 +29,14 @@ pub const SHELL_VIEW_ID: ViewId = 0;
 
 /// The help view (`?`): general keys, resource keys (`hints`), navigation, hotkeys.
 pub fn help(ctx: &mut Ctx, hints: Vec<Hint>) -> Box<dyn View> {
-    help::new_help(ctx, hints)
+    help::new_help(ctx, hints, Vec::new())
+}
+
+/// The help view with the top view's ExtraHints (xray emoji legend).
+pub fn help_with_extras(
+    ctx: &mut Ctx,
+    hints: Vec<Hint>,
+    extras: Vec<(String, String)>,
+) -> Box<dyn View> {
+    help::new_help(ctx, hints, extras)
 }

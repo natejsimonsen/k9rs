@@ -88,6 +88,8 @@ pub struct Harness {
     rx: UnboundedReceiver<AppEvent>,
     pub stack: Vec<Box<dyn View>>,
     pub flashes: Vec<(FlashLevel, String)>,
+    /// Logo statuses (app.Status); `None` marks a ClearStatus.
+    pub statuses: Vec<Option<(FlashLevel, String)>>,
     pub dialogs: Vec<Dialog>,
     pub suspends: Vec<Suspended>,
     pub commands: Vec<String>,
@@ -178,6 +180,7 @@ impl Harness {
             rx,
             stack: Vec::new(),
             flashes: Vec::new(),
+            statuses: Vec::new(),
             dialogs: Vec::new(),
             suspends: Vec::new(),
             commands: Vec::new(),
@@ -244,13 +247,33 @@ impl Harness {
             }
             ViewCmd::Quit => self.quit = true,
             ViewCmd::Flash(l, m) => self.flashes.push((l, m)),
+            ViewCmd::Status(l, m) => self.statuses.push(Some((l, m))),
+            ViewCmd::ClearStatus(_) => self.statuses.push(None),
             ViewCmd::Command(s) => self.commands.push(s),
+            ViewCmd::UseContext(n) => self.commands.push(format!("ctx {n}")),
+            ViewCmd::LogoWarn(m) => self.flashes.push((FlashLevel::Warn, m)),
+            ViewCmd::Goto { cmd, path } => {
+                self.commands.push(format!("goto:{cmd}|{path}"));
+                // app.gotoResource(cmd, path, clearStack=false): push the view.
+                if let Ok(mut c) = k9rs::cmd::parse(&cmd, &self.ctx.aliases) {
+                    c.instance = path;
+                    if let Some(ns) = c.namespace.clone().filter(|n| !n.is_empty()) {
+                        self.ctx.namespace = ns;
+                    }
+                    if let Ok(v) = k9rs::ui::browser::open(&mut self.ctx, &c) {
+                        return vec![ViewCmd::Push(v)];
+                    }
+                }
+            }
             ViewCmd::OpenCommandPrompt(s) => self.commands.push(format!("prompt:{s}")),
             ViewCmd::OpenFilterPrompt => self.commands.push("prompt:/".into()),
             ViewCmd::Dialog(d) => self.dialogs.push(d),
             ViewCmd::Suspend { argv, env, .. } => self.suspends.push(Suspended { argv, env }),
             ViewCmd::SetNamespace(ns) => {
                 self.ctx.namespace = if ns == "-" { String::new() } else { ns };
+            }
+            ViewCmd::CloseDialog => {
+                self.dialogs.pop();
             }
             ViewCmd::ToggleHeader
             | ViewCmd::ToggleCrumbs
@@ -516,6 +539,12 @@ impl Shell {
         self.key(KeyEvent::new(c, KeyModifiers::NONE)).await;
     }
 
+    /// Refresh tick then settle.
+    pub async fn tick(&mut self) {
+        self.app.tick();
+        self.settle().await;
+    }
+
     /// Type text without settling between characters.
     pub fn typ(&mut self, s: &str) {
         for c in s.chars() {
@@ -533,7 +562,11 @@ impl Shell {
     }
 
     pub fn render(&mut self) -> Screen {
-        let mut t = Terminal::new(TestBackend::new(W, H)).unwrap();
+        self.render_size(W, H)
+    }
+
+    pub fn render_size(&mut self, w: u16, h: u16) -> Screen {
+        let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
         let app = &mut self.app;
         t.draw(|f| app.draw(f)).unwrap();
         Screen(t.backend().buffer().clone())

@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::{anyhow, Context as _, Result};
+use anyhow::{anyhow, bail, Context as _, Result};
 use kube::api::DynamicObject;
 
 use crate::k8s::{
@@ -37,7 +37,13 @@ pub(crate) struct LoadSpec {
     pub has_metrics: bool,
     pub accessor: SharedAccessor,
     pub renderer: Arc<dyn Renderer>,
-    pub server_table: fn(&crate::k8s::ServerTable, &str) -> (Header, Vec<Row>),
+    pub server_table: fn(
+        &crate::k8s::ServerTable,
+        &str,
+        Option<&crate::config::ViewSetting>,
+    ) -> (Header, Vec<Row>),
+    /// views.yaml settings for this view (custom columns).
+    pub view_setting: Option<crate::config::ViewSetting>,
     pub run: Runner,
     pub aliases: Vec<(Gvr, Vec<String>)>,
     pub port_forwards: Vec<PortForwardInfo>,
@@ -80,6 +86,26 @@ fn s<'a>(v: &'a serde_json::Value, p: &str) -> &'a str {
     v.pointer(p).and_then(|x| x.as_str()).unwrap_or("")
 }
 
+/// `load`, with a panic (hostile data hitting a bug) turned into an error
+/// the view flashes instead of a dead refresh task.
+pub(crate) async fn load_guarded(spec: LoadSpec) -> Result<TableData> {
+    use futures::FutureExt;
+    match std::panic::AssertUnwindSafe(load(spec))
+        .catch_unwind()
+        .await
+    {
+        Ok(r) => r,
+        Err(p) => {
+            let msg = p
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| p.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "unknown panic".into());
+            Err(anyhow!("Boom!! {msg}"))
+        }
+    }
+}
+
 /// Fetch, render and package the table for `spec`.
 pub(crate) async fn load(spec: LoadSpec) -> Result<TableData> {
     let (header, rows) = collect(&spec).await?;
@@ -91,9 +117,9 @@ pub(crate) async fn load(spec: LoadSpec) -> Result<TableData> {
     Ok(td)
 }
 
-fn render(
+fn render<O: std::borrow::Borrow<DynamicObject>>(
     spec: &LoadSpec,
-    objs: &[DynamicObject],
+    objs: &[O],
     mx: Option<&MetricsSnapshot>,
 ) -> (Header, Vec<Row>) {
     let header = spec.renderer.header(&spec.ns);
@@ -165,7 +191,7 @@ async fn collect(spec: &LoadSpec) -> Result<(Header, Vec<Row>)> {
             std::fs::create_dir_all(&spec.dir).ok();
             let dir = spec.dir.to_string_lossy().to_string();
             let mut objs = Vec::new();
-            for e in std::fs::read_dir(&spec.dir).with_context(|| format!("reading {dir}"))? {
+            for e in read_dir(&spec.dir)? {
                 let e = e?;
                 let md = e.metadata()?;
                 let modified: chrono::DateTime<chrono::Utc> = md
@@ -189,33 +215,29 @@ async fn collect(spec: &LoadSpec) -> Result<(Header, Vec<Row>)> {
                 rx.replace_all(&spec.path.replacen('/', "_", 1), "_")
                     .to_string()
             };
-            if let Ok(rd) = std::fs::read_dir(&spec.dir) {
-                for e in rd {
-                    let e = e?;
-                    let file = e.file_name().to_string_lossy().to_string();
-                    if !file.starts_with(&prefix) {
-                        continue;
-                    }
-                    let md = e.metadata()?;
-                    let modified: chrono::DateTime<chrono::Utc> = md
-                        .modified()
-                        .map(Into::into)
-                        .unwrap_or_else(|_| chrono::Utc::now());
-                    let tt: Vec<&str> = file.split('_').collect();
-                    let ns = tt.first().copied().unwrap_or("");
-                    let res = tt.get(1).copied().unwrap_or("");
-                    let path = e.path().to_string_lossy().to_string();
-                    objs.push(pseudo::benchmark(ns, res, &path, &file, modified));
+            for e in read_dir(&spec.dir)? {
+                let e = e?;
+                let file = e.file_name().to_string_lossy().to_string();
+                if !file.starts_with(&prefix) {
+                    continue;
                 }
+                let md = e.metadata()?;
+                let modified: chrono::DateTime<chrono::Utc> = md
+                    .modified()
+                    .map(Into::into)
+                    .unwrap_or_else(|_| chrono::Utc::now());
+                let tt: Vec<&str> = file.split('_').collect();
+                let ns = tt.first().copied().unwrap_or("");
+                let res = tt.get(1).copied().unwrap_or("");
+                let path = e.path().to_string_lossy().to_string();
+                objs.push(pseudo::benchmark(ns, res, &path, &file, modified));
             }
             Ok(render(spec, &objs, None))
         }
         Kind::Dir => {
             let rx = regex::Regex::new(r".*\.(yml|yaml|json)").expect("rx");
             let mut objs = Vec::new();
-            for e in std::fs::read_dir(&spec.dir)
-                .with_context(|| format!("reading {}", spec.dir.display()))?
-            {
+            for e in read_dir(&spec.dir)? {
                 let e = e?;
                 let name = e.file_name().to_string_lossy().to_string();
                 let md = e.metadata()?;
@@ -243,6 +265,10 @@ async fn collect(spec: &LoadSpec) -> Result<(Header, Vec<Row>)> {
                 "list".into(),
                 "-o".into(),
                 "json".into(),
+                // HelmChart.List: list.All with no limit (the CLI caps at 256).
+                "--all".into(),
+                "--max".into(),
+                "0".into(),
             ];
             let ns = list_ns(&spec.ns);
             if ns.is_empty() {
@@ -328,6 +354,33 @@ async fn collect(spec: &LoadSpec) -> Result<(Header, Vec<Row>)> {
             let objs = subjects(acc, kind).await?;
             Ok(render(spec, &objs, None))
         }
+        Kind::ImageScan => {
+            // dao.ImageScan.List: the source's images with a recorded scan.
+            let (gvr, path) = spec
+                .source
+                .clone()
+                .ok_or_else(|| anyhow!("no context path for {:?}", spec.gvr.to_string()))?;
+            let o = acc.get(&gvr, &path).await?;
+            let pod_spec = match gvr.r() {
+                "pods" => o.data.get("spec"),
+                "cronjobs" => o.data.pointer("/spec/jobTemplate/spec/template/spec"),
+                _ => o.data.pointer("/spec/template/spec"),
+            }
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+            let mut objs = Vec::new();
+            if let Some(sc) = crate::vul::scanner() {
+                for img in crate::vul::extract_images(&pod_spec) {
+                    let Some(scan) = sc.get_scan(&img) else {
+                        continue;
+                    };
+                    for r in &scan.rows {
+                        objs.push(pseudo::image_scan(&img, &r.0));
+                    }
+                }
+            }
+            Ok(render(spec, &objs, None))
+        }
         Kind::Reference => {
             let (gvr, path) = spec
                 .source
@@ -361,27 +414,72 @@ fn helm_ctx(spec: &LoadSpec) -> Vec<String> {
     }
 }
 
+/// labels.ConvertSelectorToLabelsMap: `k=v[,k==v]` into a map.
+fn selector_map(s: &str) -> Result<HashMap<String, String>> {
+    let mut m = HashMap::new();
+    for kv in s.split(',').map(str::trim).filter(|kv| !kv.is_empty()) {
+        let (k, v) = kv
+            .split_once("==")
+            .or_else(|| kv.split_once('='))
+            .ok_or_else(|| anyhow!("invalid selector: {kv:?}"))?;
+        m.insert(k.trim().to_string(), v.trim().to_string());
+    }
+    Ok(m)
+}
+
+/// A bad custom column JSONPath fails the refresh, like k9s.
+fn check_columns(vs: Option<&crate::config::ViewSetting>) -> Result<()> {
+    let Some(vs) = vs else {
+        return Ok(());
+    };
+    match crate::render::core::custcol::ColumnSpecs::parse(&vs.columns) {
+        Ok(specs) => specs.check(),
+        // Unparsable definitions are ignored by the renderer (k9s logs them).
+        Err(_) => Ok(()),
+    }
+}
+
 /// Regular API resources (generic server tables or typed renderers).
 async fn k8s_rows(spec: &LoadSpec) -> Result<(Header, Vec<Row>)> {
     let acc = &spec.accessor;
     let ns = list_ns(&spec.ns);
     if spec.renderer.is_generic() && spec.instance.is_empty() {
+        // model/table.go reconcile: view settings ask for full objects.
+        let vs = spec.view_setting.as_ref();
         if let Some(t) = acc
-            .list_table(&spec.gvr, &ns, spec.label.as_deref())
+            .list_table_with(
+                &spec.gvr,
+                &ns,
+                spec.label.as_deref(),
+                vs.is_some(),
+                spec.field.as_deref(),
+            )
             .await?
         {
-            return Ok((spec.server_table)(&t, &spec.ns));
+            if !t.rows.is_empty() {
+                check_columns(vs)?;
+            }
+            return Ok((spec.server_table)(&t, &spec.ns, vs));
         }
     }
+    // Shared with the watch cache: big lists are not copied per refresh.
     let mut objs = if spec.instance.is_empty() {
-        acc.list(&spec.gvr, &ns, spec.label.as_deref()).await?
+        acc.list_shared(&spec.gvr, &ns, spec.label.as_deref())
+            .await?
     } else {
-        vec![acc.get(&spec.gvr, &spec.instance).await?]
+        vec![Arc::new(acc.get(&spec.gvr, &spec.instance).await?)]
     };
-    if let Some(field) = &spec.field {
-        if let Some((k, v)) = field.split_once('=') {
-            let ptr = format!("/{}", k.replace('.', "/"));
-            objs.retain(|o| o.data.pointer(&ptr).and_then(|x| x.as_str()) == Some(v));
+    if !objs.is_empty() {
+        check_columns(spec.view_setting.as_ref())?;
+    }
+    // dao/pod.go List: informer-backed views only honor spec.nodeName, on
+    // pods (labels.ConvertSelectorToLabelsMap); other kinds ignore fields.
+    if let (Some(field), "pods") = (&spec.field, spec.gvr.r()) {
+        let fsel = selector_map(field)?;
+        if let Some(node) = fsel.get("spec.nodeName") {
+            objs.retain(|o| {
+                o.data.pointer("/spec/nodeName").and_then(|x| x.as_str()) == Some(node)
+            });
         }
     }
     if let Some(uid) = &spec.uid {
@@ -410,7 +508,7 @@ async fn k8s_rows(spec: &LoadSpec) -> Result<(Header, Vec<Row>)> {
     };
     if spec.gvr.r() == "nodes" && spec.pod_counting {
         let pods = acc
-            .list(&Gvr::parse("v1/pods"), "", None)
+            .list_shared(&Gvr::parse("v1/pods"), "", None)
             .await
             .unwrap_or_default();
         let mut counts: HashMap<String, i64> = HashMap::new();
@@ -427,7 +525,11 @@ async fn k8s_rows(spec: &LoadSpec) -> Result<(Header, Vec<Row>)> {
                     .get(o.metadata.name.as_deref().unwrap_or(""))
                     .copied()
                     .unwrap_or(0);
-                pseudo::with_field(o, "podCount", serde_json::json!(n))
+                Arc::new(pseudo::with_field(
+                    Arc::unwrap_or_clone(o),
+                    "podCount",
+                    serde_json::json!(n),
+                ))
             })
             .collect();
     }
@@ -517,23 +619,23 @@ async fn rbac_rules(acc: &SharedAccessor, src: &Gvr, path: &str) -> Result<Vec<P
     let rules_of = |o: &DynamicObject| parse_rules(CLUSTER_SCOPE, "-", o.data.get("rules"));
     match src.r() {
         "clusterrolebindings" => {
-            let crb = acc.get(&gvr(CRB), path).await?;
-            let cr = acc.get(&gvr(CR), s(&crb.data, "/roleRef/name")).await?;
+            let crb = factory_get(acc, &gvr(CRB), path).await?;
+            let cr = factory_get(acc, &gvr(CR), s(&crb.data, "/roleRef/name")).await?;
             Ok(rules_of(&cr))
         }
         "rolebindings" => {
-            let rb = acc.get(&gvr(ROB), path).await?;
+            let rb = factory_get(acc, &gvr(ROB), path).await?;
             let role = s(&rb.data, "/roleRef/name");
             if s(&rb.data, "/roleRef/kind") == "ClusterRole" {
-                return Ok(rules_of(&acc.get(&gvr(CR), role).await?));
+                return Ok(rules_of(&factory_get(acc, &gvr(CR), role).await?));
             }
             let ns = rb.metadata.namespace.clone().unwrap_or_default();
             Ok(rules_of(
-                &acc.get(&gvr(RO), &crate::k8s::fqn(&ns, role)).await?,
+                &factory_get(acc, &gvr(RO), &crate::k8s::fqn(&ns, role)).await?,
             ))
         }
-        "clusterroles" => Ok(rules_of(&acc.get(&gvr(CR), path).await?)),
-        "roles" => Ok(rules_of(&acc.get(&gvr(RO), path).await?)),
+        "clusterroles" => Ok(rules_of(&factory_get(acc, &gvr(CR), path).await?)),
+        "roles" => Ok(rules_of(&factory_get(acc, &gvr(RO), path).await?)),
         other => Err(anyhow!("expecting clusterrole/role but found {other}")),
     }
 }
@@ -546,11 +648,41 @@ fn subjects_of(o: &DynamicObject) -> Vec<serde_json::Value> {
         .unwrap_or_default()
 }
 
+/// watch.Factory.List: CanForResource (list) gates the informer lister.
+async fn factory_list(acc: &SharedAccessor, g: &Gvr, ns: &str) -> Result<Vec<DynamicObject>> {
+    if !acc.can(g, ns, "list").await? {
+        bail!(
+            "[list] access denied on resource {}:{}",
+            crate::ui::shell::text::go_quote(ns),
+            crate::ui::shell::text::go_quote(&g.to_string())
+        );
+    }
+    acc.list(g, crate::k8s::clean_namespace(ns), None).await
+}
+
+/// watch.Factory.Get: CanForInstance (get) gates the informer lister.
+async fn factory_get(acc: &SharedAccessor, g: &Gvr, fqn: &str) -> Result<DynamicObject> {
+    let (ns, n) = namespaced(fqn);
+    let ns = if crate::k8s::is_all_namespaces(ns) {
+        ""
+    } else {
+        ns
+    };
+    if !acc.can_named(g, ns, n, "get").await? {
+        bail!(
+            "[get] access denied on resource {}:{}",
+            crate::ui::shell::text::go_quote(ns),
+            crate::ui::shell::text::go_quote(&g.to_string())
+        );
+    }
+    acc.get(g, fqn).await
+}
+
 /// dao.Policy.List: rules granted to a subject through bindings.
 async fn subject_policies(acc: &SharedAccessor, kind: &str, name: &str) -> Result<Vec<PolicyRes>> {
     let (ns, n) = namespaced(name);
-    let crbs = acc.list(&gvr(CRB), "", None).await?;
-    let crs = acc.list(&gvr(CR), "", None).await?;
+    let crbs = factory_list(acc, &gvr(CRB), CLUSTER_SCOPE).await?;
+    let crs = factory_list(acc, &gvr(CR), CLUSTER_SCOPE).await?;
     let mut role_names = Vec::new();
     for crb in &crbs {
         let bns = crb.metadata.namespace.clone().unwrap_or_default();
@@ -571,7 +703,7 @@ async fn subject_policies(acc: &SharedAccessor, kind: &str, name: &str) -> Resul
             ));
         }
     }
-    let rbs = acc.list(&gvr(ROB), "", None).await?;
+    let rbs = factory_list(acc, &gvr(ROB), CLUSTER_SCOPE).await?;
     let mut rb_map: HashMap<String, String> = HashMap::new();
     for rb in &rbs {
         let bns = rb.metadata.namespace.clone().unwrap_or_default();
@@ -598,7 +730,7 @@ async fn subject_policies(acc: &SharedAccessor, kind: &str, name: &str) -> Resul
             ));
         }
     }
-    for ro in acc.list(&gvr(RO), "", None).await? {
+    for ro in factory_list(acc, &gvr(RO), "").await? {
         let rname = ro.metadata.name.clone().unwrap_or_default();
         if rb_map.contains_key(&format!("Role:{rname}")) {
             let rns = ro.metadata.namespace.clone().unwrap_or_default();
@@ -623,7 +755,7 @@ async fn subjects(acc: &SharedAccessor, kind: &str) -> Result<Vec<DynamicObject>
         }
     };
     for (g, bkind) in [(CRB, "ClusterRoleBinding"), (ROB, "RoleBinding")] {
-        for b in acc.list(&gvr(g), "", None).await? {
+        for b in factory_list(acc, &gvr(g), CLUSTER_SCOPE).await? {
             for sub in subjects_of(&b) {
                 if s(&sub, "/kind") != kind {
                     continue;
@@ -704,7 +836,7 @@ pub(crate) async fn scan_refs(
                         }
                     }
                 }
-                "persistentvolumeclaims" => has_pvc(spec, n),
+                "persistentvolumeclaims" => has_pvc(spec, n) || sts_claims(&g, &o, n),
                 "priorityclasses" => has_pc(spec, n),
                 "serviceaccounts" => service_account_matches(spec, n),
                 _ => false,
@@ -715,4 +847,31 @@ pub(crate) async fn scan_refs(
         }
     }
     Ok(refs)
+}
+
+/// StatefulSet.Scan: a claim named `<template>-<sts>...` comes from one of
+/// the set's volumeClaimTemplates.
+fn sts_claims(g: &Gvr, o: &DynamicObject, claim: &str) -> bool {
+    if g.r() != "statefulsets" {
+        return false;
+    }
+    let name = o.metadata.name.as_deref().unwrap_or("");
+    o.data
+        .pointer("/spec/volumeClaimTemplates")
+        .and_then(|v| v.as_array())
+        .is_some_and(|tt| {
+            tt.iter()
+                .any(|t| claim.starts_with(&format!("{}-{name}", s(t, "/metadata/name"))))
+        })
+}
+
+/// os.ReadDir with Go's error text.
+fn read_dir(dir: &std::path::Path) -> Result<std::fs::ReadDir> {
+    std::fs::read_dir(dir).map_err(|e| {
+        anyhow!(
+            "open {}: {}",
+            dir.display(),
+            crate::ui::app::go_io_error(&e)
+        )
+    })
 }

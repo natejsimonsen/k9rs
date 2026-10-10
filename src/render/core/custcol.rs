@@ -11,7 +11,7 @@
 
 use std::sync::OnceLock;
 
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use regex::Regex;
 use serde_json::Value;
 
@@ -125,6 +125,66 @@ fn is_jq_spec(spec: &str) -> bool {
     spec.split('|').count() > 2
 }
 
+/// k9s jqParse: run the jq program inside the spec's outer braces over the
+/// object; outputs joined with `,` (Go `%v` formatting). `None` when the
+/// program does not parse or yields nothing; errors are logged and skipped.
+fn jq_parse(spec: &str, o: &Value) -> Option<String> {
+    use jaq_core::load::{Arena, File, Loader};
+    use jaq_core::{data, unwrap_valr, Compiler, Ctx, Vars};
+    use jaq_json::Val;
+
+    if !is_jq_spec(spec) {
+        return None;
+    }
+    let exp = spec.get(1..spec.len().saturating_sub(1))?;
+    let defs = jaq_core::defs()
+        .chain(jaq_std::defs())
+        .chain(jaq_json::defs());
+    let funs = jaq_core::funs()
+        .chain(jaq_std::funs())
+        .chain(jaq_json::funs());
+    let loader = Loader::new(defs);
+    let arena = Arena::default();
+    let modules = match loader.load(
+        &arena,
+        File {
+            code: exp,
+            path: (),
+        },
+    ) {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!(exp, error = ?e, "Fail to parse JQ expression");
+            return None;
+        }
+    };
+    let filter = match Compiler::default().with_funs(funs).compile(modules) {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::warn!(exp, error = ?e, "Fail to parse JQ expression");
+            return None;
+        }
+    };
+    let input = jaq_json::read::parse_single(serde_json::to_string(o).ok()?.as_bytes()).ok()?;
+    let ctx = Ctx::<data::JustLut<Val>>::new(&filter.lut, Vars::new([]));
+    let mut rr = Vec::new();
+    for v in filter.id.run((ctx, input)).map(unwrap_valr) {
+        match v {
+            Ok(Val::TStr(b)) | Ok(Val::BStr(b)) => {
+                rr.push(String::from_utf8_lossy(&b).into_owned())
+            }
+            Ok(v) => {
+                let js: Value = serde_json::from_str(&v.to_string()).unwrap_or(Value::Null);
+                rr.push(go_fmt(&js));
+            }
+            Err(e) => {
+                tracing::error!(error = ?e, "JQ expression evaluation failed. Check your query")
+            }
+        }
+    }
+    (!rr.is_empty()).then(|| rr.join(","))
+}
+
 /// A list of custom columns (k9s ColumnSpecs).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ColumnSpecs(pub Vec<ColumnSpec>);
@@ -140,6 +200,22 @@ impl ColumnSpecs {
 
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
+    }
+
+    /// k9s realize/hydrate: a JSONPath that does not parse leaves client-go
+    /// an incomplete template, and FindResults then fails the whole render
+    /// ("column<i> is an incomplete jsonpath template"). JQ specs are exempt.
+    pub fn check(&self) -> Result<()> {
+        for (i, c) in self.0.iter().enumerate() {
+            if c.spec.is_empty() || is_jq_spec(&c.spec) {
+                continue;
+            }
+            if let Err(e) = JsonPath::parse(&c.spec) {
+                tracing::warn!(name = %c.header.name, error = %e, "Unable to parse custom column");
+                anyhow::bail!("column{i} is an incomplete jsonpath template");
+            }
+        }
+        Ok(())
     }
 
     /// Custom columns first, then the remaining default columns; custom
@@ -194,12 +270,20 @@ impl ColumnSpecs {
         let Some(o) = o else {
             return Ok(NA_VALUE.into());
         };
-        if is_jq_spec(&c.spec) {
-            tracing::warn!(spec = %c.spec, "JQ column specs are not supported");
-            return Ok(NA_VALUE.into());
+        if let Some(v) = jq_parse(&c.spec, o) {
+            return Ok(v);
         }
-        let parser = JsonPath::parse(&c.spec)
-            .map_err(|e| anyhow!("unable to parse custom column {}: {e}", c.header.name))?;
+        // client-go keeps a partly parsed template: k9s warns and the column
+        // shows no value; the row stays.
+        let parser = match JsonPath::parse(&c.spec) {
+            Ok(p) => p,
+            Err(e) => {
+                if !is_jq_spec(&c.spec) {
+                    tracing::warn!(name = %c.header.name, error = %e, "Unable to parse custom column");
+                }
+                return Ok(MISSING_VALUE.into());
+            }
+        };
         let vals = parser.find_results(o);
         let mut values: Vec<String> = Vec::new();
         if vals.is_empty() || vals[0].is_empty() {
@@ -430,7 +514,9 @@ mod tests {
         let now = crate::render::helpers::parse_time("2020-01-01T00:01:00Z").unwrap();
         let ff =
             crate::render::helpers::with_now(now, || specs.realize(Some(&o), &rh, &row).unwrap());
-        assert_eq!(ff, ["60s", "80,443", NA_VALUE, "x"]);
+        // JQ runs now (was unsupported => n/a): a null result prints Go's
+        // `%v` of nil.
+        assert_eq!(ff, ["60s", "80,443", "<nil>", "x"]);
     }
 
     #[test]

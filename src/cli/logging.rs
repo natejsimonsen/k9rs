@@ -79,6 +79,10 @@ where
         mut w: Writer<'_>,
         event: &Event<'_>,
     ) -> std::fmt::Result {
+        // k9s logs its own slog lines only, not the client libraries'.
+        if !event.metadata().target().starts_with("k9rs") {
+            return Ok(());
+        }
         let mut f = Fields::default();
         event.record(&mut f);
         writeln!(
@@ -102,6 +106,103 @@ fn format_line(
 ) -> String {
     let ts = t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     format!("{FAINT}{ts}{RESET} {} {msg}{attrs}", level_tag(level))
+}
+
+/// slog TextHandler value quoting (needsQuoting + strconv.Quote).
+fn slog_value(v: &str) -> String {
+    let quote = v.is_empty()
+        || v.chars()
+            .any(|c| c == ' ' || c == '=' || c == '"' || c.is_whitespace() || c.is_control());
+    if quote {
+        let mut q = String::from("\"");
+        for c in v.chars() {
+            match c {
+                '"' => q.push_str("\\\""),
+                '\\' => q.push_str("\\\\"),
+                '\n' => q.push_str("\\n"),
+                '\t' => q.push_str("\\t"),
+                '\r' => q.push_str("\\r"),
+                c if c.is_control() => {
+                    let _ = write!(q, "\\x{:02x}", c as u32);
+                }
+                c => q.push(c),
+            }
+        }
+        q.push('"');
+        q
+    } else {
+        v.to_string()
+    }
+}
+
+#[derive(Default)]
+struct PlainFields {
+    msg: String,
+    attrs: String,
+}
+
+impl Visit for PlainFields {
+    fn record_str(&mut self, field: &Field, value: &str) {
+        if field.name() == "message" {
+            self.msg = value.to_string();
+        } else {
+            let _ = write!(self.attrs, " {}={}", field.name(), slog_value(value));
+        }
+    }
+    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+        self.record_str(field, &format!("{value:?}"));
+    }
+}
+
+/// Go's default slog logger line: `2006/01/02 15:04:05 LEVEL msg k=v`.
+struct GoDefaultFormat;
+
+fn go_level(l: &Level) -> &'static str {
+    match *l {
+        Level::ERROR => "ERROR",
+        Level::WARN => "WARN",
+        Level::INFO => "INFO",
+        _ => "DEBUG",
+    }
+}
+
+impl<S, N> FormatEvent<S, N> for GoDefaultFormat
+where
+    S: Subscriber + for<'a> LookupSpan<'a>,
+    N: for<'a> FormatFields<'a> + 'static,
+{
+    fn format_event(
+        &self,
+        _ctx: &FmtContext<'_, S, N>,
+        mut w: Writer<'_>,
+        event: &Event<'_>,
+    ) -> std::fmt::Result {
+        // Only k9s's own logs, not the client libraries'.
+        if !event.metadata().target().starts_with("k9rs") {
+            return Ok(());
+        }
+        let mut f = PlainFields::default();
+        event.record(&mut f);
+        writeln!(
+            w,
+            "{} {} {}{}",
+            chrono::Local::now().format("%Y/%m/%d %H:%M:%S"),
+            go_level(event.metadata().level()),
+            f.msg,
+            f.attrs
+        )
+    }
+}
+
+/// Log to stderr like Go's default slog logger (k9s sub commands run
+/// before the log file is set up).
+pub fn init_stderr() {
+    let sub = tracing_subscriber::fmt()
+        .with_max_level(Level::INFO)
+        .with_writer(std::io::stderr)
+        .event_format(GoDefaultFormat)
+        .finish();
+    let _ = tracing::subscriber::set_global_default(sub);
 }
 
 /// Open (append/create, 0600) the log file and install the subscriber.
@@ -157,6 +258,21 @@ mod tests {
         let mut f = Fields::default();
         f.record_str(&field("path"), "/a b");
         assert_eq!(f.attrs, " \x1b[2mpath=\x1b[0m\"/a b\"");
+    }
+
+    #[test]
+    fn go_default_values() {
+        assert_eq!(slog_value("fred"), "fred");
+        assert_eq!(slog_value(""), "\"\"");
+        assert_eq!(
+            slog_value("open /a b: no such file"),
+            "\"open /a b: no such file\""
+        );
+        assert_eq!(slog_value("a\"b"), "\"a\\\"b\"");
+        let mut f = PlainFields::default();
+        f.record_str(&field("path"), "/x");
+        assert_eq!(f.attrs, " path=/x");
+        assert_eq!(go_level(&Level::WARN), "WARN");
     }
 
     fn field(name: &'static str) -> Field {

@@ -1,10 +1,15 @@
 //! API discovery (client-go ServerPreferredResources + k9s dao.loadPreferred).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 use anyhow::Result;
 use futures::StreamExt;
-use k8s_openapi::apimachinery::pkg::apis::meta::v1::{APIGroup, APIResource, APIResourceList};
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::{
+    APIGroup, APIGroupList, APIResource, APIResourceList, GroupVersionForDiscovery,
+};
+use serde::{de::DeserializeOwned, Serialize};
 
 use crate::k8s::{Gvr, ResourceMeta};
 
@@ -96,12 +101,130 @@ pub(crate) fn groups_from(core_versions: Vec<String>, groups: Vec<APIGroup>) -> 
     out
 }
 
-/// Fetch everything from the server. Individual group/version failures are
-/// tolerated (client-go returns partial results), only /api and /apis are fatal.
-pub(crate) async fn discover(client: &kube::Client) -> Result<DiscoveryData> {
-    let core = client.list_core_api_versions().await.map_err(super::kerr)?;
-    let groups = client.list_api_groups().await.map_err(super::kerr)?;
-    let groups = groups_from(core.versions, groups.groups);
+/// k9s client cacheExpiry for the on-disk discovery cache.
+pub(crate) const DISK_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
+
+/// client-go disk.CachedDiscoveryClient: `servergroups.json` and
+/// `<group/version>/serverresources.json` under
+/// `$KUBECACHEDIR|~/.kube/cache/discovery/<host>`, shared with kubectl.
+/// Files older than the TTL are refetched.
+pub(crate) struct DiskCache {
+    dir: PathBuf,
+    ttl: Duration,
+}
+
+impl DiskCache {
+    pub(crate) fn new(dir: PathBuf, ttl: Duration) -> DiskCache {
+        DiskCache { dir, ttl }
+    }
+
+    /// Cache dir for an API server URL (k9s CachedDiscovery + toHostDir).
+    pub(crate) fn for_host(base: &Path, host: &str) -> DiskCache {
+        let h = host.replacen("https://", "", 1).replacen("http://", "", 1);
+        let h = h.trim_end_matches('/');
+        // toFileName: [^(\w/.)] -> _
+        let safe: String = h
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || "_/.()".contains(c) {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        DiskCache::new(base.join("discovery").join(safe), DISK_CACHE_TTL)
+    }
+
+    fn read<T: DeserializeOwned>(&self, rel: &str) -> Option<T> {
+        let p = self.dir.join(rel);
+        let age = SystemTime::now()
+            .duration_since(std::fs::metadata(&p).ok()?.modified().ok()?)
+            .unwrap_or_default();
+        if age > self.ttl {
+            return None;
+        }
+        serde_json::from_slice(&std::fs::read(&p).ok()?).ok()
+    }
+
+    fn write<T: Serialize>(&self, rel: &str, v: &T) {
+        let p = self.dir.join(rel);
+        let res = (|| -> std::io::Result<()> {
+            let parent = p.parent().unwrap_or(&self.dir);
+            std::fs::create_dir_all(parent)?;
+            let tmp = tempfile::NamedTempFile::new_in(parent)?;
+            std::fs::write(tmp.path(), serde_json::to_vec(v)?)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o660))?;
+            }
+            tmp.persist(&p).map_err(|e| e.error)?;
+            Ok(())
+        })();
+        if let Err(e) = res {
+            tracing::debug!("discovery cache write {}: {e}", p.display());
+        }
+    }
+}
+
+/// ServerGroups: the core group (name "") first, then /apis.
+async fn server_groups(
+    client: &kube::Client,
+    cache: Option<&DiskCache>,
+    err: &impl Fn(&str, kube::Error) -> anyhow::Error,
+) -> Result<APIGroupList> {
+    if let Some(l) = cache.and_then(|c| c.read::<APIGroupList>("servergroups.json")) {
+        return Ok(l);
+    }
+    let core = client
+        .list_core_api_versions()
+        .await
+        .map_err(|e| err("/api", e))?;
+    let mut groups = client
+        .list_api_groups()
+        .await
+        .map_err(|e| err("/apis", e))?;
+    if let Some(v) = core.versions.first() {
+        let gv = |v: &String| GroupVersionForDiscovery {
+            group_version: v.clone(),
+            version: v.clone(),
+        };
+        groups.groups.insert(
+            0,
+            APIGroup {
+                name: String::new(),
+                versions: core.versions.iter().map(gv).collect(),
+                preferred_version: Some(gv(v)),
+                server_address_by_client_cidrs: None,
+            },
+        );
+    }
+    if let Some(c) = cache {
+        c.write("servergroups.json", &groups);
+    }
+    Ok(groups)
+}
+
+/// Fetch everything from the server (or the fresh disk cache). Individual
+/// group/version failures are tolerated (client-go returns partial
+/// results), only /api and /apis are fatal.
+pub(crate) async fn discover(
+    client: &kube::Client,
+    cache: Option<&DiskCache>,
+    err: impl Fn(&str, kube::Error) -> anyhow::Error,
+) -> Result<DiscoveryData> {
+    let mut all = server_groups(client, cache, &err).await?.groups;
+    let core_versions = match all.iter().position(|g| g.name.is_empty()) {
+        Some(i) => all
+            .remove(i)
+            .versions
+            .into_iter()
+            .map(|v| v.version)
+            .collect(),
+        None => Vec::new(),
+    };
+    let groups = groups_from(core_versions, all);
 
     let gvs: Vec<String> = groups
         .iter()
@@ -109,13 +232,22 @@ pub(crate) async fn discover(client: &kube::Client) -> Result<DiscoveryData> {
         .collect();
     let lists: Vec<(String, Option<APIResourceList>)> = futures::stream::iter(gvs)
         .map(|gv| async move {
+            let file = format!("{gv}/serverresources.json");
+            if let Some(l) = cache.and_then(|c| c.read::<APIResourceList>(&file)) {
+                return (gv, Some(l));
+            }
             let res = if gv.contains('/') {
                 client.list_api_group_resources(&gv).await
             } else {
                 client.list_core_api_resources(&gv).await
             };
             match res {
-                Ok(l) => (gv, Some(l)),
+                Ok(l) => {
+                    if let Some(c) = cache {
+                        c.write(&file, &l);
+                    }
+                    (gv, Some(l))
+                }
                 Err(e) => {
                     tracing::debug!("discovery of {gv} failed: {e}");
                     (gv, None)
@@ -179,6 +311,24 @@ pub(crate) fn build(groups: &[Group], lists: &HashMap<String, APIResourceList>) 
         };
         data.preferred.push(to_meta(&gv, &group, &version, &res));
     }
+    // loadCRDs: custom resources with a scale subresource get "scale".
+    let has_scale = |m: &ResourceMeta| {
+        let gv = if m.gvr.g().is_empty() {
+            m.gvr.v().to_string()
+        } else {
+            format!("{}/{}", m.gvr.g(), m.gvr.v())
+        };
+        let sub = format!("{}/scale", m.gvr.r());
+        m.categories.iter().any(|c| c == "crd")
+            && lists
+                .get(&gv)
+                .is_some_and(|l| l.resources.iter().any(|r| r.name == sub))
+    };
+    for m in data.preferred.iter_mut().chain(data.all.values_mut()) {
+        if has_scale(m) && !m.categories.iter().any(|c| c == "scale") {
+            m.categories.push("scale".into());
+        }
+    }
     data.preferred.sort_by_key(|m| m.gvr.to_string());
     data
 }
@@ -228,6 +378,30 @@ fn to_meta(gv: &str, group: &str, version: &str, r: &APIResource) -> ResourceMet
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn disk_cache_dir_and_ttl() {
+        let base = Path::new("/c");
+        let c = DiskCache::for_host(base, "https://api.my-cluster.example.com/");
+        assert_eq!(c.dir, Path::new("/c/discovery/api.my_cluster.example.com"));
+        let c = DiskCache::for_host(base, "https://10.0.0.1:6443");
+        assert_eq!(c.dir, Path::new("/c/discovery/10.0.0.1_6443"));
+
+        let dir = tempfile::tempdir().unwrap();
+        let l = list("apps/v1", json!([]));
+        let c = DiskCache::new(dir.path().to_path_buf(), Duration::from_secs(60));
+        c.write("apps/v1/serverresources.json", &l);
+        assert_eq!(
+            c.read::<APIResourceList>("apps/v1/serverresources.json"),
+            Some(l)
+        );
+        let stale = DiskCache::new(dir.path().to_path_buf(), Duration::ZERO);
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(stale
+            .read::<APIResourceList>("apps/v1/serverresources.json")
+            .is_none());
+        assert!(c.read::<APIResourceList>("nope.json").is_none());
+    }
 
     fn list(gv: &str, res: serde_json::Value) -> APIResourceList {
         serde_json::from_value(json!({"groupVersion": gv, "resources": res})).unwrap()
@@ -322,6 +496,41 @@ mod tests {
             ),
         );
         (groups, lists)
+    }
+
+    /// dao/registry.go loadCRDs: a CRD with a scale subresource gets the
+    /// "scale" category (Scale action); one without does not.
+    #[test]
+    fn crd_scale_subresource_category() {
+        let groups: Vec<APIGroup> = serde_json::from_value(json!([
+            {"name": "argoproj.io", "versions": [{"groupVersion": "argoproj.io/v1alpha1", "version": "v1alpha1"}],
+             "preferredVersion": {"groupVersion": "argoproj.io/v1alpha1", "version": "v1alpha1"}}
+        ]))
+        .unwrap();
+        let groups = groups_from(vec![], groups);
+        let mut lists = HashMap::new();
+        lists.insert(
+            "argoproj.io/v1alpha1".to_string(),
+            list(
+                "argoproj.io/v1alpha1",
+                json!([
+                    {"name": "rollouts", "singularName": "rollout", "namespaced": true, "kind": "Rollout", "verbs": ["get"]},
+                    {"name": "rollouts/scale", "singularName": "", "namespaced": true, "kind": "Scale", "verbs": ["get"]},
+                    {"name": "workflows", "singularName": "workflow", "namespaced": true, "kind": "Workflow", "verbs": ["get"]}
+                ]),
+            ),
+        );
+        let d = build(&groups, &lists);
+        let cats = |r: &str| {
+            d.preferred
+                .iter()
+                .find(|m| m.gvr.r() == r)
+                .unwrap()
+                .categories
+                .clone()
+        };
+        assert_eq!(cats("rollouts"), vec!["crd", "scale"]);
+        assert_eq!(cats("workflows"), vec!["crd"]);
     }
 
     #[test]

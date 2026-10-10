@@ -498,6 +498,7 @@ pub fn cluster() -> FakeAccessor {
             container: "nginx".into(),
             timestamp: Some(format!("2026-10-09T10:00:0{i}Z")),
             text: format!("GET /healthz 200 request-{i}"),
+            ..Default::default()
         })
         .collect();
     f.logs

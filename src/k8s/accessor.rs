@@ -28,12 +28,21 @@ pub trait Accessor: Send + Sync {
     async fn can(&self, _gvr: &Gvr, _ns: &str, _verb: &str) -> Result<bool> {
         Ok(true)
     }
+    /// `can` for a named instance (client.CanI with a name).
+    async fn can_named(&self, gvr: &Gvr, ns: &str, _name: &str, verb: &str) -> Result<bool> {
+        self.can(gvr, ns, verb).await
+    }
     /// Namespaces visible to the current user.
     async fn namespaces(&self) -> Result<Vec<String>>;
     /// Header cluster information.
     async fn cluster_info(&self) -> Result<ClusterInfo>;
     /// Whether metrics-server is available.
     async fn has_metrics(&self) -> bool;
+    /// client.InitConnection: the metrics-server probe's connection error
+    /// (logged as "Fail to locate metrics-server"), if any.
+    async fn init_error(&self) -> Option<String> {
+        None
+    }
     /// Reach the API server (k9s CheckConnectivity). Defaults to OK.
     async fn check_connectivity(&self) -> Result<()> {
         Ok(())
@@ -44,6 +53,11 @@ pub trait Accessor: Send + Sync {
     fn active_context(&self) -> String;
     /// Switch the active context (reconnects). Returns the new default namespace.
     async fn switch_context(&self, name: &str) -> Result<String>;
+    /// client.Config.RenameContext: rewrite the context's kubeconfig file;
+    /// renaming the active context switches to the new name.
+    async fn rename_context(&self, old: &str, new: &str) -> Result<()>;
+    /// client.Config.DelContext.
+    async fn delete_context(&self, name: &str) -> Result<()>;
     /// Default namespace of the active context.
     fn default_namespace(&self) -> String;
 
@@ -56,6 +70,21 @@ pub trait Accessor: Send + Sync {
         ns: &str,
         label_selector: Option<&str>,
     ) -> Result<Vec<DynamicObject>>;
+    /// `list`, sharing objects with the watch cache where there is one, so
+    /// refreshes of big lists do not deep-copy them.
+    async fn list_shared(
+        &self,
+        gvr: &Gvr,
+        ns: &str,
+        label_selector: Option<&str>,
+    ) -> Result<Vec<std::sync::Arc<DynamicObject>>> {
+        Ok(self
+            .list(gvr, ns, label_selector)
+            .await?
+            .into_iter()
+            .map(std::sync::Arc::new)
+            .collect())
+    }
     /// List as a server-side table (k9s dao.Table). `Ok(None)` when the
     /// server does not support tables for this resource.
     async fn list_table(
@@ -66,6 +95,19 @@ pub trait Accessor: Send + Sync {
     ) -> Result<Option<ServerTable>> {
         Ok(None)
     }
+    /// `list_table`; `include_object` asks for full row objects
+    /// (includeObject=Object, k9s does so when views.yaml has columns);
+    /// `field_selector` goes to the server (dao/table.go FieldSelector).
+    async fn list_table_with(
+        &self,
+        gvr: &Gvr,
+        ns: &str,
+        label_selector: Option<&str>,
+        _include_object: bool,
+        _field_selector: Option<&str>,
+    ) -> Result<Option<ServerTable>> {
+        self.list_table(gvr, ns, label_selector).await
+    }
     /// Get a single object by FQN (`ns/name` or `name`).
     async fn get(&self, gvr: &Gvr, path: &str) -> Result<DynamicObject>;
     async fn delete(&self, gvr: &Gvr, path: &str, opts: DeleteOptions) -> Result<()>;
@@ -75,12 +117,16 @@ pub trait Accessor: Send + Sync {
     async fn to_yaml(&self, gvr: &Gvr, path: &str, show_managed: bool) -> Result<String>;
     /// Replace an object (used after `e`dit). `yaml` is the full manifest.
     async fn apply_yaml(&self, gvr: &Gvr, path: &str, yaml: &str) -> Result<()>;
+    /// RFC 6902 JSON patch (types.JSONPatchType).
+    async fn patch_json(&self, gvr: &Gvr, path: &str, patch: &serde_json::Value) -> Result<()>;
+    /// Create an object in `path`'s namespace (`Create`, e.g. the node shell pod).
+    async fn create(&self, gvr: &Gvr, path: &str, body: &serde_json::Value) -> Result<()>;
     /// Scale a scalable resource.
     async fn scale(&self, gvr: &Gvr, path: &str, replicas: i32) -> Result<()>;
     /// Current replica count of a scalable resource.
     async fn replicas(&self, gvr: &Gvr, path: &str) -> Result<i32>;
     /// Rollout restart (patches the pod template restartedAt annotation).
-    async fn restart(&self, gvr: &Gvr, path: &str) -> Result<()>;
+    async fn restart(&self, gvr: &Gvr, path: &str, field_manager: &str) -> Result<()>;
     /// Set container images on a workload.
     async fn set_images(&self, gvr: &Gvr, path: &str, images: Vec<ImageSpec>) -> Result<()>;
     /// Trigger a job from a cronjob.
@@ -91,7 +137,14 @@ pub trait Accessor: Send + Sync {
     // ---- nodes -----------------------------------------------------------
     async fn toggle_cordon(&self, node: &str, cordon: bool) -> Result<()>;
     /// Drain a node, returning the progress log.
-    async fn drain(&self, node: &str, opts: DrainOptions) -> Result<String>;
+    /// Drain a node; `progress` receives the Helper Out/ErrOut writes as
+    /// they happen. Returns the whole log.
+    async fn drain(
+        &self,
+        node: &str,
+        opts: DrainOptions,
+        progress: DrainProgress,
+    ) -> Result<String>;
 
     // ---- metrics ---------------------------------------------------------
     /// Pod metrics for `ns` ("" for all) keyed by FQN.
@@ -111,12 +164,24 @@ pub trait Accessor: Send + Sync {
     fn edit_argv(&self, gvr: &Gvr, path: &str) -> Vec<String>;
     /// Environment overrides (KUBECONFIG, etc.) for shell outs.
     fn shell_env(&self) -> Vec<(String, String)>;
+    /// Route API calls through `proxy` (context config `proxy.address`).
+    async fn set_proxy(&self, _proxy: Option<String>) {}
+    /// `--as-group` impersonation groups (client.Config.CurrentGroupNames).
+    fn impersonate_groups(&self) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 /// Running port-forward; dropping it stops the forward.
+/// Live drain output sink (k9s streams it into "Drain Progress").
+pub type DrainProgress = Arc<dyn Fn(&str) + Send + Sync>;
+
 pub struct PortForwardHandle {
     pub info: PortForwardInfo,
     pub cancel: tokio_util::sync::CancellationToken,
+    /// Fires with the error when the forward dies after starting
+    /// (portforward.ForwardPorts returning an error).
+    pub died: Option<tokio::sync::oneshot::Receiver<String>>,
 }
 
 impl Drop for PortForwardHandle {

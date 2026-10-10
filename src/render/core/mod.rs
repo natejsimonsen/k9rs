@@ -30,6 +30,7 @@ mod dir;
 mod event;
 mod generic;
 mod helm;
+mod imgscan;
 mod namespace;
 mod node;
 mod pod;
@@ -38,16 +39,18 @@ mod screendump;
 
 pub use container::{container_ports, container_state};
 pub use generic::render_server_table_with;
+pub use imgscan::CVE_PARSE_IDX;
 pub use pod::{pod_phase, pod_status};
 
+/// tcell named colors are fitted to the 256 palette (palette::named).
 /// tcell.ColorSkyblue.
-pub(crate) const SKY_BLUE: Color = Color::Rgb(0x87, 0xCE, 0xEB);
+pub(crate) const SKY_BLUE: Color = Color::Indexed(117);
 /// tcell.ColorNavajoWhite.
-pub(crate) const NAVAJO_WHITE: Color = Color::Rgb(0xFF, 0xDE, 0xAD);
+pub(crate) const NAVAJO_WHITE: Color = Color::Indexed(223);
 /// tcell.ColorPaleGreen.
-pub(crate) const PALE_GREEN: Color = Color::Rgb(0x98, 0xFB, 0x98);
+pub(crate) const PALE_GREEN: Color = Color::Indexed(121);
 /// tcell.ColorCadetBlue.
-pub(crate) const CADET_BLUE: Color = Color::Rgb(0x5F, 0x9E, 0xA0);
+pub(crate) const CADET_BLUE: Color = Color::Indexed(73);
 
 /// Trimmed field of the column named exactly `name` (k9s IndexOf).
 pub(crate) fn field_of<'a>(h: &Header, re: &'a RowEvent, name: &str) -> Option<&'a str> {
@@ -67,6 +70,7 @@ pub fn renderer_for(gvr: &Gvr) -> Option<Box<dyn Renderer>> {
         ("", "", "aliases") => Box::new(alias::Alias),
         ("", "", "portforwards") => Box::new(portforward::PortForward),
         ("", "", "screendumps") => Box::new(screendump::ScreenDump),
+        ("", "", "scans") => Box::new(imgscan::ImageScan),
         ("", "", "benchmarks") => Box::new(benchmark::Benchmark),
         ("", "", "dir") | ("", "", "dirs") => Box::new(dir::Dir),
         ("", "", "helm") => Box::new(helm::Chart),

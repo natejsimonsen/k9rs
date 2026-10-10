@@ -244,12 +244,6 @@ impl KubeAccessor {
                         .await,
                 );
             }
-            ("", "serviceaccounts") => {
-                rel.secrets = absent(
-                    "secrets",
-                    self.list_chunked(&known::secrets(), &ns, "", "").await,
-                );
-            }
             _ => {}
         }
         Ok(rel)

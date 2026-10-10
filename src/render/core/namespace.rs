@@ -32,7 +32,7 @@ impl Renderer for Namespace {
     fn render(&self, input: &RenderInput<'_>, ns: &str, row: &mut Row) -> Result<()> {
         let o = input.obj;
         let phase = data_str(o, "status.phase");
-        row.id = obj_fqn(o);
+        row.id = meta_fqn(o);
         row.fields = vec![
             obj_name(o).to_string(),
             phase.to_string(),
@@ -88,7 +88,8 @@ mod tests {
             Namespace::default().render(&RenderInput::new(&o), "-", &mut r)
         })
         .unwrap();
-        assert_eq!(r.id, "kube-system");
+        // k9s render tests: cluster-scoped ids keep the "-/" prefix.
+        assert_eq!(r.id, "-/kube-system");
         assert_eq!(r.fields[..2], ["kube-system", "Active"]);
         assert_eq!(r.fields[3], "");
         assert_eq!(r.fields[4], "329d");

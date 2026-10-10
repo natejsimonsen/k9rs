@@ -53,8 +53,8 @@ pub(crate) fn line_width(line: &[Seg]) -> usize {
 // ---------------------------------------------------------------------------
 // Colors.
 
-/// tcell color name lookup. The 16 basic names map onto the terminal
-/// palette exactly like `config::styles` does; other names are exact RGB.
+/// tcell color name lookup (markup): the 16 basic names are palette
+/// colors; W3C names are tcell named colors, fitted to the 256 palette.
 pub(crate) fn color_by_name(name: &str) -> Option<Color> {
     let n = name.to_ascii_lowercase();
     let c = match n.as_str() {
@@ -77,7 +77,7 @@ pub(crate) fn color_by_name(name: &str) -> Option<Color> {
         "default" => Color::Reset,
         _ => {
             let hex = W3C.iter().find(|(k, _)| *k == n).map(|(_, v)| *v)?;
-            rgb(hex)
+            crate::ui::shell::palette::named(hex)
         }
     };
     Some(c)
@@ -219,7 +219,8 @@ pub(crate) fn color_tag(c: Color) -> String {
     match c {
         Color::Rgb(r, g, b) => format!("#{r:02x}{g:02x}{b:02x}"),
         Color::Indexed(i) => format!("@{i}"),
-        Color::Reset => "default".into(),
+        // config.Color.String: `default` is `-`, the widget's own color.
+        Color::Reset => "-".into(),
         Color::Black => "black".into(),
         Color::Red => "maroon".into(),
         Color::Green => "green".into(),
@@ -363,6 +364,61 @@ pub(crate) fn parse_markup(s: &str, base: Style) -> Vec<SLine> {
     out
 }
 
+/// derailed/tview Print color tags: the colorPattern needs both colons, so
+/// `[list]` stays literal while `[yellow::b]` styles.
+fn print_tag_rx() -> &'static Regex {
+    static RX: OnceLock<Regex> = OnceLock::new();
+    RX.get_or_init(|| {
+        Regex::new(
+            r#"\[([a-zA-Z]+|#[0-9a-zA-Z]{6}|-)?:([a-zA-Z]+|#[0-9a-zA-Z]{6}|-)?:([lbdru]+|-)?\]"#,
+        )
+        .expect("print tag regex")
+    })
+}
+
+/// Byte ranges of tview Print color tags in `s`.
+pub(crate) fn print_tags(s: &str) -> Vec<(usize, usize)> {
+    print_tag_rx()
+        .find_iter(s)
+        .filter(|m| m.len() > 2)
+        .map(|m| (m.start(), m.end()))
+        .collect()
+}
+
+/// Style `s` like tview Print: each tag restyles `base`.
+pub(crate) fn print_markup(s: &str, base: Style) -> Vec<(String, Style)> {
+    let mut out = Vec::new();
+    let (mut style, mut at) = (base, 0);
+    for c in print_tag_rx().captures_iter(s) {
+        let m = c.get(0).expect("match");
+        if m.start() > at {
+            out.push((s[at..m.start()].to_string(), style));
+        }
+        at = m.end();
+        style = base;
+        let tok = |i: usize| {
+            c.get(i)
+                .map(|t| t.as_str())
+                .filter(|t| !t.is_empty() && *t != "-")
+        };
+        if let Some(fg) = tok(1) {
+            style.fg = parse_color_token(fg);
+        }
+        if let Some(bg) = tok(2) {
+            style.bg = parse_color_token(bg);
+        }
+        if let Some(a) = tok(3) {
+            let m = attrs(a);
+            style.add_modifier = m;
+            style.sub_modifier = base.sub_modifier - m;
+        }
+    }
+    if at < s.len() {
+        out.push((s[at..].to_string(), style));
+    }
+    out
+}
+
 /// Parse markup expected to hold a single line.
 pub(crate) fn markup_line(s: &str, base: Style) -> SLine {
     parse_markup(s, base).into_iter().flatten().collect()
@@ -383,9 +439,10 @@ pub(crate) fn skin_title(fmat: &str, s: &Styles) -> String {
 /// k9s ui.SearchFmt.
 pub(crate) const SEARCH_FMT: &str = "<[filter:bg:r]/{}[fg:bg:-]> ";
 
-/// Base style for frame titles.
+/// Base style for frame titles: tview box title color (body fg) on the
+/// view background; what `-` falls back to.
 pub(crate) fn title_base(s: &Styles) -> Style {
-    Style::default().fg(s.title_fg).bg(s.title_bg)
+    Style::default().fg(s.fg).bg(s.bg)
 }
 
 /// Format the `/` filter suffix of a title.
@@ -471,6 +528,9 @@ pub(crate) fn draw_box(
     if !title.is_empty() && avail > 0 {
         let w = line_width(title).min(avail as usize) as u16;
         let x = l + 1 + (avail - w) / 2;
+        // tview Print: title cells take only the markup styles, never the
+        // border's (bold) attributes.
+        fill(buf, Rect::new(x, t, w, 1), bg);
         put_line(buf, x, t, title, w);
     }
     Rect::new(l + 1, t + 1, area.width - 2, area.height - 2)
@@ -709,6 +769,8 @@ pub(crate) struct TextPane {
     pub trailing_newline: bool,
     height: usize,
     width: usize,
+    /// Screen area of the last draw (mouse hits).
+    pub area: Rect,
 }
 
 impl TextPane {
@@ -764,6 +826,22 @@ impl TextPane {
 
     pub fn page(&self) -> usize {
         self.height.max(1)
+    }
+
+    /// tview TextView.MouseHandler wheel: up stops tracking the end, down
+    /// moves on (Draw clamps; scrolling past the end tracks it again).
+    /// Returns true when `(x, y)` is over the pane.
+    pub fn wheel(&mut self, x: u16, y: u16, up: bool) -> bool {
+        if !self.area.contains(ratatui::layout::Position::new(x, y)) {
+            return false;
+        }
+        if up {
+            self.track_end = false;
+            self.row = self.row.saturating_sub(1);
+        } else {
+            self.row += 1;
+        }
+        true
     }
 
     /// Handle a navigation key (tview TextView.InputHandler); returns true
@@ -852,6 +930,7 @@ impl TextPane {
 
     /// Draw into `area`.
     pub fn draw(&mut self, buf: &mut Buffer, area: Rect) {
+        self.area = area;
         self.height = area.height as usize;
         self.width = area.width as usize;
         let width = self.width;
@@ -877,6 +956,10 @@ impl TextPane {
             self.track_end = false;
         }
         let max_row = total.saturating_sub(self.height);
+        // TextView.Draw: lineOffset+height past the text tracks the end.
+        if self.row > max_row {
+            self.track_end = true;
+        }
         if self.track_end || self.row > max_row {
             self.row = max_row;
         }
@@ -946,11 +1029,13 @@ pub(crate) fn screen_dump_dir(ctx: &Ctx) -> PathBuf {
         .join(sanitize_file_name(&ci.context))
 }
 
+/// k9s ensureDir (0744) + OpenFile(O_CREATE|O_WRONLY, 0600); no truncation.
 fn write_file(dir: &Path, file: &str, body: &str) -> anyhow::Result<PathBuf> {
-    std::fs::create_dir_all(dir)?;
+    crate::config::paths::ensure_full_path(dir)?;
     let path = dir.join(file);
     let mut opts = std::fs::OpenOptions::new();
-    opts.create(true).write(true).truncate(true);
+    #[allow(clippy::suspicious_open_options)]
+    opts.create(true).write(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -1029,6 +1114,21 @@ pub(crate) fn cow_talk(says: &str, w: usize, base: Style) -> Vec<SLine> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn save_yaml_matches_k9s_modes() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("c/ctx");
+        let p = save_yaml(&dir, "ns/po:x", "body").unwrap();
+        let name = p.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name.starts_with("ns-po-x--") && name.ends_with(".yaml"));
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&dir), 0o744);
+        assert_eq!(mode(&p), 0o600);
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "body");
+    }
 
     #[test]
     fn tags_restyle_from_base_like_derailed_tview() {
@@ -1156,6 +1256,29 @@ mod tests {
             p.draw(&mut buf, Rect::new(0, 0, 4, 10));
             assert_eq!(p.row, want, "{k}");
         }
+    }
+
+    /// TextView.MouseHandler wheel + Draw: up stops tracking, down past
+    /// the end tracks it again; outside the pane nothing happens.
+    #[test]
+    fn pane_mouse_wheel_like_tview() {
+        let mut p = TextPane::new(false);
+        p.set_lines(vec![vec![Seg::new("x", Style::default())]; 12]);
+        p.track_end = true;
+        let mut buf = Buffer::empty(Rect::new(0, 0, 4, 12));
+        let area = Rect::new(0, 2, 4, 10);
+        p.draw(&mut buf, area);
+        assert_eq!(p.row, 2);
+        assert!(!p.wheel(1, 0, true), "above the pane");
+        assert!(p.wheel(1, 3, true));
+        p.draw(&mut buf, area);
+        assert_eq!((p.row, p.track_end), (1, false));
+        p.wheel(1, 3, false);
+        p.draw(&mut buf, area);
+        assert_eq!((p.row, p.track_end), (2, false));
+        p.wheel(1, 3, false);
+        p.draw(&mut buf, area);
+        assert_eq!((p.row, p.track_end), (2, true));
     }
 
     #[test]

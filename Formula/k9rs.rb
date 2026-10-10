@@ -28,6 +28,7 @@ class K9rs < Formula
 
   def install
     bin.install "k9rs"
+    generate_completions_from_executable(bin/"k9rs", "completion")
   end
 
   test do

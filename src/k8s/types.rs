@@ -51,6 +51,20 @@ pub struct ClusterInfo {
     pub mem_pct: Option<i64>,
 }
 
+impl ClusterInfo {
+    /// What the header shows before the first cluster refresh: names from
+    /// the kubeconfig and the k9s version; no API call needed.
+    pub fn from_context(c: &ContextInfo) -> ClusterInfo {
+        ClusterInfo {
+            context: c.name.clone(),
+            cluster: c.cluster.clone(),
+            user: c.user.clone(),
+            k9s_version: crate::version::k9s_revs(crate::version::VERSION, "").0,
+            ..Default::default()
+        }
+    }
+}
+
 /// CPU in millicores + memory in bytes.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Metrics {
@@ -69,9 +83,10 @@ impl PodMetrics {
     pub fn total(&self) -> Metrics {
         self.containers
             .values()
+            // Go int64 math wraps; never panic on hostile values.
             .fold(Metrics::default(), |acc, m| Metrics {
-                cpu_millis: acc.cpu_millis + m.cpu_millis,
-                mem_bytes: acc.mem_bytes + m.mem_bytes,
+                cpu_millis: acc.cpu_millis.wrapping_add(m.cpu_millis),
+                mem_bytes: acc.mem_bytes.wrapping_add(m.mem_bytes),
             })
     }
 }
@@ -119,6 +134,22 @@ pub struct DrainOptions {
     pub disable_eviction: bool,
 }
 
+/// A drain that failed after writing progress (k9s streams it to the
+/// "Drain Progress" view before flashing the error).
+#[derive(Debug)]
+pub struct DrainFailed {
+    pub out: String,
+    pub err: anyhow::Error,
+}
+
+impl std::fmt::Display for DrainFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.err)
+    }
+}
+
+impl std::error::Error for DrainFailed {}
+
 impl Default for DrainOptions {
     fn default() -> Self {
         Self {
@@ -150,6 +181,9 @@ pub struct LogOptions {
     pub previous: bool,
     pub show_timestamp: bool,
     pub follow: bool,
+    /// The resource the logs were opened from (k9s LogOptions.Path at the
+    /// view level, e.g. `ns/deploy`) when `path` is a pod label selector.
+    pub view_path: Option<String>,
 }
 
 impl Default for LogOptions {
@@ -165,6 +199,7 @@ impl Default for LogOptions {
             previous: false,
             show_timestamp: false,
             follow: true,
+            view_path: None,
         }
     }
 }
@@ -177,6 +212,42 @@ pub struct LogLine {
     /// RFC3339 timestamp if `show_timestamp` was requested.
     pub timestamp: Option<String>,
     pub text: String,
+    /// A trailing chunk without its newline (k9s writes the next item on the
+    /// same screen line).
+    pub partial: bool,
+    /// dao.LogOptions.ToErrLogItem (stream closed, retries exhausted).
+    pub is_error: bool,
+    /// The line's pod has a single container (LogOptions.SingleContainer).
+    pub single: bool,
+}
+
+impl LogLine {
+    /// ToErrLogItem: a `<now RFC3339Nano> <msg>` line, timestamp shown only
+    /// when timestamps are on.
+    pub fn error(msg: String, show_ts: bool) -> LogLine {
+        LogLine {
+            timestamp: show_ts.then(go_rfc3339_nano_now),
+            text: msg,
+            is_error: true,
+            ..Default::default()
+        }
+    }
+}
+
+/// Go time.RFC3339Nano (trailing fractional zeros trimmed) of now, UTC.
+pub fn go_rfc3339_nano_now() -> String {
+    go_rfc3339_nano(chrono::Utc::now())
+}
+
+pub(crate) fn go_rfc3339_nano(t: chrono::DateTime<chrono::Utc>) -> String {
+    let frac = format!("{:09}", t.timestamp_subsec_nanos());
+    let frac = frac.trim_end_matches('0');
+    let base = t.format("%Y-%m-%dT%H:%M:%S");
+    if frac.is_empty() {
+        format!("{base}Z")
+    } else {
+        format!("{base}.{frac}Z")
+    }
 }
 
 /// Port-forward request (k9s port.PortTunnel).
@@ -237,6 +308,9 @@ pub struct ServerTableRow {
     /// metadata.creationTimestamp (RFC3339), if present.
     pub creation_timestamp: Option<String>,
     pub labels: std::collections::BTreeMap<String, String>,
+    /// The row object (metadata only unless fetched with includeObject=Object).
+    #[serde(default)]
+    pub object: Option<serde_json::Value>,
 }
 
 /// Server-side table (`Accept: application/json;as=Table;v=v1;g=meta.k8s.io`).

@@ -48,9 +48,27 @@ pub fn text(ctx: &mut Ctx, name: String, title: String, body: String) -> Box<dyn
     if name == "cow" {
         return Box::new(details::DetailsView::cow(ctx, &body));
     }
+    // NewDetails(.., contentYAML, ..): one-shot YAML and the views k9s
+    // opens with YAML content get YAML colors.
+    let yaml = matches!(
+        name.as_str(),
+        "YAML" | "Secret Decoder" | "Drain Progress" | "Applied Manifest" | "Deleted Manifest"
+    );
     Box::new(details::DetailsView::fixed(
-        ctx, &name, title, false, true, &body,
+        ctx, &name, title, yaml, true, &body,
     ))
+}
+
+pub(crate) use util::{print_markup, print_tags};
+
+/// Helm release notes/manifest in a live view (helm dao Describe/ToYAML).
+pub fn helm_release(ctx: &mut Ctx, title: String, subject: String, body: String) -> Box<dyn View> {
+    Box::new(details::DetailsView::release(ctx, &title, subject, &body))
+}
+
+/// Helm values in a live view (view.showValues / History.getValsCmd).
+pub fn helm_values(ctx: &mut Ctx, subject: String, user: String, all: String) -> Box<dyn View> {
+    Box::new(details::DetailsView::values(ctx, subject, user, all))
 }
 
 /// Whether `:xray` supports `gvr` (k9s allowedXRay).

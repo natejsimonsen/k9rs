@@ -180,38 +180,126 @@ pub(crate) fn go_quote(s: &str) -> String {
     out
 }
 
-/// tview WordWrap: wrap `text` (honoring newlines) into lines of at most `w`.
+/// tview WordWrap: wrap `text` (honoring newlines) into lines of at most `w`, breaking
+/// after punctuation or at whitespace, else mid-word.
 pub(crate) fn word_wrap(text: &str, w: usize) -> Vec<String> {
-    let mut out = Vec::new();
-    for line in text.split('\n') {
-        if width(line) <= w || w == 0 {
-            out.push(line.to_string());
-            continue;
-        }
-        let mut cur = String::new();
-        for word in line.split_inclusive(' ') {
-            if width(&cur) + width(word.trim_end()) > w && !cur.is_empty() {
-                out.push(cur.trim_end().to_string());
-                cur.clear();
-            }
-            let mut word = word.to_string();
-            while width(&word) > w {
-                let mut head = String::new();
-                for c in word.chars() {
-                    if width(&head) + unicode_width::UnicodeWidthChar::width(c).unwrap_or(0) > w {
-                        break;
-                    }
-                    head.push(c);
-                }
-                let rest = word[head.len()..].to_string();
-                out.push(head);
-                word = rest;
-            }
-            cur.push_str(&word);
-        }
-        out.push(cur.trim_end().to_string());
+    wrap_ranges(text, w)
+        .into_iter()
+        .map(|(a, b)| text[a..b].to_string())
+        .collect()
+}
+
+/// word_wrap ignoring the byte ranges `tags` (tview color tags) for widths
+/// and breakpoints; returned lines keep their tags.
+pub(crate) fn word_wrap_tagged(text: &str, w: usize, tags: &[(usize, usize)]) -> Vec<String> {
+    if tags.is_empty() {
+        return word_wrap(text, w);
     }
-    out
+    // stripped text plus each stripped byte's position in `text`.
+    let (mut stripped, mut map) = (String::new(), Vec::new());
+    let mut tt = tags.iter().peekable();
+    let mut i = 0;
+    while i < text.len() {
+        if let Some(&&(a, b)) = tt.peek() {
+            if a == i {
+                i = b;
+                tt.next();
+                continue;
+            }
+        }
+        let ch = text[i..].chars().next().expect("char");
+        for _ in 0..ch.len_utf8() {
+            map.push(i);
+        }
+        stripped.push(ch);
+        i += ch.len_utf8();
+    }
+    map.push(text.len());
+    wrap_ranges(&stripped, w)
+        .into_iter()
+        .map(|(a, b)| {
+            let end = if b == stripped.len() {
+                text.len()
+            } else {
+                map[b]
+            };
+            text[map[a]..end].to_string()
+        })
+        .collect()
+}
+
+fn wrap_ranges(text: &str, w: usize) -> Vec<(usize, usize)> {
+    static BOUNDARY: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"(([,\.\-:;!\?&#+]|\n)[ \t\f\r]*|([ \t\f\r]+))").unwrap()
+    });
+    // (start, end, is punctuation/newline)
+    let bps: Vec<(usize, usize, bool)> = BOUNDARY
+        .captures_iter(text)
+        .map(|c| {
+            let m = c.get(0).unwrap();
+            (m.start(), m.end(), c.get(3).is_none())
+        })
+        .collect();
+    let mut lines = Vec::new();
+    let (mut bp_pos, mut last_bp, mut last_cont, mut start) = (0, 0, 0, 0);
+    let (mut line_w, mut overflow, mut force) = (0, 0, false);
+    for (pos, ch) in text.char_indices() {
+        let cw = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        if bp_pos < bps.len() && pos == bps[bp_pos].0 {
+            (last_bp, last_cont, overflow) = (bps[bp_pos].0, bps[bp_pos].1, 0);
+            force = ch == '\n';
+            if bps[bp_pos].2 && !force {
+                last_bp += 1; // keep the punctuation on this line
+            }
+            bp_pos += 1;
+        }
+        if force || line_w > 0 && line_w + cw > w {
+            let (mut brk, mut cont) = (last_bp, last_cont);
+            if force {
+                (brk, cont, last_bp, overflow) = (pos, pos + 1, 0, 0);
+            } else if last_bp <= start {
+                (brk, cont, overflow) = (pos, pos, 0);
+            }
+            lines.push((start, brk));
+            (start, line_w, force) = (cont, overflow, false);
+        }
+        if last_bp > 0 && last_cont <= pos {
+            overflow += cw;
+        }
+        line_w += cw;
+        if pos < start {
+            line_w -= cw;
+        }
+    }
+    if start < text.len() {
+        lines.push((start, text.len()));
+    }
+    lines
+}
+
+/// tcell never writes a wide grapheme's trailing cell, so it shows the
+/// grapheme's background. ratatui blanks it with a reset style and, for VS16
+/// emoji (e.g. the xray service icon), emits it explicitly: give trailing
+/// cells the grapheme's style.
+pub(crate) fn style_wide_trailers(buf: &mut Buffer) {
+    let area = buf.area;
+    for y in area.top()..area.bottom() {
+        let mut x = area.left();
+        while x < area.right() {
+            let (w, style) = {
+                let c = &buf[(x, y)];
+                (width(c.symbol()).max(1) as u16, c.style())
+            };
+            for t in 1..w {
+                if let Some(c) = buf.cell_mut((x + t, y)) {
+                    if c.symbol() == " " {
+                        c.set_style(style);
+                    }
+                }
+            }
+            x += w;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -328,6 +416,17 @@ mod tests {
     }
 
     #[test]
+    fn wide_trailers_take_the_grapheme_style() {
+        use ratatui::style::Color;
+        let mut b = Buffer::empty(Rect::new(0, 0, 6, 1));
+        b.set_string(0, 0, "💁‍♀️ x", Style::default().bg(Color::Blue));
+        assert_eq!(b[(1, 0)].bg, Color::Reset);
+        style_wide_trailers(&mut b);
+        assert_eq!(b[(1, 0)].bg, Color::Blue);
+        assert_eq!(b[(1, 0)].symbol(), " ");
+    }
+
+    #[test]
     fn helpers() {
         assert_eq!(truncate("abcdef", 4), "abc…");
         assert_eq!(truncate("abc", 4), "abc");
@@ -335,5 +434,35 @@ mod tests {
         assert_eq!(word_wrap("aaa bbb ccc", 7), vec!["aaa bbb", "ccc"]);
         assert_eq!(word_wrap("a\nb", 7), vec!["a", "b"]);
         assert_eq!(word_wrap("abcdefghij", 4), vec!["abcd", "efgh", "ij"]);
+        // tview breaks after punctuation, keeping it on the line.
+        assert_eq!(
+            word_wrap(
+                r#"denied on resource "kube-system":"apiextensions.k8s.io/v1/crds" >"#,
+                53
+            ),
+            vec![
+                r#"denied on resource "kube-system":"apiextensions.k8s."#,
+                r#"io/v1/crds" >"#
+            ]
+        );
+        assert_eq!(word_wrap("ab kube-system", 8), vec!["ab kube-", "system"]);
+        // Tags take no width and stay in the line they precede a break in.
+        let t = "ab [red::b]cd[-::-] ef";
+        let tags = [(3, 11), (13, 19)];
+        assert_eq!(
+            word_wrap_tagged(t, 5, &tags),
+            vec!["ab [red::b]cd[-::-]", "ef"]
+        );
+        // Live k9s error dialog (width 53): the colon overflows and is clipped.
+        let msg = "< Ruroh? (list) access denied for user on resource \"\":events.k8s.io/v1/events in namespace \"\" >";
+        assert_eq!(
+            word_wrap(msg, 53),
+            vec![
+                "< Ruroh? (list) access denied for user on resource \"\":",
+                "events.k8s.io/v1/events in namespace \"\" >"
+            ]
+        );
+        assert_eq!(word_wrap("ab-cd", 3), vec!["ab-", "cd"]);
+        assert_eq!(word_wrap("a\n", 3), vec!["a"]);
     }
 }

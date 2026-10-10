@@ -271,6 +271,17 @@ fn find_color(rgb: u32, n: u16) -> u8 {
     best.0
 }
 
+/// A tcell named color (ColorAliceBlue.., what GetColor returns for W3C
+/// names in markup and code). These are palette entries past 255, not RGB,
+/// so sendFgBg fits them to the 256-color palette even with 24-bit color.
+/// Skin colors differ: k9s turns them into RGB (Color.TrueColor()).
+pub(crate) fn named(rgb: u32) -> Color {
+    static CACHE: std::sync::LazyLock<Mutex<HashMap<u32, u8>>> =
+        std::sync::LazyLock::new(Default::default);
+    let mut c = CACHE.lock().expect("named colors");
+    Color::Indexed(*c.entry(rgb).or_insert_with(|| find_color(rgb, 256)))
+}
+
 /// Maps colors the way tcell's sendFgBg does for a given mode.
 pub(crate) struct Fitter {
     mode: ColorMode,
@@ -352,6 +363,25 @@ mod tests {
         assert!(detect("xterm-truecolor", "", "", no_infocmp).truecolor);
         assert_eq!(detect("xterm", "", "", no_infocmp).colors, 8);
         assert_eq!(detect("vt100", "", "", no_infocmp).colors, 0);
+    }
+
+    #[test]
+    fn named_colors_fit_to_256_palette() {
+        // What k9s draws for [cadetblue::b] / ColorOrange with COLORTERM=truecolor.
+        assert_eq!(named(0x5F9EA0), Color::Indexed(73));
+        assert_eq!(named(0xFFA500), Color::Indexed(214));
+        // Constants hard coded elsewhere (flash, header, dialogs, renderers).
+        for (rgb, idx) in [
+            (0xFFDEAD, 223),
+            (0xFF4500, 202),
+            (0x87CEEB, 117),
+            (0x98FB98, 121),
+            (0xC71585, 162),
+            (0x7CFC00, 118),
+            (0x00FA9A, 49),
+        ] {
+            assert_eq!(named(rgb), Color::Indexed(idx), "{rgb:06x}");
+        }
     }
 
     #[test]

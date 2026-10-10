@@ -3,7 +3,8 @@
 //! `{.a.b}`, `..name` (recursive), `.*` / `[*]`, `[n]`, `[-n]`,
 //! `[start:end:step]`, `[0,2]`, `['a','b']`, `[?(@.x == 'y')]` filters
 //! (`==`, `!=`, `<`, `>`, `<=`, `>=`, or bare existence), `$` / `@` roots,
-//! `\.` escapes in field names and literal text between `{...}` actions.
+//! `\.` escapes in field names, literal text between `{...}` actions and
+//! `{range EXPR}...{end}` blocks.
 
 use serde_json::Value;
 
@@ -17,6 +18,8 @@ pub struct JsonPath {
 enum Node {
     Text(String),
     Expr(Vec<Seg>),
+    /// `{range EXPR}` body `{end}`: the body runs once per result of EXPR.
+    Range(Vec<Seg>, Vec<Node>),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -48,6 +51,8 @@ enum Literal {
 impl JsonPath {
     /// Parse a template such as `{.metadata.name}`.
     pub fn parse(s: &str) -> Result<JsonPath, String> {
+        // Open ranges: (range expr, nodes before it).
+        let mut stack: Vec<(Vec<Seg>, Vec<Node>)> = Vec::new();
         let mut nodes = Vec::new();
         let mut rest = s;
         while !rest.is_empty() {
@@ -64,15 +69,30 @@ impl JsonPath {
                     let end =
                         find_close(after).ok_or_else(|| format!("unclosed action in {s:?}"))?;
                     let inner = after[..end].trim();
-                    for expr in split_top(inner, ' ') {
-                        if expr.is_empty() {
-                            continue;
+                    if let Some(r) = inner.strip_prefix("range ") {
+                        stack.push((parse_expr(r.trim())?, std::mem::take(&mut nodes)));
+                    } else if inner == "end" {
+                        let (segs, outer) = stack
+                            .pop()
+                            .ok_or_else(|| "not in range, nothing to end".to_string())?;
+                        let body = std::mem::replace(&mut nodes, outer);
+                        nodes.push(Node::Range(segs, body));
+                    } else {
+                        for expr in split_top(inner, ' ') {
+                            if expr.is_empty() {
+                                continue;
+                            }
+                            nodes.push(Node::Expr(parse_expr(expr)?));
                         }
-                        nodes.push(Node::Expr(parse_expr(expr)?));
                     }
                     rest = &after[end + 1..];
                 }
             }
+        }
+        // An unclosed range runs to the end of the template.
+        while let Some((segs, outer)) = stack.pop() {
+            let body = std::mem::replace(&mut nodes, outer);
+            nodes.push(Node::Range(segs, body));
         }
         Ok(JsonPath { nodes })
     }
@@ -80,13 +100,25 @@ impl JsonPath {
     /// Evaluate against `root`: one result list per template node
     /// (client-go `FindResults`). Missing keys yield empty lists.
     pub fn find_results(&self, root: &Value) -> Vec<Vec<Value>> {
-        self.nodes
-            .iter()
-            .map(|n| match n {
-                Node::Text(t) => vec![Value::String(t.clone())],
-                Node::Expr(segs) => eval(segs, root, root).into_iter().cloned().collect(),
-            })
-            .collect()
+        let mut out = Vec::new();
+        run(&self.nodes, root, root, &mut out);
+        out
+    }
+}
+
+/// client-go FindResults: one list per node; a range appends its body's
+/// lists once per value.
+fn run(nodes: &[Node], cur: &Value, root: &Value, out: &mut Vec<Vec<Value>>) {
+    for n in nodes {
+        match n {
+            Node::Text(t) => out.push(vec![Value::String(t.clone())]),
+            Node::Expr(segs) => out.push(eval(segs, cur, root).into_iter().cloned().collect()),
+            Node::Range(segs, body) => {
+                for v in eval(segs, cur, root) {
+                    run(body, v, root, out);
+                }
+            }
+        }
     }
 }
 
@@ -151,8 +183,8 @@ fn is_terminator(c: char) -> bool {
 }
 
 fn parse_expr(s: &str) -> Result<Vec<Seg>, String> {
-    if s == "range" || s == "end" || s.starts_with("range ") {
-        return Err(format!("unsupported jsonpath action {s:?}"));
+    if s == "range" || s == "end" {
+        return Err(format!("invalid jsonpath action {s:?}"));
     }
     let chars: Vec<char> = s.chars().collect();
     let mut i = 0;
@@ -611,10 +643,40 @@ mod tests {
     }
 
     #[test]
+    fn range_end() {
+        let d = json!({"spec": {"containers": [
+            {"name": "a", "image": "i1", "ports": [{"p": 1}, {"p": 2}]},
+            {"name": "b", "image": "i2"}
+        ]}});
+        let p = JsonPath::parse("{range .spec.containers[*]}{.name}={.image} {end}").unwrap();
+        assert_eq!(
+            p.find_results(&d),
+            vec![
+                vec![json!("a")],
+                vec![json!("=")],
+                vec![json!("i1")],
+                vec![json!(" ")],
+                vec![json!("b")],
+                vec![json!("=")],
+                vec![json!("i2")],
+                vec![json!(" ")],
+            ]
+        );
+        // Nested ranges and empty ranges.
+        let p =
+            JsonPath::parse("{range .spec.containers[*]}{range .ports[*]}{.p}{end}{end}").unwrap();
+        assert_eq!(p.find_results(&d), vec![vec![json!(1)], vec![json!(2)]]);
+        let p = JsonPath::parse("{range .nope[*]}{.x}{end}").unwrap();
+        assert!(p.find_results(&d).is_empty());
+    }
+
+    #[test]
     fn errors() {
         assert!(JsonPath::parse("{.a").is_err());
         assert!(JsonPath::parse("{.a[}").is_err());
-        assert!(JsonPath::parse("{range .items}").is_err());
+        // client-go supports `{range}`; only a stray `{end}` is an error
+        // (this used to reject range).
+        assert!(JsonPath::parse("{end}").is_err());
         assert!(JsonPath::parse("{.a[x]}").is_err());
     }
 }

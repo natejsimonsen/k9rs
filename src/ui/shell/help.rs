@@ -113,7 +113,7 @@ impl HelpTable {
     }
 }
 
-fn build(resource: &[Hint], hotkeys: &[Hint]) -> HelpTable {
+fn build(resource: &[Hint], hotkeys: &[Hint], extras: &[(String, String)]) -> HelpTable {
     let mut t = HelpTable { rows: Vec::new() };
     let sections: [(&str, Vec<Hint>); 3] = [
         ("RESOURCE", resource.to_vec()),
@@ -122,21 +122,58 @@ fn build(resource: &[Hint], hotkeys: &[Hint]) -> HelpTable {
     ];
     let mut max_rows = general().len();
     let mut col = 0;
-    for (title, mut hh) in sections {
+    for (i, (title, mut hh)) in sections.into_iter().enumerate() {
         sort_hints(&mut hh);
-        add_section(&mut t, col, title, &hh, &mut max_rows);
+        // help.go computeExtraMaxes: with extras every section's description
+        // width becomes the longest extras key.
+        let desc =
+            (!extras.is_empty()).then(|| extras.iter().map(|(k, _)| k.len()).max().unwrap_or(0));
+        let max_key = add_section(&mut t, col, title, &hh, &mut max_rows, desc);
+        if i == 0 {
+            // addExtras: sorted by key, right below the resource hints.
+            for (r, (k, v)) in extras.iter().enumerate() {
+                let row = hh.len() + 1 + r;
+                t.set(
+                    row,
+                    col,
+                    Cell {
+                        text: pad(v, max_key),
+                        kind: CellKind::Key,
+                        expand: false,
+                    },
+                );
+                t.set(
+                    row,
+                    col + 1,
+                    Cell {
+                        text: pad(k, desc.unwrap_or(0)),
+                        kind: CellKind::Info,
+                        expand: false,
+                    },
+                );
+            }
+        }
         col += 2;
     }
     // k9s shows HOTKEYS whenever hotkeys.yaml loads, and a missing file
     // loads fine, so the section is always present (possibly empty).
     let hh = hotkeys.to_vec();
-    add_section(&mut t, col, "HOTKEYS", &hh, &mut max_rows);
+    add_section(&mut t, col, "HOTKEYS", &hh, &mut max_rows, None);
     t
 }
 
-fn add_section(t: &mut HelpTable, c: usize, title: &str, hh: &[Hint], max_rows: &mut usize) {
+/// Returns the key column width.
+fn add_section(
+    t: &mut HelpTable,
+    c: usize,
+    title: &str,
+    hh: &[Hint],
+    max_rows: &mut usize,
+    desc: Option<usize>,
+) -> usize {
     let max_key = hh.iter().map(|h| h.mnemonic.len()).max().unwrap_or(0) + 2;
-    let max_desc = hh.iter().map(|h| h.description.len()).max().unwrap_or(0);
+    let max_desc =
+        desc.unwrap_or_else(|| hh.iter().map(|h| h.description.len()).max().unwrap_or(0));
     if hh.len() > *max_rows {
         *max_rows = hh.len();
     }
@@ -186,7 +223,7 @@ fn add_section(t: &mut HelpTable, c: usize, title: &str, hh: &[Hint], max_rows: 
         row += 1;
     }
     if hh.len() >= *max_rows {
-        return;
+        return max_key;
     }
     for _ in 0..(*max_rows - hh.len()) {
         t.set(
@@ -209,6 +246,7 @@ fn add_section(t: &mut HelpTable, c: usize, title: &str, hh: &[Hint], max_rows: 
         );
         row += 1;
     }
+    max_key
 }
 
 /// tview column widths with expansion distribution.
@@ -248,16 +286,23 @@ struct Help {
     id: ViewId,
     resource: Vec<Hint>,
     hotkeys: Vec<Hint>,
+    /// Top view ExtraHints (xray emoji legend).
+    extras: Vec<(String, String)>,
     offset: usize,
     page: usize,
 }
 
 /// The help view (`?`): general keys, resource keys (`hints`), navigation, hotkeys.
-pub(crate) fn new_help(ctx: &mut Ctx, hints: Vec<Hint>) -> Box<dyn View> {
+pub(crate) fn new_help(
+    ctx: &mut Ctx,
+    hints: Vec<Hint>,
+    extras: Vec<(String, String)>,
+) -> Box<dyn View> {
     Box::new(Help {
         id: ctx.new_view_id(),
         resource: hints,
         hotkeys: hotkey_hints(&ctx.hotkeys),
+        extras,
         offset: 0,
         page: 1,
     })
@@ -265,7 +310,9 @@ pub(crate) fn new_help(ctx: &mut Ctx, hints: Vec<Hint>) -> Box<dyn View> {
 
 impl Help {
     fn row_count(&self) -> usize {
-        build(&self.resource, &self.hotkeys).rows.len()
+        build(&self.resource, &self.hotkeys, &self.extras)
+            .rows
+            .len()
     }
 
     fn scroll(&mut self, delta: isize) {
@@ -293,6 +340,11 @@ impl View for Help {
             Hint::new("q", "Back").hidden(),
         ]
     }
+    /// showHotKeys reads the hotkeys file when the help opens.
+    fn start(&mut self, ctx: &mut Ctx) -> Vec<ViewCmd> {
+        self.hotkeys = hotkey_hints(&ctx.hotkeys);
+        Vec::new()
+    }
     fn handle_key(&mut self, key: KeyEvent, _ctx: &mut Ctx) -> Vec<ViewCmd> {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
@@ -311,13 +363,22 @@ impl View for Help {
         }
         Vec::new()
     }
+    /// tview Table.MouseHandler on an unselectable table: the wheel moves
+    /// the row offset; clicks select nothing.
+    fn on_mouse(&mut self, m: crate::ui::Mouse, _area: Rect, _ctx: &mut Ctx) -> Vec<ViewCmd> {
+        match m {
+            crate::ui::Mouse::ScrollUp { .. } => self.scroll(-1),
+            crate::ui::Mouse::ScrollDown { .. } => self.scroll(1),
+            crate::ui::Mouse::Click { .. } => {}
+        }
+        Vec::new()
+    }
     fn draw(&mut self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx) {
         self.page = area.height.max(1) as usize;
         draw_help(
             frame.buffer_mut(),
             area,
-            &self.resource,
-            &self.hotkeys,
+            build(&self.resource, &self.hotkeys, &self.extras),
             self.offset,
             &ctx.styles,
         );
@@ -330,19 +391,12 @@ impl View for Help {
     }
 }
 
-fn draw_help(
-    buf: &mut Buffer,
-    area: Rect,
-    resource: &[Hint],
-    hotkeys: &[Hint],
-    offset: usize,
-    styles: &Styles,
-) {
-    let t = build(resource, hotkeys);
+fn draw_help(buf: &mut Buffer, area: Rect, t: HelpTable, offset: usize, styles: &Styles) {
     let widths = column_widths(&t, area.width as usize);
-    let base = Style::default().bg(styles.help_bg);
+    // help.go updateStyle uses SetStyle, which keeps cells transparent:
+    // they show the table background (body bg), never help.bgColor.
+    let base = Style::default().bg(styles.bg);
     super::text::fill(buf, area, base);
-    // Row 0 is the fixed heading row in tview tables? No: help rows scroll as a whole.
     for (vis, r) in (offset..t.rows.len()).enumerate() {
         let y = area.y + vis as u16;
         if y >= area.bottom() {
@@ -396,7 +450,7 @@ mod tests {
         let mut buf = Buffer::empty(Rect::new(0, 0, 160, 20));
         {
             let a = buf.area;
-            draw_help(&mut buf, a, &res, &hk, 0, &st)
+            draw_help(&mut buf, a, build(&res, &hk, &[]), 0, &st)
         };
         let r0 = row(&buf, 0);
         assert!(r0.starts_with("RESOURCE"));
@@ -430,7 +484,7 @@ mod tests {
 
     #[test]
     fn hotkeys_section_shown_without_hotkeys() {
-        let t = build(&[Hint::new("d", "Describe")], &[]);
+        let t = build(&[Hint::new("d", "Describe")], &[], &[]);
         let titles: Vec<String> = t
             .rows
             .first()
@@ -460,7 +514,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let mut v = new_help(&mut ctx, vec![Hint::new("d", "Describe")]);
+        let mut v = new_help(&mut ctx, vec![Hint::new("d", "Describe")], Vec::new());
         assert_eq!(v.name(), "help");
         let hk = v.as_any().downcast_ref::<Help>().unwrap();
         assert_eq!(hk.hotkeys, vec![Hint::new("Shift-1", "Goto pods")]);
@@ -469,6 +523,15 @@ mod tests {
                 KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
                 &mut ctx
             )
+            .is_empty());
+        assert_eq!(v.as_any().downcast_ref::<Help>().unwrap().offset, 1);
+        // The wheel scrolls the (unselectable) help table; clicks do nothing.
+        let r = Rect::new(0, 0, 80, 10);
+        v.on_mouse(crate::ui::Mouse::ScrollDown { x: 1, y: 1 }, r, &mut ctx);
+        assert_eq!(v.as_any().downcast_ref::<Help>().unwrap().offset, 2);
+        v.on_mouse(crate::ui::Mouse::ScrollUp { x: 1, y: 1 }, r, &mut ctx);
+        assert!(v
+            .on_mouse(crate::ui::Mouse::Click { x: 1, y: 3 }, r, &mut ctx)
             .is_empty());
         assert_eq!(v.as_any().downcast_ref::<Help>().unwrap().offset, 1);
         let out = v.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &mut ctx);
@@ -482,10 +545,29 @@ mod tests {
 
     #[test]
     fn expansion_spreads_extra_width() {
-        let t = build(&[Hint::new("a", "A")], &[]);
+        let t = build(&[Hint::new("a", "A")], &[], &[]);
         let natural = column_widths(&t, 0);
         let wide = column_widths(&t, 200);
         assert_eq!(wide.iter().sum::<usize>() + wide.len() - 1, 200);
         assert!(wide.iter().zip(natural.iter()).all(|(w, n)| w >= n));
+    }
+
+    /// help.go addExtras: extras sit right under the resource hints (key
+    /// column = value, info column = key) and computeExtraMaxes sets every
+    /// section's description width to the longest extras key.
+    #[test]
+    fn extras_under_resource_hints() {
+        let ex = vec![
+            ("deployments".to_string(), "🪂".to_string()),
+            ("persistentvolumeclaims".to_string(), "🎟 ".to_string()),
+        ];
+        let t = build(&[Hint::new("x", "Expand")], &[], &ex);
+        let cell = |r: usize, c: usize| t.rows[r][c].as_ref().unwrap().text.clone();
+        assert_eq!(cell(1, 1).trim_end(), "Expand");
+        assert_eq!(cell(2, 0).trim_end(), "🪂");
+        assert!(matches!(t.rows[2][0].as_ref().unwrap().kind, CellKind::Key));
+        assert_eq!(cell(3, 1), "persistentvolumeclaims");
+        // GENERAL descriptions padded to the extras key width (22).
+        assert_eq!(cell(1, 3).len(), "persistentvolumeclaims".len());
     }
 }

@@ -13,5 +13,7 @@ mod details;
 mod drill;
 mod logs;
 mod pods;
+mod robustness;
 mod startup;
 mod table;
+mod views;

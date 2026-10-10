@@ -244,7 +244,9 @@ impl Harness {
         let cfg = LoadedConfig::from_kubeconfig(Kubeconfig::from_yaml(KC).unwrap(), opts);
         let acc = KubeAccessor::from_conn(Conn {
             clients: Ok((client.clone(), client)),
+            build_failed: false,
             cfg,
+            server: "https://k8s.test".into(),
             override_file: None,
         });
         Harness { acc, log }
@@ -313,6 +315,41 @@ async fn resources_from_discovery() {
     assert_eq!(h.log.lock().unwrap().len(), before);
     let meta = h.acc.resource_meta(&Gvr::parse("v1/events")).await.unwrap();
     assert_eq!(meta.unwrap().kind, "Event");
+}
+
+/// k9s CachedDiscovery: discovery lands in the client-go disk cache and a
+/// fresh cache serves the next process without discovery requests.
+#[tokio::test]
+async fn discovery_disk_cache_shared_across_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let disc = |h: &Harness| {
+        h.log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.path == "/api" || r.path.starts_with("/apis") || r.path == "/api/v1")
+            .count()
+    };
+    let mut h = Harness::new(base);
+    h.acc.disk_cache = Some(dir.path().to_path_buf());
+    let first = h.acc.resources().await.unwrap();
+    assert!(disc(&h) > 0);
+    let host = dir.path().join("discovery").join("127.0.0.1_1");
+    let groups: Value =
+        serde_json::from_slice(&std::fs::read(host.join("servergroups.json")).unwrap()).unwrap();
+    assert_eq!(groups["kind"], "APIGroupList");
+    assert_eq!(groups["groups"][0]["name"], "");
+    let core: Value =
+        serde_json::from_slice(&std::fs::read(host.join("v1/serverresources.json")).unwrap())
+            .unwrap();
+    assert_eq!(core["kind"], "APIResourceList");
+    assert!(host.join("apps/v1/serverresources.json").exists());
+
+    let mut h2 = Harness::new(base);
+    h2.acc.disk_cache = Some(dir.path().to_path_buf());
+    let second = h2.acc.resources().await.unwrap();
+    assert_eq!(disc(&h2), 0);
+    assert_eq!(first, second);
 }
 
 #[tokio::test]
@@ -399,6 +436,29 @@ async fn list_table_requests_metadata_tables() {
         c.header("accept"),
         "application/json;as=Table;v=v1;g=meta.k8s.io,application/json;as=Table;v=v1beta1;g=meta.k8s.io,application/json"
     );
+    // Custom columns: full row objects (dao/table.go includeObject=Object).
+    let t = h
+        .acc
+        .list_table_with(
+            &known::deployments(),
+            "ns1",
+            None,
+            true,
+            Some("status.phase=Running"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        h.non_sar().last().unwrap().q("includeObject"),
+        Some("Object")
+    );
+    // dao/table.go: field selectors go to the server.
+    assert_eq!(
+        h.non_sar().last().unwrap().q("fieldSelector"),
+        Some("status.phase=Running")
+    );
+    assert_eq!(t.rows[0].object.as_ref().unwrap()["metadata"]["name"], "d1");
     // Plain list answer: no table support.
     assert!(h
         .acc
@@ -645,9 +705,12 @@ async fn restart_patches_template() {
         }
         _ => base(r),
     });
-    h.acc.restart(&known::deployments(), "ns/d1").await.unwrap();
     h.acc
-        .restart(&known::statefulsets(), "ns/s1")
+        .restart(&known::deployments(), "ns/d1", "kubectl-rollout")
+        .await
+        .unwrap();
+    h.acc
+        .restart(&known::statefulsets(), "ns/s1", "")
         .await
         .unwrap();
     let calls = h.non_sar();
@@ -657,6 +720,10 @@ async fn restart_patches_template() {
         patch.header("content-type"),
         "application/strategic-merge-patch+json"
     );
+    // dialog.ShowRestart FieldManager rides on the PatchOptions.
+    assert!(patch
+        .query
+        .contains(&("fieldManager".to_string(), "kubectl-rollout".to_string())));
     let ts = patch.json()["spec"]["template"]["metadata"]["annotations"]
         ["kubectl.kubernetes.io/restartedAt"]
         .as_str()
@@ -667,14 +734,14 @@ async fn restart_patches_template() {
     assert_eq!(h.sars()[0]["verb"], json!("patch"));
     let err = h
         .acc
-        .restart(&known::deployments(), "ns/paused")
+        .restart(&known::deployments(), "ns/paused", "")
         .await
         .unwrap_err();
     assert_eq!(
         err.to_string(),
         "can't restart paused deployment (run rollout resume first)"
     );
-    let err = h.acc.restart(&known::pods(), "ns/p").await.unwrap_err();
+    let err = h.acc.restart(&known::pods(), "ns/p", "").await.unwrap_err();
     assert_eq!(err.to_string(), "unsupported resource for restart: v1/pods");
 }
 
@@ -896,6 +963,7 @@ async fn drain_cordons_and_evicts() {
                 grace_period_seconds: 30,
                 ..Default::default()
             },
+            noop(),
         )
         .await
         .unwrap();
@@ -917,6 +985,42 @@ async fn drain_cordons_and_evicts() {
         .any(|r| r.path.contains("agent") || r.path.contains("mirror")));
 }
 
+fn noop() -> crate::k8s::DrainProgress {
+    Arc::new(|_: &str| {})
+}
+
+/// kubectl v0.35 evictPods: a pod that outlives the global timeout reports
+/// the context error, and the progress written so far is kept.
+#[tokio::test]
+async fn drain_eviction_wait_times_out() {
+    let h = Harness::new(|r: &Req| match (r.method.as_str(), r.path.as_str()) {
+        ("GET", "/api/v1/namespaces/ns/pods/web") => ok(
+            json!({"kind": "Pod", "apiVersion": "v1", "metadata": {"name": "web", "namespace": "ns", "uid": "u1"}}),
+        ),
+        _ => drain_handler(false)(r),
+    });
+    let err = h
+        .acc
+        .drain(
+            "n1",
+            DrainOptions {
+                timeout_secs: 1,
+                ..Default::default()
+            },
+            noop(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "error when waiting for pod \"web\" in namespace \"ns\" to terminate: context deadline exceeded"
+    );
+    let f = err
+        .downcast_ref::<crate::k8s::DrainFailed>()
+        .expect("drain output");
+    assert_eq!(f.out, "evicting pod ns/web\n");
+}
+
 #[tokio::test]
 async fn drain_without_eviction_deletes() {
     let h = Harness::new(|r: &Req| match (r.method.as_str(), r.path.as_str()) {
@@ -933,6 +1037,7 @@ async fn drain_without_eviction_deletes() {
                 disable_eviction: true,
                 ..Default::default()
             },
+            noop(),
         )
         .await
         .unwrap();
@@ -950,12 +1055,20 @@ async fn drain_reports_filter_errors() {
     let h = Harness::new(drain_handler(true));
     let err = h
         .acc
-        .drain("n1", DrainOptions::default())
+        .drain("n1", DrainOptions::default(), noop())
         .await
         .unwrap_err();
     assert_eq!(
         err.to_string(),
         "cannot delete Pods declare no controller (use --force to override): ns/bare"
+    );
+    // dao.Node.Drain writes each filter error to the progress writer.
+    let f = err
+        .downcast_ref::<crate::k8s::DrainFailed>()
+        .expect("drain output");
+    assert_eq!(
+        f.out,
+        "[n1] cannot delete Pods declare no controller (use --force to override): ns/bare\n"
     );
     let h = Harness::new(drain_handler(true));
     let err = h
@@ -967,6 +1080,7 @@ async fn drain_reports_filter_errors() {
                 force: true,
                 ..Default::default()
             },
+            noop(),
         )
         .await
         .unwrap_err();
@@ -1113,6 +1227,8 @@ async fn collect(s: LogStream) -> (Vec<LogLine>, Vec<String>) {
     let mut errs = vec![];
     for i in items {
         match i {
+            // EOF/retry errors arrive as error items (k9s ToErrLogItem).
+            Ok(l) if l.is_error => errs.push(l.text),
             Ok(l) => lines.push(l),
             Err(e) => errs.push(e.to_string()),
         }
@@ -1145,13 +1261,15 @@ async fn tail_single_container() {
                 pod: "p1".into(),
                 container: "app".into(),
                 timestamp: Some("2024-05-01T10:00:00Z".into()),
-                text: "app one".into()
+                text: "app one".into(),
+                ..Default::default()
             },
             LogLine {
                 pod: "p1".into(),
                 container: "app".into(),
                 timestamp: Some("2024-05-01T10:00:01Z".into()),
-                text: "app two".into()
+                text: "app two".into(),
+                ..Default::default()
             },
         ]
     );
@@ -1326,7 +1444,9 @@ async fn client_errors_are_kept_until_used() {
     let cfg = LoadedConfig::from_kubeconfig(Kubeconfig::from_yaml(KC).unwrap(), Default::default());
     let acc = KubeAccessor::from_conn(Conn {
         clients: Err("auth error: token expired".into()),
+        build_failed: false,
         cfg,
+        server: String::new(),
         override_file: None,
     });
     // Kubeconfig-only calls still work, so the context view can load.
@@ -1476,16 +1596,20 @@ fn event_selectors() {
     }))
     .unwrap();
     assert_eq!(
-        events_selector(&pod, &known::pods()),
-        "involvedObject.kind=Pod,involvedObject.name=p,involvedObject.namespace=ns,involvedObject.uid=u1"
+        events_selectors(&pod, &known::pods()),
+        vec!["involvedObject.kind=Pod,involvedObject.name=p,involvedObject.namespace=ns,involvedObject.uid=u1"]
     );
     let node: DynamicObject = serde_json::from_value(json!({
         "apiVersion": "v1", "kind": "Node", "metadata": {"name": "n1", "uid": "real-uid"}
     }))
     .unwrap();
     assert_eq!(
-        events_selector(&node, &known::nodes()),
-        "involvedObject.kind=Node,involvedObject.name=n1,involvedObject.namespace=,involvedObject.uid=n1"
+        // kubectl's node describer merges uid (controllers) and name (kubelet) matches.
+        events_selectors(&node, &known::nodes()),
+        vec![
+            "involvedObject.kind=Node,involvedObject.name=n1,involvedObject.namespace=,involvedObject.uid=real-uid",
+            "involvedObject.kind=Node,involvedObject.name=n1,involvedObject.namespace=,involvedObject.uid=n1"
+        ]
     );
 }
 
@@ -1924,23 +2048,14 @@ async fn describe_namespace_fetches_quotas_and_limits() {
     assert!(out.contains("Resource Limits\n"), "{out}");
 }
 
+// kubectl v0.35 no longer lists the namespace's secrets for a ServiceAccount.
 #[tokio::test]
-async fn describe_service_account_fetches_secrets() {
+async fn describe_service_account_makes_no_secret_lookups() {
     let h = Harness::new(|r| match r.path.as_str() {
         "/api/v1/namespaces/default/serviceaccounts/sa" => ok(json!({
             "kind": "ServiceAccount", "apiVersion": "v1",
             "metadata": {"name": "sa", "namespace": "default", "uid": "sa-uid"},
             "secrets": [{"name": "gone"}]})),
-        "/api/v1/namespaces/default/secrets" => list(
-            "Secret",
-            "v1",
-            vec![
-                json!({"metadata": {"name": "sa-token", "namespace": "default",
-                "annotations": {"kubernetes.io/service-account.name": "sa",
-                    "kubernetes.io/service-account.uid": "sa-uid"}},
-                "type": "kubernetes.io/service-account-token"}),
-            ],
-        ),
         _ => base(r),
     });
     let out = h
@@ -1949,10 +2064,8 @@ async fn describe_service_account_fetches_secrets() {
         .await
         .unwrap();
     let calls = related_calls(&h);
-    assert_eq!(calls.len(), 2, "{calls:?}");
-    assert!(calls[1].is("GET", "/api/v1/namespaces/default/secrets"));
-    assert!(out.contains("Tokens:              sa-token\n"), "{out}");
-    assert!(out.contains("gone (not found)"), "{out}");
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    assert!(!out.contains("Tokens:"), "{out}");
 }
 
 #[tokio::test]
@@ -1967,4 +2080,112 @@ async fn describe_pod_makes_no_extra_lookups() {
     assert!(out.starts_with("Name:"), "{out}");
     let calls = related_calls(&h);
     assert_eq!(calls.len(), 1, "{calls:?}");
+}
+
+#[test]
+fn user_agent_matches_client_go_default() {
+    // client-go's form for the k9rs binary (field manager "k9rs").
+    let ua = super::default_user_agent();
+    assert!(
+        ua.starts_with(&format!("k9rs/{} (", crate::version::VERSION)),
+        "{ua}"
+    );
+    assert!(ua.ends_with(") kubernetes/$Format"), "{ua}");
+    assert!(!ua.contains("aarch64") && !ua.contains("x86_64"), "{ua}");
+}
+
+/// APIClient.CheckConnectivity: every check hits /version (no 5 minute
+/// cache), so a lost API server is noticed on the next cluster refresh.
+#[tokio::test]
+async fn connectivity_check_is_uncached() {
+    let down = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let d = down.clone();
+    let h = Harness::new(move |r| {
+        if r.path == "/version" {
+            if d.load(std::sync::atomic::Ordering::SeqCst) {
+                return status(503, "ServiceUnavailable", "down");
+            }
+            return ok(json!({"gitVersion": "v1.30.0", "major": "1", "minor": "30"}));
+        }
+        base(r)
+    });
+    let versions = |h: &Harness| {
+        h.log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.path == "/version")
+            .count()
+    };
+    h.acc.check_connectivity().await.unwrap();
+    h.acc.check_connectivity().await.unwrap();
+    assert_eq!(versions(&h), 2);
+    down.store(true, std::sync::atomic::Ordering::SeqCst);
+    assert!(h.acc.check_connectivity().await.is_err());
+    down.store(false, std::sync::atomic::Ordering::SeqCst);
+    h.acc.check_connectivity().await.unwrap();
+    assert_eq!(versions(&h), 4);
+}
+
+/// SetImages: a denied patch says "user is not authorized to patch a <kind>"
+/// (dao pod.go also says "deployment"). The pod owner check matches k9s's
+/// isControlled: any owner reference refuses, named after the first one.
+#[tokio::test]
+async fn set_images_denied_patch_messages() {
+    let h = Harness::new(deny_all);
+    let imgs = vec![ImageSpec {
+        name: "c".into(),
+        docker_image: "nginx:2".into(),
+        init: false,
+    }];
+    for (g, what) in [
+        (known::pods(), "deployment"),
+        (known::deployments(), "deployment"),
+        (known::statefulsets(), "statefulset"),
+        (known::daemonsets(), "daemonset"),
+    ] {
+        let e = h
+            .acc
+            .set_images(&g, "ns/x", imgs.clone())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            format!("user is not authorized to patch a {what}")
+        );
+    }
+}
+
+/// watch.Factory.CanForResource: watched lists check RBAC first, so a
+/// denial reads like k9s (fresh CanI error, then the cached
+/// `[list] access denied on resource ...`) instead of a raw 403.
+#[tokio::test]
+async fn watched_list_checks_access_first() {
+    let mut h = Harness::new(|r| match (r.method.as_str(), r.path.as_str()) {
+        ("GET", "/api/v1") => ok(
+            json!({"kind": "APIResourceList", "groupVersion": "v1", "resources": [
+                {"name": "pods", "singularName": "pod", "namespaced": true, "kind": "Pod", "verbs": ["get", "list", "watch"]}
+            ]}),
+        ),
+        _ => deny_all(r),
+    });
+    h.acc.informers = Some(informer::Informers::default());
+    let e1 = h
+        .acc
+        .list(&known::pods(), "ns1", None)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e1.contains("access denied"), "{e1}");
+    let e2 = h
+        .acc
+        .list(&known::pods(), "ns1", None)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert_eq!(e2, "[list] access denied on resource \"ns1\":\"v1/pods\"");
+    assert!(!h
+        .calls()
+        .iter()
+        .any(|c| c.path == "/api/v1/namespaces/ns1/pods"));
 }

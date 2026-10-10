@@ -17,10 +17,11 @@ const EMO_HAPPY: &str = "😎";
 const EMO_DOH: &str = "😗";
 const EMO_RED: &str = "😡";
 
-/// tcell ColorNavajoWhite / ColorOrange / ColorOrangeRed.
-const NAVAJO_WHITE: Color = Color::Rgb(0xFF, 0xDE, 0xAD);
-const ORANGE: Color = Color::Rgb(0xFF, 0xA5, 0x00);
-const ORANGE_RED: Color = Color::Rgb(0xFF, 0x45, 0x00);
+/// tcell ColorNavajoWhite / ColorOrange / ColorOrangeRed: named colors,
+/// always fitted to the 256 palette (see palette::named).
+const NAVAJO_WHITE: Color = Color::Indexed(223);
+const ORANGE: Color = Color::Indexed(214);
+const ORANGE_RED: Color = Color::Indexed(202);
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Flash {

@@ -16,6 +16,22 @@ mod markup;
 mod picker;
 mod table;
 
+pub(crate) use actions::{exec_failure, shell_banner};
+
+/// view.Picker titled "Containers Picker".
+pub(crate) fn containers_picker(
+    ctx: &mut Ctx,
+    items: Vec<String>,
+    on_pick: picker::PickFn,
+) -> Box<dyn View> {
+    Box::new(picker::Picker::new(
+        ctx,
+        "Containers Picker",
+        items,
+        on_pick,
+    ))
+}
+
 #[cfg(test)]
 mod tests;
 
@@ -63,7 +79,7 @@ pub(crate) struct Deps {
     pub parse_filter: fn(&str) -> FilterSpec,
     pub apply_filter: fn(&TableData, &FilterSpec) -> TableData,
     pub sort_rows: fn(&mut [RowEvent], &Header, usize, bool),
-    pub server_table: fn(&ServerTable, &str) -> (Header, Vec<Row>),
+    pub server_table: fn(&ServerTable, &str, Option<&ViewSetting>) -> (Header, Vec<Row>),
     pub context_config: fn(&Ctx) -> ContextConfig,
     pub dumps_dir: fn(&Ctx) -> PathBuf,
     pub benchmarks_dir: fn(&Ctx) -> PathBuf,
@@ -74,6 +90,10 @@ pub(crate) struct Deps {
     pub yaml: fn(&mut Ctx, Gvr, String) -> Box<dyn View>,
     pub logs: fn(&mut Ctx, LogOptions) -> Box<dyn View>,
     pub text: fn(&mut Ctx, String, String, String) -> Box<dyn View>,
+    /// Helm values viewer: (subject, user values, all values).
+    pub values: fn(&mut Ctx, String, String, String) -> Box<dyn View>,
+    /// Helm notes/manifest viewer: (title, subject, body).
+    pub release: fn(&mut Ctx, String, String, String) -> Box<dyn View>,
     pub help: fn(&mut Ctx, Vec<Hint>) -> Box<dyn View>,
     pub bench: BenchFn,
     pub run: Runner,
@@ -83,6 +103,24 @@ fn context_subpath(ctx: &Ctx) -> PathBuf {
     PathBuf::from(helpers::sanitize_file_name(&ctx.cluster_info.cluster))
         .join(helpers::sanitize_file_name(&ctx.cluster_info.context))
 }
+
+/// A command that exited non-zero; keeps its output like k9s oneShoot.
+#[derive(Debug)]
+pub(crate) struct RunFailed {
+    msg: String,
+    /// Go exec.ExitError text, e.g. `exit status 1`.
+    pub status: String,
+    /// stdout + stderr.
+    pub output: String,
+}
+
+impl std::fmt::Display for RunFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.msg)
+    }
+}
+
+impl std::error::Error for RunFailed {}
 
 fn default_runner() -> Runner {
     Arc::new(|argv: Vec<String>, env: Vec<(String, String)>| {
@@ -101,14 +139,19 @@ fn default_runner() -> Runner {
             let stdout = String::from_utf8_lossy(&out.stdout).to_string();
             if !out.status.success() {
                 let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
-                bail!(
-                    "{}",
-                    if stderr.is_empty() {
+                return Err(RunFailed {
+                    msg: if stderr.is_empty() {
                         out.status.to_string()
                     } else {
-                        stderr
-                    }
-                );
+                        stderr.clone()
+                    },
+                    status: match out.status.code() {
+                        Some(c) => format!("exit status {c}"),
+                        None => out.status.to_string(),
+                    },
+                    output: format!("{stdout}{stderr}").trim_matches('\n').to_string(),
+                }
+                .into());
             }
             Ok(stdout)
         }) as BoxFuture<'static, Result<String>>
@@ -123,10 +166,11 @@ impl Deps {
             parse_filter: FilterSpec::parse,
             apply_filter: crate::model::apply_filter,
             sort_rows: crate::model::sort_rows,
-            server_table: crate::render::core::render_server_table,
-            context_config: |ctx| {
-                ContextConfig::load(&ctx.cluster_info.cluster, &ctx.cluster_info.context)
-                    .unwrap_or_default()
+            server_table: crate::render::core::render_server_table_with,
+            context_config: |ctx| match &ctx.context_cfg {
+                Some(cc) => cc.clone(),
+                None => ContextConfig::load(&ctx.cluster_info.cluster, &ctx.cluster_info.context)
+                    .unwrap_or_default(),
             },
             dumps_dir: |ctx| {
                 let dir = ctx
@@ -163,6 +207,8 @@ impl Deps {
             yaml: crate::ui::views::yaml,
             logs: crate::ui::views::logs,
             text: crate::ui::views::text,
+            values: crate::ui::views::helm_values,
+            release: crate::ui::views::helm_release,
             help: crate::ui::shell::help,
             bench: |spec, cluster, context, name| {
                 Box::pin(crate::ui::views::run_benchmark(
@@ -188,6 +234,8 @@ pub(crate) struct Opts {
     pub dir: Option<PathBuf>,
     pub filter: Option<String>,
     pub alias: String,
+    /// The command line (gvr and namespace), a custom view key too.
+    pub line: String,
 }
 
 /// Async follow-ups posted back to the browser.
@@ -211,6 +259,10 @@ pub(crate) enum Msg {
         uid: String,
     },
     ShowNode(String),
+    /// CanI(all, namespaces, list) answer.
+    ListAllNs(bool),
+    /// cmd_buff keyEntryDelay elapsed.
+    FilterCompleted,
     ShowPortForwards(String),
     Owners {
         ns: String,
@@ -228,6 +280,16 @@ pub(crate) enum Msg {
         title: String,
         body: String,
     },
+    Values {
+        subject: String,
+        user: String,
+        all: String,
+    },
+    Release {
+        title: String,
+        subject: String,
+        body: String,
+    },
     Refs {
         gvr: Gvr,
         path: String,
@@ -235,7 +297,11 @@ pub(crate) enum Msg {
     Deleted(Vec<String>),
     Dim(Vec<String>),
     Refresh,
+    /// The updater's first refresh (initRefreshRate after Watch).
+    InitRefresh,
     BenchDone(std::result::Result<PathBuf, String>),
+    /// svc.go clearStatus: 2s after a benchmark ends.
+    ClearStatus,
 }
 
 pub(crate) fn post(tx: &tokio::sync::mpsc::UnboundedSender<AppEvent>, view: ViewId, msg: Msg) {
@@ -256,6 +322,10 @@ pub(crate) fn post_err(
     });
 }
 
+/// Sent to the top browser after views.yaml reloads (CustomView
+/// fireConfigChanged).
+pub(crate) struct ViewSettingsChanged;
+
 /// The resource table view.
 pub struct Browser {
     id: ViewId,
@@ -265,6 +335,11 @@ pub struct Browser {
     deps: Deps,
     renderer: Arc<dyn Renderer>,
     view_setting: Option<ViewSetting>,
+    /// The command alias the view was opened with (custom view lookup).
+    alias: String,
+    line: String,
+    /// ui.useFullGVRTitle (browser.go SetFullGVR).
+    full_gvr: bool,
     table: TableState,
     /// Model namespace: "" all, "-" cluster scoped, "*" not namespaced.
     ns: String,
@@ -284,6 +359,27 @@ pub struct Browser {
     loading: Option<JoinHandle<()>>,
     /// browser.go Start: the watch failed, so no updates ever come.
     watch_failed: bool,
+    /// Started by the boot command: an empty first result is not shown.
+    boot_skip: bool,
+    /// The watch access check already ran: Model.Watch fails at most once.
+    watch_checked: bool,
+    /// browser.go firstView: the first empty update is dropped.
+    first_view: bool,
+    /// CanI list namespaces cluster wide (gates the `0` key).
+    list_all_ns: bool,
+    /// `/` text typed since the last refresh tick.
+    typed: Option<String>,
+    /// Buffer text at the last BufferCompleted: Table.Filter retitles at
+    /// once, rows follow on the next model refresh.
+    shown: Option<String>,
+    /// A cmd_buff completion timer is running.
+    completion_pending: bool,
+    /// The last hotKeyActions pass hit a bad or duplicate shortcut.
+    hotkeys_failed: bool,
+    /// model.SetNamespace cleared the model; the next update replaces the rows.
+    data_reset: bool,
+    /// refreshActions ran: it only runs once the model delivers data.
+    actions_ready: bool,
     bench: Option<JoinHandle<()>>,
     active: bool,
     dirty: bool,
@@ -308,18 +404,10 @@ pub fn containers(ctx: &mut Ctx, path: String) -> Box<dyn View> {
     ))
 }
 
+/// app.go dirCmd only stats the path (done by the shell); the view keeps
+/// it verbatim (no `~` expansion, no symlink resolution) for title and rows.
 fn expand_dir(arg: &str) -> Result<PathBuf> {
-    let p = if arg == "~" || arg.starts_with("~/") {
-        let home = dirs::home_dir().ok_or_else(|| anyhow!("unable to locate home dir"))?;
-        home.join(arg.trim_start_matches('~').trim_start_matches('/'))
-    } else {
-        PathBuf::from(arg)
-    };
-    let p = std::fs::canonicalize(&p).map_err(|e| anyhow!("invalid dir {arg:?}: {e}"))?;
-    if !p.is_dir() {
-        bail!("{arg:?} is not a directory");
-    }
-    Ok(p)
+    Ok(PathBuf::from(arg))
 }
 
 /// k9s mapSubject.
@@ -340,6 +428,11 @@ pub(crate) fn open_with(ctx: &mut Ctx, cmd: &Command, deps: Deps) -> Result<Box<
     let mut opts = Opts {
         ns: cmd.namespace.clone(),
         alias: cmd.alias.clone(),
+        line: match cmd.namespace.as_deref().filter(|n| !n.is_empty()) {
+            Some(ns) => format!("{} {ns}", cmd.gvr),
+            None => cmd.gvr.clone(),
+        },
+        instance: cmd.instance.clone(),
         ..Default::default()
     };
     match kind {
@@ -388,8 +481,11 @@ fn is_k8s_resource(ctx: &Ctx, gvr: &Gvr) -> bool {
     ctx.resources.iter().any(|m| &m.gvr == gvr)
 }
 
+/// model.initRefreshRate.
+const INIT_REFRESH_RATE: std::time::Duration = std::time::Duration::from_millis(300);
+
 /// watch.Factory.CanForResource denial message.
-fn access_denied(ns: &str, gvr: &Gvr) -> String {
+pub(crate) fn access_denied(ns: &str, gvr: &Gvr) -> String {
     format!(
         "[list] access denied on resource {}:{}",
         crate::ui::shell::text::go_quote(ns),
@@ -399,7 +495,7 @@ fn access_denied(ns: &str, gvr: &Gvr) -> String {
 
 /// Run a short async check from sync view setup, as k9s' Init blocks on
 /// its access review (cached by the accessor).
-fn block_on<T>(f: impl std::future::Future<Output = T> + Send) -> T
+pub(crate) fn block_on<T>(f: impl std::future::Future<Output = T> + Send) -> T
 where
     T: Send,
 {
@@ -428,7 +524,8 @@ impl Browser {
         opts: Opts,
     ) -> Browser {
         let id = ctx.new_view_id();
-        let view_setting = Self::lookup_view_setting(ctx, &gvr, &opts.alias);
+        let start_ns = opts.ns.clone().unwrap_or_else(|| ctx.namespace.clone());
+        let view_setting = Self::lookup_view_setting(ctx, &gvr, &opts.alias, &opts.line, &start_ns);
         let renderer: Arc<dyn Renderer> = {
             let mut r = (deps.make_renderer)(&gvr);
             r.set_view_setting(view_setting.clone());
@@ -445,6 +542,7 @@ impl Browser {
             Kind::Policy => Some(("API-GROUP", false)),
             Kind::Workload => Some(("KIND", true)),
             Kind::HelmHistory => Some(("REVISION", false)),
+            Kind::ImageScan => Some(("SEVERITY", true)),
             _ => None,
         };
         if let Some((n, asc)) = initial_sort {
@@ -464,7 +562,9 @@ impl Browser {
                 path = format!("{k}:{n}");
             }
         }
-        if let (Kind::Rules | Kind::Reference, Some((_, p))) = (kind, &opts.source) {
+        if let (Kind::Rules | Kind::Reference | Kind::ImageScan, Some((_, p))) =
+            (kind, &opts.source)
+        {
             path = p.clone();
         }
         let cc = (deps.context_config)(ctx);
@@ -476,6 +576,9 @@ impl Browser {
             deps,
             renderer,
             view_setting,
+            alias: opts.alias.clone(),
+            line: opts.line.clone(),
+            full_gvr: ctx.config.read().is_ok_and(|c| c.k9s.ui.use_full_gvr_name),
             table,
             ns: String::new(),
             path,
@@ -493,6 +596,16 @@ impl Browser {
             has_metrics: ctx.has_metrics,
             loading: None,
             watch_failed: false,
+            boot_skip: false,
+            watch_checked: false,
+            first_view: false,
+            list_all_ns: true,
+            typed: None,
+            shown: None,
+            completion_pending: false,
+            hotkeys_failed: false,
+            data_reset: false,
+            actions_ready: false,
             bench: None,
             active: false,
             dirty: true,
@@ -511,25 +624,59 @@ impl Browser {
         b
     }
 
-    fn lookup_view_setting(ctx: &Ctx, gvr: &Gvr, alias: &str) -> Option<ViewSetting> {
-        let views = &ctx.views.views;
+    /// view/table.go Start + CustomView.fireConfigChanged: the commands this
+    /// table answers to (gvr, command line, aliases; plain names before
+    /// gvrs), the first with a setting for namespace `ns` wins (getVS,
+    /// including `gvr@ns-regex` and `cmd ns` keys).
+    fn lookup_view_setting(
+        ctx: &Ctx,
+        gvr: &Gvr,
+        alias: &str,
+        line: &str,
+        ns: &str,
+    ) -> Option<ViewSetting> {
         let gs = gvr.to_string();
-        if let Some(v) = views.get(&gs) {
-            return Some(v.clone());
-        }
-        if !alias.is_empty() {
-            if let Some(v) = views.get(alias) {
-                return Some(v.clone());
+        let mut cmds = vec![gs.clone()];
+        for c in [line, alias] {
+            if !c.is_empty() && !cmds.iter().any(|x| x == c) {
+                cmds.push(c.to_string());
             }
         }
-        if let Some(v) = views.get(gvr.r()) {
-            return Some(v.clone());
+        cmds.sort_by(|a, b| match (a.contains('/'), b.contains('/')) {
+            (true, false) => std::cmp::Ordering::Greater,
+            (false, true) => std::cmp::Ordering::Less,
+            _ => a.cmp(b),
+        });
+        cmds.iter().find_map(|c| ctx.views.get_vs(c, ns))
+    }
+
+    /// ui.Table.ViewSettingsChanged: views.yaml was reloaded.
+    fn view_settings_changed(&mut self, ctx: &mut Ctx) -> Vec<ViewCmd> {
+        if self.apply_view_setting(ctx) {
+            self.spawn_load(ctx, true);
         }
-        ctx.aliases
-            .aliases
-            .iter()
-            .filter(|(_, g)| **g == gs)
-            .find_map(|(a, _)| views.get(a).cloned())
+        Vec::new()
+    }
+
+    /// Resolve the view setting for the current namespace; true when it
+    /// changed.
+    fn apply_view_setting(&mut self, ctx: &Ctx) -> bool {
+        let vs = Self::lookup_view_setting(ctx, &self.gvr, &self.alias, &self.line, &self.ns);
+        if vs == self.view_setting {
+            return false;
+        }
+        let mut r = (self.deps.make_renderer)(&self.gvr);
+        r.set_view_setting(vs.clone());
+        self.renderer = Arc::from(r);
+        if vs.is_none() {
+            if !self.table.manual_sort && self.table.sort.name.is_empty() {
+                self.table.sort = SortColumn::default();
+            }
+        } else {
+            self.table.manual_sort = false;
+        }
+        self.view_setting = vs;
+        true
     }
 
     /// Browser.setNamespace.
@@ -540,19 +687,48 @@ impl Browser {
         }
         match self.kind {
             Kind::Alias => ns = table::NOT_NAMESPACED.to_string(),
-            Kind::Reference => ns = String::new(),
+            Kind::Reference | Kind::ImageScan => ns = String::new(),
             _ => {}
         }
         if ns != self.ns {
             self.ns = ns.clone();
-            self.table.data = TableData::new(self.gvr.clone(), Header::default(), ns);
-            self.table.rows.clear();
-            self.table.loaded = false;
-            self.dirty = true;
+            // model.SetNamespace resets the model data only: the UI table
+            // keeps its rows and header until the next update lands, which
+            // then replaces them wholesale.
+            self.table.data.namespace = ns;
+            self.data_reset = true;
         }
     }
 
     /// The `/` buffer changed: recompute the server-side label selector.
+    /// The title's filter part (ui.Table.styleTitle over the cmd buffer).
+    fn title_buff(&self) -> String {
+        match &self.shown {
+            Some(t) => table::title_filter(t, None),
+            None => table::title_filter(&self.filter, self.label.as_deref()),
+        }
+    }
+
+    fn schedule_completion(&mut self, ctx: &Ctx, delay: std::time::Duration) {
+        if self.completion_pending {
+            return;
+        }
+        self.completion_pending = true;
+        actions::spawn_msg(ctx, self.id, async move {
+            tokio::time::sleep(delay).await;
+            Ok(Msg::FilterCompleted)
+        });
+    }
+
+    /// view.Table.BufferCompleted -> Table.Filter: retitle and select the
+    /// first row; the rows refilter on the next refresh.
+    pub(super) fn filter_completed(&mut self) {
+        if let Some(t) = self.typed.clone() {
+            self.shown = Some(t);
+            self.table.select_first();
+        }
+    }
+
     fn set_filter_text(&mut self, text: &str) -> bool {
         self.filter = text.to_string();
         let old = self.label.clone();
@@ -588,6 +764,7 @@ impl Browser {
     fn resource_name(&self) -> String {
         match self.kind {
             Kind::Dir => "dirs".into(),
+            _ if self.full_gvr => self.gvr.to_string(),
             _ => self.gvr.r().to_string(),
         }
     }
@@ -617,6 +794,7 @@ impl Browser {
             accessor: ctx.accessor.clone(),
             renderer: self.renderer.clone(),
             server_table: self.deps.server_table,
+            view_setting: self.view_setting.clone(),
             run: self.deps.run.clone(),
             aliases: groups
                 .into_iter()
@@ -667,14 +845,18 @@ impl Browser {
         let spec = self.load_spec(ctx);
         let tx = ctx.sender();
         let id = self.id;
-        // browser.go Start: a watch the user may not list fails once with
-        // "Watcher failed"; no updates follow.
-        let watch_check = (!self.table.loaded && is_k8s_resource(ctx, &self.gvr)).then(|| {
+        // browser.go Start: Model.Watch runs the first refresh; if it fails
+        // (e.g. the user may not list) k9s flashes "Watcher failed" once and
+        // no updates follow.
+        let watch = !self.watch_checked;
+        self.watch_checked = true;
+        let watch_check = (watch && is_k8s_resource(ctx, &self.gvr)).then(|| {
             (
                 self.gvr.clone(),
                 crate::k8s::clean_namespace(&spec.ns).to_string(),
             )
         });
+        let gvr = self.gvr.clone();
         self.loading = Some(ctx.spawn(async move {
             if let Some((gvr, ns)) = watch_check {
                 let denied = match spec.accessor.can(&gvr, &ns, "list").await {
@@ -691,10 +873,22 @@ impl Browser {
                     return;
                 }
             }
-            match loader::load(spec).await {
+            match loader::load_guarded(spec).await {
                 Ok(data) => {
                     let _ = tx.send(AppEvent::Data { view: id, data });
+                    if watch {
+                        // model.Table.updater: the first refresh comes after initRefreshRate.
+                        tokio::spawn(async move {
+                            tokio::time::sleep(INIT_REFRESH_RATE).await;
+                            post(&tx, id, Msg::InitRefresh);
+                        });
+                    }
                 }
+                Err(e) if watch => post(
+                    &tx,
+                    id,
+                    Msg::WatchFailed(format!("Watcher failed for {gvr} -- {e:#}")),
+                ),
                 Err(e) => post_err(&tx, id, format!("{e:#}")),
             }
         }));
@@ -705,14 +899,26 @@ impl Browser {
         if td.namespace != self.ns || td.gvr != self.gvr {
             return Vec::new();
         }
-        let first = !self.table.loaded;
-        if self.table.data.header != td.header {
+        // browser.go TableNoData: k9s drops the boot refresh (app not
+        // running yet) and skips the next empty one as the first view.
+        if std::mem::take(&mut self.boot_skip) && td.rows.is_empty() {
+            return Vec::new();
+        }
+        let empty = td.rows.is_empty();
+        // TableNoData skips the first empty update (and any without a header).
+        if empty && (!self.first_view || td.header.is_empty()) {
+            self.first_view = true;
+            return Vec::new();
+        }
+        // The UI table has no columns yet: TableDataChanged/TableNoData flash.
+        let first = !self.actions_ready;
+        self.actions_ready = true;
+        if std::mem::take(&mut self.data_reset) || self.table.data.header != td.header {
             self.table.data.rows.clear();
         }
         self.table.data.header = td.header;
         self.table.data.namespace = td.namespace;
         self.table.data.gvr = td.gvr;
-        let empty = td.rows.is_empty();
         self.table
             .data
             .update(td.rows.into_iter().map(|r| r.row).collect());
@@ -728,8 +934,12 @@ impl Browser {
         self.dirty = true;
         self.rebuild(ctx);
         self.refresh_actions(ctx);
+        // refreshActions -> hotKeyActions error: logo warning on each update.
+        let warn = self
+            .hotkeys_failed
+            .then(|| ViewCmd::LogoWarn("HotKeys load failed!".into()));
         if !first {
-            return Vec::new();
+            return warn.into_iter().collect();
         }
         let msg = if empty {
             (
@@ -752,7 +962,9 @@ impl Browser {
                 ),
             )
         };
-        vec![ViewCmd::Flash(msg.0, msg.1)]
+        let mut out = vec![ViewCmd::Flash(msg.0, msg.1)];
+        out.extend(warn);
+        out
     }
 
     /// Decorations k9s applies before display (pod PF indicator,
@@ -955,7 +1167,15 @@ impl Browser {
 
     /// Aliases of this resource (plugin scopes).
     fn scope_aliases(&self, ctx: &Ctx) -> Vec<String> {
-        let gs = self.gvr.to_string();
+        scope_aliases(ctx, &self.gvr)
+    }
+}
+
+/// Aliases a resource answers to (plugin scopes): command aliases, plural,
+/// short and singular names.
+pub(crate) fn scope_aliases(ctx: &Ctx, gvr: &Gvr) -> Vec<String> {
+    {
+        let gs = gvr.to_string();
         let mut out: Vec<String> = ctx
             .aliases
             .aliases
@@ -963,8 +1183,8 @@ impl Browser {
             .filter(|(_, g)| **g == gs)
             .map(|(a, _)| a.clone())
             .collect();
-        out.push(self.gvr.r().to_string());
-        if let Some(m) = ctx.resources.iter().find(|m| m.gvr == self.gvr) {
+        out.push(gvr.r().to_string());
+        if let Some(m) = ctx.resources.iter().find(|m| m.gvr == *gvr) {
             out.extend(m.short_names.iter().cloned());
             if !m.singular_name.is_empty() {
                 out.push(m.singular_name.clone());
@@ -972,10 +1192,22 @@ impl Browser {
         }
         out
     }
+}
 
+impl Browser {
     /// Table.bindKeys + Browser.bindKeys + refreshActions + extenders,
     /// plugins and hotkeys.
     fn refresh_actions(&mut self, ctx: &Ctx) {
+        // Config.FavNamespaces runs Namespace.Validate: favorites the cluster
+        // does not list are dropped (none are valid if the list failed).
+        if ctx.namespaces_known {
+            let known = &ctx.namespaces;
+            self.cc.namespace.validate_with(&|n| {
+                table::is_cluster_wide(n)
+                    || n == table::NOT_NAMESPACED
+                    || known.iter().any(|k| k == n)
+            });
+        }
         let ro = ctx.readonly;
         let mut aa = Actions::new();
         aa.insert(rune('?'), Action::new("Help", Act::Help, true));
@@ -1041,18 +1273,29 @@ impl Browser {
             aa.remove(&rune('P'));
         }
 
+        if !self.actions_ready {
+            self.actions = aa;
+            return;
+        }
         let mut a2 = Actions::new();
         a2.insert(rune('c'), Action::new("Copy", Act::Copy, false));
         a2.insert(KEY_ENTER, Action::new("View", Act::Enter, false));
         a2.insert(ctrl('r'), Action::new("Refresh", Act::Refresh, false));
-        if self.meta.namespaced && self.path.is_empty() {
+        // refreshActions: namespace, edit and delete keys need ConOK.
+        let con = ctx.con_ok;
+        if con && self.meta.namespaced && self.path.is_empty() {
             a2.insert(rune('n'), Action::new("Copy Namespace", Act::CopyNs, false));
             a2.insert(rune('w'), Action::new("Warp To Namespace", Act::Warp, true));
-            a2.insert(
-                rune('0'),
-                Action::new(NAMESPACE_ALL, Act::SwitchNs(NAMESPACE_ALL.into()), true),
-            );
-            let mut index = 1u32;
+            // namespaceActions: `0` is all namespaces only for users who may
+            // list them cluster wide; favorites then start at `0`.
+            let mut index = 0u32;
+            if self.list_all_ns {
+                a2.insert(
+                    rune('0'),
+                    Action::new(NAMESPACE_ALL, Act::SwitchNs(NAMESPACE_ALL.into()), true),
+                );
+                index = 1;
+            }
             for ns in &self.cc.namespace.favorites {
                 if ns == NAMESPACE_ALL {
                     continue;
@@ -1068,7 +1311,7 @@ impl Browser {
                 index += 1;
             }
         }
-        if !ro {
+        if con && !ro {
             if self.meta.can("edit") {
                 a2.insert(rune('e'), Action::danger("Edit", Act::Edit));
             }
@@ -1122,7 +1365,8 @@ impl Browser {
         }
     }
 
-    fn hotkey_keys(&self, aa: &mut Actions, ctx: &Ctx) {
+    fn hotkey_keys(&mut self, aa: &mut Actions, ctx: &Ctx) {
+        self.hotkeys_failed = false;
         if ctx.hotkeys.hot_keys.is_empty() {
             return;
         }
@@ -1130,10 +1374,12 @@ impl Browser {
         for (name, hk) in &ctx.hotkeys.hot_keys {
             let Some(key) = (self.deps.parse_key)(&hk.short_cut).and_then(|k| key_of(&k)) else {
                 tracing::warn!(hotkey = %name, shortcut = %hk.short_cut, "invalid hotkey shortcut");
+                self.hotkeys_failed = true;
                 continue;
             };
             if aa.contains_key(&key) && !hk.override_ {
                 tracing::warn!(hotkey = %name, shortcut = %hk.short_cut, "duplicate hotkey");
+                self.hotkeys_failed = true;
                 continue;
             }
             aa.insert(
@@ -1189,12 +1435,35 @@ impl Browser {
         let used_by = |aa: &mut Actions| {
             aa.insert(rune('u'), Action::new("UsedBy", Act::UsedBy, true));
         };
+        // vul_extender.go: only with imageScans.enable.
+        let scans_on = ctx
+            .config
+            .read()
+            .map(|c| c.k9s.image_scans.enable)
+            .unwrap_or(false);
+        let vul = |aa: &mut Actions| {
+            if scans_on {
+                aa.insert(
+                    rune('v'),
+                    Action::new("Show Vulnerabilities", Act::ShowVulns, true),
+                );
+                aa.insert(
+                    rune('V'),
+                    Action::new(
+                        "Sort Vulnerabilities",
+                        Act::SortCol("VS".into(), true),
+                        false,
+                    ),
+                );
+            }
+        };
         match self.kind {
             Kind::Generic => {
                 owner(aa);
                 scale(aa);
             }
             Kind::Pod => {
+                vul(aa);
                 logs(aa);
                 image(aa);
                 owner(aa);
@@ -1225,6 +1494,7 @@ impl Browser {
                 );
             }
             Kind::Deploy | Kind::StatefulSet => {
+                vul(aa);
                 logs(aa);
                 owner(aa);
                 image(aa);
@@ -1239,6 +1509,7 @@ impl Browser {
                 }
             }
             Kind::DaemonSet => {
+                vul(aa);
                 logs(aa);
                 owner(aa);
                 image(aa);
@@ -1246,14 +1517,17 @@ impl Browser {
                 pf(aa);
             }
             Kind::ReplicaSet => {
+                vul(aa);
                 owner(aa);
                 aa.insert(ctrl('l'), Action::new("Rollback", Act::Rollback, true));
             }
             Kind::Job => {
+                vul(aa);
                 logs(aa);
                 owner(aa);
             }
             Kind::CronJob => {
+                vul(aa);
                 owner(aa);
                 aa.insert(rune('t'), Action::new("Trigger", Act::Trigger, true));
                 aa.insert(
@@ -1277,6 +1551,11 @@ impl Browser {
             }
             Kind::Context => {
                 del(aa, &[rune('A'), KEY_CTRL_SPACE, KEY_SPACE]);
+                // context.go bindDangerousKeys.
+                if !ro {
+                    aa.insert(rune('r'), Action::new("Rename", Act::RenameContext, true));
+                    aa.insert(ctrl('d'), Action::new("Delete", Act::DeleteContext, true));
+                }
             }
             Kind::Service => {
                 logs(aa);
@@ -1447,6 +1726,17 @@ impl Browser {
                 aa.insert(rune('y'), Action::new("YAML", Act::Yaml, true));
                 aa.insert(rune('d'), Action::new("Describe", Act::Describe, true));
             }
+            Kind::ImageScan => {
+                del(aa, &[rune('A'), rune('N'), rune('S'), ctrl('z'), ctrl('w')]);
+                for (k, d, c) in [
+                    ('L', "Sort Lib", "LIBRARY"),
+                    ('S', "Sort Severity", "SEVERITY"),
+                    ('F', "Sort Fixed-in", "FIXED-IN"),
+                    ('V', "Sort Vulnerability", "VULNERABILITY"),
+                ] {
+                    aa.insert(rune(k), Action::new(d, Act::SortCol(c.into(), false), true));
+                }
+            }
             Kind::Reference => {
                 del(aa, &[rune('A'), ctrl('s'), KEY_CTRL_SPACE, KEY_SPACE]);
                 del(aa, &[ctrl('w'), ctrl('l'), ctrl('z')]);
@@ -1536,7 +1826,7 @@ impl View for Browser {
             return String::new();
         }
         let (r, ns, n) = self.title_parts();
-        let buff = table::title_filter(&self.filter, self.label.as_deref());
+        let buff = self.title_buff();
         table::plain_title(&r, &ns, n, &buff)
     }
 
@@ -1554,6 +1844,23 @@ impl View for Browser {
             if print_namespace(&ctx.namespace) != want {
                 out.push(ViewCmd::SetNamespace(want));
             }
+        }
+        self.boot_skip = ctx.booting && !self.table.loaded;
+        // table.go Start: custom view listeners are re-registered with the
+        // current namespace.
+        self.apply_view_setting(ctx);
+        // browser.go Start: reset the first view counter and watch again.
+        self.first_view = false;
+        self.watch_checked = false;
+        if self.meta.namespaced && self.path.is_empty() {
+            let (acc, id) = (ctx.accessor.clone(), self.id);
+            actions::spawn_msg(ctx, id, async move {
+                let ok = acc
+                    .can(&crate::k8s::known::namespaces(), "", "list")
+                    .await
+                    .unwrap_or(false);
+                Ok(Msg::ListAllNs(ok))
+            });
         }
         self.refresh_actions(ctx);
         self.spawn_load(ctx, true);
@@ -1607,6 +1914,13 @@ impl View for Browser {
         match ev {
             AppEvent::Tick => {
                 if self.active {
+                    if let Some(t) = self.typed.take() {
+                        self.shown = None;
+                        let changed = self.set_filter_text(&t);
+                        self.rebuild(ctx);
+                        self.spawn_load(ctx, changed);
+                        return Vec::new();
+                    }
                     self.spawn_load(ctx, false);
                 }
                 Vec::new()
@@ -1617,6 +1931,11 @@ impl View for Browser {
             }
             AppEvent::Info { view, msg } if *view == self.id => {
                 vec![ViewCmd::Flash(FlashLevel::Info, msg.clone())]
+            }
+            AppEvent::Custom { view, payload }
+                if *view == self.id && payload.is::<ViewSettingsChanged>() =>
+            {
+                self.view_settings_changed(ctx)
             }
             AppEvent::Custom { view, payload } if *view == self.id => {
                 // Payloads are single-use; the shell hands us a shared ref,
@@ -1633,12 +1952,63 @@ impl View for Browser {
         }
     }
 
+    /// ui.Table reads the buffer on its next model refresh: a typed filter
+    /// (label selectors included) lands with the next tick, not per key.
+    fn on_filter_typing(&mut self, text: &str, ctx: &mut Ctx) -> Vec<ViewCmd> {
+        let prev = self.typed.clone().unwrap_or_else(|| self.filter.clone());
+        self.typed = Some(text.to_string());
+        // model/cmd_buff.go: Add completes 100ms after the first key of a
+        // burst; Delete completes at once and again after 800ms.
+        if text.len() < prev.len() {
+            self.filter_completed();
+            self.schedule_completion(ctx, std::time::Duration::from_millis(800));
+        } else {
+            self.schedule_completion(ctx, std::time::Duration::from_millis(100));
+        }
+        Vec::new()
+    }
+
     fn on_filter(&mut self, text: &str, ctx: &mut Ctx) -> Vec<ViewCmd> {
+        self.typed = None;
+        self.shown = None;
         let changed = self.set_filter_text(text);
         self.table.select_first();
         self.rebuild(ctx);
         if changed {
             self.spawn_load(ctx, true);
+        }
+        Vec::new()
+    }
+
+    /// tview Table.MouseHandler: a click selects the row under the mouse
+    /// (header, borders and rows past the end select the first row); the
+    /// wheel scrolls the viewport, clamped so the selection stays visible.
+    fn on_mouse(&mut self, m: crate::ui::Mouse, area: Rect, _ctx: &mut Ctx) -> Vec<ViewCmd> {
+        use crate::ui::Mouse;
+        let st = &mut self.table;
+        match m {
+            Mouse::Click { y, .. } => {
+                // Inner rect starts below the top border; row 0 is the header.
+                let r = y as i64 - (area.y as i64 + 1);
+                let tview_row = if r >= 1 { r + st.row_offset as i64 } else { r };
+                st.cursor = if tview_row >= 1 && (tview_row as usize) <= st.rows.len() {
+                    tview_row as usize - 1
+                } else {
+                    0
+                };
+            }
+            Mouse::ScrollUp { .. } => st.row_offset = st.row_offset.saturating_sub(1),
+            Mouse::ScrollDown { .. } => {
+                let max = st.rows.len().saturating_sub(st.page);
+                st.row_offset = (st.row_offset + 1).min(max);
+            }
+        }
+        // Draw keeps the cursor inside the viewport.
+        if st.cursor < st.row_offset {
+            st.row_offset = st.cursor;
+        }
+        if st.page > 0 && st.cursor >= st.row_offset + st.page {
+            st.row_offset = st.cursor + 1 - st.page;
         }
         Vec::new()
     }
@@ -1649,7 +2019,7 @@ impl View for Browser {
         }
         let (r, ns, n) = self.title_parts();
         let title = if self.table.loaded {
-            let buff = table::title_filter(&self.filter, self.label.as_deref());
+            let buff = self.title_buff();
             table::styled_title(&r, &ns, n, &buff, &TitleColors::from_styles(&ctx.styles))
         } else {
             String::new()
@@ -1672,6 +2042,10 @@ impl View for Browser {
 
     fn filter_text(&self) -> String {
         self.filter.clone()
+    }
+
+    fn keeps_filter_history(&self) -> bool {
+        !self.table.rows.is_empty()
     }
 
     fn as_any(&self) -> &dyn Any {

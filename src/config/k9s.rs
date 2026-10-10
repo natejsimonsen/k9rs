@@ -497,6 +497,8 @@ impl K9s {
         for (k, v) in k1.gpu_vendors {
             self.manual.gpu_vendors.insert(k, v);
         }
+        // config.KnownGPUVendors is global in k9s; the renderers read it.
+        crate::render::helpers::set_gpu_vendors(&self.known_gpu_vendors());
         self.live_view_auto_refresh = k1.live_view_auto_refresh;
         self.default_view = k1.default_view;
         self.screen_dump_dir = k1.screen_dump_dir;
@@ -573,7 +575,7 @@ impl K9s {
         if self.manual.refresh_rate != 0.0 {
             rate = self.manual.refresh_rate;
         }
-        if rate < DEFAULT_REFRESH_RATE {
+        if rate.is_nan() || rate < DEFAULT_REFRESH_RATE {
             if !REFRESH_RATE_WARNED.swap(true, Ordering::Relaxed) {
                 tracing::warn!(
                     requested = rate as f64,
@@ -588,7 +590,7 @@ impl K9s {
 
     /// Refresh rate as a duration.
     pub fn refresh_duration(&self) -> Duration {
-        Duration::from_secs_f32(self.get_refresh_rate())
+        secs(self.get_refresh_rate() as f64)
     }
 
     /// Effective read only mode: config, then context config, then flags.
@@ -800,7 +802,17 @@ pub fn parse_go_duration(s: &str) -> Option<Duration> {
     if neg {
         return None;
     }
-    Some(Duration::from_secs_f64(total))
+    Duration::try_from_secs_f64(total).ok()
+}
+
+/// Seconds from config/flags as a duration timers accept: never panics on
+/// NaN, infinite or huge values (capped at a day); non-positive is zero.
+pub fn secs(r: f64) -> Duration {
+    const MAX: f64 = 24.0 * 3600.0;
+    if r.is_nan() || r <= 0.0 {
+        return Duration::ZERO;
+    }
+    Duration::from_secs_f64(r.min(MAX))
 }
 
 /// Format a duration like Go's `time.Duration.String` (whole units).
@@ -887,7 +899,7 @@ impl Config {
         let mut errs: Vec<String> = Vec::new();
         if let Err(e) = json::validate(json::K9S_SCHEMA, &bb) {
             errs.push(format!(
-                "k9s config file {:?} load failed:\n{e}",
+                "k9rs config file {:?} load failed:\n{e}",
                 path.to_string_lossy()
             ));
         }
@@ -913,7 +925,7 @@ impl Config {
         paths::ensure_dir_path(path)?;
         let s = yaml::to_string(self)?;
         paths::write_file(path, s.as_bytes())?;
-        tracing::info!(path = %path.display(), "[CONFIG] Saving K9s config to disk");
+        tracing::info!(path = %path.display(), "[CONFIG] Saving K9rs config to disk");
         Ok(())
     }
 
@@ -1197,6 +1209,10 @@ impl ContextConfig {
     /// Load the per-context config for `cluster`/`context`, with defaults
     /// (generated and saved when missing).
     pub fn load(cluster: &str, context: &str) -> Result<ContextConfig> {
+        // K9s.ActiveContext: nothing to load (or generate) without a context.
+        if cluster.is_empty() || context.is_empty() {
+            return Err(anyhow!("no context found for: {context:?}"));
+        }
         ContextConfig::activate(&paths::contexts_dir(), cluster, context, "")
     }
 
@@ -1318,6 +1334,23 @@ impl ContextConfig {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn secs_never_panics() {
+        assert_eq!(secs(f64::NAN), Duration::ZERO);
+        assert_eq!(secs(-1.0), Duration::ZERO);
+        assert_eq!(secs(f64::INFINITY), Duration::from_secs(86_400));
+        assert_eq!(secs(1e300), Duration::from_secs(86_400));
+        assert_eq!(secs(2.0), Duration::from_secs(2));
+        let mut k = K9s {
+            refresh_rate: f32::NAN,
+            ..Default::default()
+        };
+        assert_eq!(k.refresh_duration(), Duration::from_secs(2));
+        k.refresh_rate = 1e38;
+        assert_eq!(k.refresh_duration(), Duration::from_secs(86_400));
+    }
+
     use super::*;
     use crate::config::paths::MapEnv;
 
@@ -1410,7 +1443,7 @@ mod tests {
         assert_eq!(
             err,
             format!(
-                "k9s config file {:?} load failed:\nAdditional property disablePodCounts is not allowed\nAdditional property shellPods is not allowed\nInvalid type. Expected: boolean, given: string",
+                "k9rs config file {:?} load failed:\nAdditional property disablePodCounts is not allowed\nAdditional property shellPods is not allowed\nInvalid type. Expected: boolean, given: string",
                 p.to_string_lossy()
             )
         );

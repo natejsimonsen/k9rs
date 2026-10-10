@@ -23,7 +23,7 @@ pub const K9S_ENV_LOGS_DIR: &str = "K9S_LOGS_DIR";
 /// App name used for dir names.
 pub const APP_NAME: &str = "k9s";
 /// Log file name.
-pub const K9S_LOGS_FILE: &str = "k9s.log";
+pub const K9S_LOGS_FILE: &str = "k9rs.log";
 /// Main config file name (data.MainConfigFile).
 pub const MAIN_CONFIG_FILE: &str = "config.yaml";
 /// Default dir permissions (data.DefaultDirMod).
@@ -528,15 +528,33 @@ pub fn ensure_full_path(path: &Path) -> Result<()> {
     if path.as_os_str().is_empty() || path.exists() {
         return Ok(());
     }
+    mkdir_all(path)
+}
+
+/// os.MkdirAll, with Go's `mkdir <path>: <errno>` errors.
+fn mkdir_all(path: &Path) -> Result<()> {
+    let go_err =
+        |e: &std::io::Error| anyhow::anyhow!(crate::cli::info::go_path_error("mkdir", path, e));
+    if let Ok(m) = std::fs::metadata(path) {
+        if m.is_dir() {
+            return Ok(());
+        }
+        return Err(anyhow::anyhow!("mkdir {}: not a directory", path.display()));
+    }
+    if let Some(p) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        mkdir_all(p)?;
+    }
     let mut b = std::fs::DirBuilder::new();
-    b.recursive(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt;
         b.mode(DEFAULT_DIR_MOD);
     }
-    b.create(path)?;
-    Ok(())
+    match b.create(path) {
+        Ok(()) => Ok(()),
+        Err(_) if path.is_dir() => Ok(()),
+        Err(e) => Err(go_err(&e)),
+    }
 }
 
 /// Create the parent dir of `path` if missing (data.EnsureDirPath).
@@ -564,6 +582,32 @@ pub fn write_file(path: &Path, bb: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mkdir_errors_like_go() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = tmp.path().join("file");
+        std::fs::write(&f, "x").unwrap();
+        let e = ensure_full_path(&f.join("a/b")).unwrap_err().to_string();
+        assert_eq!(e, format!("mkdir {}: not a directory", f.display()));
+        let d = tmp.path().join("x/y/z");
+        ensure_full_path(&d).unwrap();
+        assert!(d.is_dir());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let ro = tmp.path().join("ro");
+            std::fs::create_dir(&ro).unwrap();
+            std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o500)).unwrap();
+            let e = ensure_dir_path(&ro.join("dumps/x"))
+                .unwrap_err()
+                .to_string();
+            assert_eq!(
+                e,
+                format!("mkdir {}: permission denied", ro.join("dumps").display())
+            );
+        }
+    }
 
     fn home() -> PathBuf {
         PathBuf::from("/home/fred")
@@ -627,7 +671,7 @@ mod tests {
         );
         assert_eq!(
             resolve_log_file(&MapEnv::default(), &x),
-            PathBuf::from("/home/fred/.local/state/k9s/k9s.log")
+            PathBuf::from("/home/fred/.local/state/k9s/k9rs.log")
         );
     }
 
@@ -644,7 +688,7 @@ mod tests {
         assert_eq!(l.dumps_dir, sup.join("k9s/screen-dumps"));
         assert_eq!(
             resolve_log_file(&MapEnv::default(), &x),
-            sup.join("k9s/k9s.log")
+            sup.join("k9s/k9rs.log")
         );
         assert_eq!(
             l.plugin_dirs(),
@@ -734,7 +778,7 @@ mod tests {
         let user = must_k9s_user(&env);
         assert_eq!(
             resolve_log_file(&env, &x),
-            PathBuf::from(format!("/var/tmp/{user}/k9s/k9s.log"))
+            PathBuf::from(format!("/var/tmp/{user}/k9s/k9rs.log"))
         );
     }
 
@@ -744,20 +788,20 @@ mod tests {
         let x = Xdg::resolve(&env, &home(), false);
         assert_eq!(
             resolve_log_file(&env, &x),
-            PathBuf::from("/tmp/test/k9s/logs/k9s.log")
+            PathBuf::from("/tmp/test/k9s/logs/k9rs.log")
         );
         let env = MapEnv::new(&[("XDG_STATE_HOME", "/tmp/test/xdg-state")]);
         let x = Xdg::resolve(&env, &home(), false);
         assert_eq!(
             resolve_log_file(&env, &x),
-            PathBuf::from("/tmp/test/xdg-state/k9s/k9s.log")
+            PathBuf::from("/tmp/test/xdg-state/k9s/k9rs.log")
         );
         // Empty values count as unset.
         let env = MapEnv::new(&[(K9S_ENV_LOGS_DIR, ""), (K9S_ENV_CONFIG_DIR, "")]);
         let x = Xdg::resolve(&env, &home(), false);
         assert_eq!(
             resolve_log_file(&env, &x),
-            PathBuf::from("/home/fred/.local/state/k9s/k9s.log")
+            PathBuf::from("/home/fred/.local/state/k9s/k9rs.log")
         );
     }
 

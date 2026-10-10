@@ -1,6 +1,6 @@
 [package]
 name = "k9rs"
-version = "0.50.18"
+version = "0.1.0"
 edition = "2021"
 description = "A Rust port of k9s, the Kubernetes terminal UI"
 license = "Apache-2.0"
@@ -27,7 +27,7 @@ tokio-stream = "0.1"
 futures = "0.3"
 async-trait = "0.1"
 # kubernetes
-kube = { version = "4", features = ["client", "runtime", "derive", "ws", "config"] }
+kube = { version = "4", features = ["client", "runtime", "derive", "ws", "config", "http-proxy"] }
 k8s-openapi = { version = "0.28", features = ["v1_34"] }
 # tui
 ratatui = "0.30"
@@ -64,16 +64,21 @@ http-body-util = "0.1"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 base64 = "0.22"
+flate2 = "1"
 rustls-native-certs = "0.8"
 secrecy = "0.10"
 tempfile = "3"
 libc = "0.2"
 jiff = "0.2"
+tower = { version = "0.5", features = ["filter", "buffer"] }
+jaq-core = "3"
+jaq-std = "3"
+jaq-json = "2"
+x509-parser = "0.18.1"
 
 [dev-dependencies]
 pretty_assertions = "1"
 tower-test = "0.4"
-tower = "0.5"
 hyper = { version = "1", features = ["server", "http1"] }
 
 [profile.release]

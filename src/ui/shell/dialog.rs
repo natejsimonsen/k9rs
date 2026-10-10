@@ -7,15 +7,13 @@ use ratatui::layout::{Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 
 use super::cow::dialog_cow_talk;
-use super::text::{draw_segs, fill, seg, width, word_wrap, Align};
+use super::text::{draw_segs, fill, seg, width, word_wrap_tagged, Align};
 use crate::config::Styles;
 use crate::k8s::{fqn, DeleteOptions, DrainOptions, PortForwardSpec, Propagation};
 use crate::ui::{Ctx, Dialog, FlashLevel, ViewCmd};
 
-/// tview's ModalForm minimum text width.
-const BUTTONS_WIDTH: u16 = 50;
 const AQUA: Color = Color::LightCyan;
-const ORANGE_RED: Color = Color::Rgb(0xFF, 0x45, 0x00);
+const ORANGE_RED: Color = Color::Indexed(202);
 const PROPAGATIONS: [&str; 4] = ["Background", "Foreground", "Orphan", "None"];
 
 #[derive(Clone, Debug, PartialEq)]
@@ -85,6 +83,22 @@ pub(crate) struct DialogState {
     drain: DrainOptions,
     /// Flash message the app should show (empty text clears the flash).
     pub pending_flash: Option<(FlashLevel, String)>,
+    /// Last draw geometry for mouse hits.
+    hits: std::cell::RefCell<Hits>,
+    /// tview focus left the modal (a click elsewhere): nothing is drawn
+    /// focused and no input cursor shows.
+    pub blurred: bool,
+    /// ui.ModalList (dialog.ShowSelection): list items and the current one.
+    list: Option<(Vec<String>, usize)>,
+}
+
+/// The modal box, each focusable element (focus index -> rect) and an open
+/// drop down's options.
+#[derive(Default)]
+struct Hits {
+    area: Rect,
+    elems: Vec<(usize, Rect)>,
+    options: Vec<(usize, Rect)>,
 }
 
 impl DialogState {
@@ -99,6 +113,9 @@ impl DialogState {
             kind: None,
             drain: DrainOptions::default(),
             pending_flash: None,
+            hits: Default::default(),
+            blurred: false,
+            list: None,
         };
         match &d {
             Dialog::Confirm { title, msg, .. } => {
@@ -129,6 +146,75 @@ impl DialogState {
                 st.text_color = Some(ORANGE_RED);
                 st.buttons = vec!["Dismiss".into()];
             }
+            Dialog::ConfirmAck { title, msg, .. } => {
+                st.title = format!("<{title}>");
+                st.text = msg.clone();
+                st.text_color = Some(ctx.styles.dialog_fg);
+                st.items = vec![Item::input("Confirm:", "", 30)];
+            }
+            Dialog::Launching { title, msg, .. } => {
+                st.title = format!("<{title}>");
+                st.text = msg.clone();
+                st.text_color = Some(ctx.styles.dialog_fg);
+                st.buttons = vec!["Cancel".into()];
+            }
+            Dialog::Transfer {
+                pod,
+                containers,
+                retries,
+                ..
+            } => {
+                st.title = "<Transfer>".into();
+                st.text = "Download Files".into();
+                if containers.len() > 1 {
+                    st.text
+                        .push_str(&format!("\nAvailable Containers:{}", containers.join(",")));
+                }
+                st.text_color = Some(ctx.styles.dialog_fg);
+                st.items = vec![
+                    Item::Checkbox {
+                        label: "Download:".into(),
+                        checked: true,
+                    },
+                    Item::input("From:", pod.clone(), 40),
+                    Item::input("To:", "", 40),
+                    Item::Checkbox {
+                        label: "NoPreserve:".into(),
+                        checked: false,
+                    },
+                    Item::input(
+                        "Container:",
+                        containers.first().cloned().unwrap_or_default(),
+                        30,
+                    ),
+                    Item::input("Retries:", retries.to_string(), 30),
+                ];
+            }
+            Dialog::Restart {
+                title,
+                msg,
+                field_manager,
+                ..
+            } => {
+                st.title = format!("<{title}>");
+                st.text = msg.clone();
+                st.items = vec![Item::input("FieldManager:", field_manager.clone(), 40)];
+                // f.SetFocus(1): the Cancel button.
+                st.focus = 1;
+            }
+            Dialog::SetImage {
+                msg, containers, ..
+            } => {
+                st.title = "<Set image>".into();
+                st.text = msg.clone();
+                // ModalForm text color is never set: tview.Styles.PrimaryTextColor.
+                st.text_color = Some(ctx.styles.fg);
+                st.items = containers
+                    .iter()
+                    .map(|(name, image, _)| Item::input(name, image.clone(), 0))
+                    .collect();
+                st.buttons = vec!["OK".into(), "Cancel".into()];
+            }
             Dialog::Scale { msg, current, .. } => {
                 st.title = "<Scale>".into();
                 st.text = msg.clone();
@@ -141,7 +227,12 @@ impl DialogState {
                 }];
                 st.buttons = vec!["OK".into(), "Cancel".into()];
             }
-            Dialog::PortForward { spec, ports, .. } => {
+            Dialog::PortForward {
+                spec,
+                ports,
+                prefill,
+                ..
+            } => {
                 st.title = "<PortForward>".into();
                 let mut msg = fqn(&spec.namespace, &spec.pod);
                 if ports.len() > 1 {
@@ -149,18 +240,7 @@ impl DialogState {
                     msg.push_str(&ports.join("\n"));
                 }
                 st.text = msg;
-                let p1 = if let Some(p) = ports.first() {
-                    p.clone()
-                } else if spec.container_port > 0 {
-                    format!("{}::{}", spec.container, spec.container_port)
-                } else {
-                    String::new()
-                };
-                let p2 = if spec.local_port > 0 {
-                    spec.local_port.to_string()
-                } else {
-                    extract_port(&p1)
-                };
+                let (p1, p2) = prefill.clone();
                 let field_len = 30.max(p1.len()) as u16;
                 let address = if spec.address.is_empty() {
                     ctx.config
@@ -170,20 +250,28 @@ impl DialogState {
                 } else {
                     spec.address.clone()
                 };
+                // pf_dialog.go only sets placeholders on fields that start empty.
+                let hint = |v: &str, h: &str| {
+                    if v.is_empty() {
+                        h.into()
+                    } else {
+                        String::new()
+                    }
+                };
                 st.items = vec![
                     Item::Input {
                         label: "Container Port:".into(),
+                        placeholder: hint(&p1, "Enter a container name::port"),
                         value: p1.clone(),
                         width: field_len,
                         numeric: false,
-                        placeholder: "Enter a container name::port".into(),
                     },
                     Item::Input {
                         label: "Local Port:".into(),
+                        placeholder: hint(&p2, "Enter a local port"),
                         value: p2,
                         width: field_len,
                         numeric: false,
-                        placeholder: "Enter a local port".into(),
                     },
                     Item::input("Address:", address, field_len),
                 ];
@@ -192,7 +280,15 @@ impl DialogState {
             Dialog::Drain { node, .. } => {
                 st.title = "<Drain>".into();
                 st.text = format!("Drain {node}?");
-                let o = DrainOptions::default();
+                // view/node.go drainCmd: only GracePeriod and Timeout are set.
+                let o = DrainOptions {
+                    grace_period_seconds: -1,
+                    timeout_secs: 5,
+                    ignore_all_daemon_sets: false,
+                    delete_empty_dir_data: false,
+                    force: false,
+                    disable_eviction: false,
+                };
                 st.items = vec![
                     Item::input("GracePeriod:", o.grace_period_seconds.to_string(), 0),
                     Item::input("Timeout:", go_duration(o.timeout_secs), 0),
@@ -215,6 +311,12 @@ impl DialogState {
                 ];
                 st.drain = o;
             }
+            Dialog::Rename { name, .. } => {
+                st.title = "<Rename>".into();
+                st.text = format!("Rename context {}?", super::text::go_quote(name));
+                st.items = vec![Item::input("New name:", name.clone(), 0)];
+                st.buttons = vec!["OK".into(), "Cancel".into()];
+            }
             Dialog::Prompt {
                 title,
                 label,
@@ -224,6 +326,16 @@ impl DialogState {
                 st.title = format!("<{title}>");
                 st.items = vec![Item::input(label, value.clone(), 40)];
                 st.buttons = vec!["OK".into(), "Cancel".into()];
+            }
+            Dialog::Selection { title, options, .. } => {
+                st.title = format!("<{title}>");
+                st.buttons = Vec::new();
+                // ShowSelection adds every option twice (k9s quirk).
+                let items = options
+                    .iter()
+                    .flat_map(|o| [o.clone(), o.clone()])
+                    .collect();
+                st.list = Some((items, 0));
             }
         }
         st.kind = Some(d);
@@ -251,6 +363,9 @@ impl DialogState {
 
     /// Handle a key. `None` keeps the dialog open; `Some(cmds)` closes it.
     pub fn handle_key(&mut self, key: KeyEvent, ctx: &mut Ctx) -> Option<Vec<ViewCmd>> {
+        if self.list.is_some() {
+            return self.list_key(key, ctx);
+        }
         let n_items = self.items.len();
         // Open drop down list captures keys.
         if let Some(Item::DropDown {
@@ -276,7 +391,7 @@ impl DialogState {
             return None;
         }
         match key.code {
-            KeyCode::Esc => return Some(Vec::new()),
+            KeyCode::Esc => return Some(self.cancelled(ctx)),
             KeyCode::Tab => {
                 self.next();
                 return None;
@@ -298,6 +413,206 @@ impl DialogState {
                 return self.press(&b, ctx);
             }
             _ => {}
+        }
+        None
+    }
+
+    /// tview List.InputHandler (wrap around, Enter/space select, Esc done).
+    fn list_key(&mut self, key: KeyEvent, ctx: &mut Ctx) -> Option<Vec<ViewCmd>> {
+        let (n, cur) = self
+            .list
+            .as_ref()
+            .map(|(l, c)| (l.len() as i64, *c as i64))?;
+        if key.code == KeyCode::Esc {
+            return Some(Vec::new());
+        }
+        if n == 0 {
+            return None;
+        }
+        let mut c = cur;
+        match key.code {
+            KeyCode::Tab | KeyCode::Down | KeyCode::Right => c += 1,
+            KeyCode::BackTab | KeyCode::Up | KeyCode::Left => c -= 1,
+            KeyCode::Home => c = 0,
+            KeyCode::End => c = n - 1,
+            KeyCode::PageDown => c += n,
+            KeyCode::PageUp => c -= n,
+            KeyCode::Enter | KeyCode::Char(' ') => return self.select(cur as usize, ctx),
+            _ => {}
+        }
+        if c < 0 {
+            c = n - 1;
+        } else if c >= n {
+            c = 0;
+        }
+        if let Some((_, cc)) = self.list.as_mut() {
+            *cc = c as usize;
+        }
+        None
+    }
+
+    fn select(&mut self, i: usize, ctx: &mut Ctx) -> Option<Vec<ViewCmd>> {
+        match self.kind.take()? {
+            Dialog::Selection { on_select, .. } => Some(on_select(ctx, i)),
+            _ => Some(Vec::new()),
+        }
+    }
+
+    /// ui.ModalList.Draw: list width + 4, items + 4 rows, centered; framed
+    /// with a focused border and an aqua title.
+    fn draw_list(&self, buf: &mut Buffer, screen: Rect, styles: &Styles) {
+        let Some((items, cur)) = &self.list else {
+            return;
+        };
+        let w = items.iter().map(|i| width(i) as u16 + 2).max().unwrap_or(0) + 2;
+        let h = items.len() as u16 + 4;
+        let (w, h) = (w.min(screen.width), h.min(screen.height));
+        let x = screen.x + (screen.width - w) / 2;
+        let y = screen.y + (screen.height - h) / 2;
+        let area = Rect::new(x, y, w, h);
+        let mut hits = Hits {
+            area,
+            ..Default::default()
+        };
+        fill(buf, area, Style::default().bg(styles.bg));
+        if w < 4 || h < 3 {
+            *self.hits.borrow_mut() = hits;
+            return;
+        }
+        let bc = if self.blurred {
+            styles.border
+        } else {
+            styles.border_focus
+        };
+        let bs = Style::default().fg(bc).bg(styles.bg);
+        let (l, r, t, b) = (area.left(), area.right() - 1, area.top(), area.bottom() - 1);
+        let mut put = |x: u16, y: u16, s: &str| {
+            if let Some(c) = buf.cell_mut((x, y)) {
+                c.set_symbol(s);
+                c.set_style(bs);
+            }
+        };
+        for xx in l + 1..r {
+            put(xx, t, "─");
+            put(xx, b, "─");
+        }
+        for yy in t + 1..b {
+            put(l, yy, "│");
+            put(r, yy, "│");
+        }
+        put(l, t, "┌");
+        put(r, t, "┐");
+        put(l, b, "└");
+        put(r, b, "┘");
+        draw_segs(
+            buf,
+            l + 1,
+            t,
+            w - 2,
+            &[seg(
+                self.title.clone(),
+                Style::default().fg(AQUA).bg(styles.bg),
+            )],
+            Align::Center,
+            false,
+        );
+        let (ix, iw) = (l + 2, w.saturating_sub(4));
+        for (i, item) in items.iter().enumerate() {
+            let yy = t + 2 + i as u16;
+            if yy >= b {
+                break;
+            }
+            let st = if i == *cur {
+                Style::default()
+                    .fg(styles.dialog_button_focus_fg)
+                    .bg(styles.dialog_button_focus_bg)
+            } else {
+                Style::default().fg(styles.fg).bg(styles.bg)
+            };
+            draw_segs(
+                buf,
+                ix,
+                yy,
+                iw,
+                &[seg(item.clone(), st)],
+                Align::Left,
+                false,
+            );
+            hits.elems.push((i, Rect::new(ix, yy, iw, 1)));
+        }
+        *self.hits.borrow_mut() = hits;
+    }
+
+    /// Whether `(x, y)` falls on the modal box of the last draw.
+    pub fn contains(&self, x: u16, y: u16) -> bool {
+        self.hits.borrow().area.contains(Position::new(x, y))
+    }
+
+    /// tview Form.MouseHandler for a left click inside the modal: an open
+    /// drop down list picks the clicked option (or closes); buttons press,
+    /// checkboxes toggle, drop downs open, inputs take focus; anywhere else
+    /// keeps the current focus. Same return contract as `handle_key`.
+    pub fn click(&mut self, x: u16, y: u16, ctx: &mut Ctx) -> Option<Vec<ViewCmd>> {
+        let p = Position::new(x, y);
+        // tview List.MouseHandler: a click on an item selects it.
+        if self.list.is_some() {
+            let hit = self
+                .hits
+                .borrow()
+                .elems
+                .iter()
+                .find(|(_, r)| r.contains(p))
+                .map(|(i, _)| *i);
+            return match hit {
+                Some(i) => {
+                    if let Some((_, c)) = self.list.as_mut() {
+                        *c = i;
+                    }
+                    self.select(i, ctx)
+                }
+                None => None,
+            };
+        }
+        let (elem, option) = {
+            let h = self.hits.borrow();
+            (
+                h.elems.iter().find(|(_, r)| r.contains(p)).map(|(i, _)| *i),
+                h.options
+                    .iter()
+                    .find(|(_, r)| r.contains(p))
+                    .map(|(i, _)| *i),
+            )
+        };
+        if let Some(Item::DropDown {
+            open: true,
+            selected,
+            ..
+        }) = self.items.get_mut(self.focus)
+        {
+            if let Some(o) = option {
+                *selected = o;
+            }
+            self.close_dropdown();
+            return None;
+        }
+        let i = elem?;
+        self.focus = i;
+        if i >= self.items.len() {
+            let b = self.focused_button().unwrap_or_default().to_string();
+            return self.press(&b, ctx);
+        }
+        match &mut self.items[i] {
+            Item::Checkbox { checked, .. } => *checked = !*checked,
+            Item::DropDown {
+                open,
+                cursor,
+                selected,
+                ..
+            } => {
+                *open = true;
+                *cursor = *selected;
+            }
+            Item::Input { .. } => {}
         }
         None
     }
@@ -338,7 +653,10 @@ impl DialogState {
                 _ => {}
             },
             Item::Checkbox { checked, .. } => match key.code {
-                KeyCode::Enter | KeyCode::Char(' ') => *checked = !*checked,
+                KeyCode::Enter | KeyCode::Char(' ') => {
+                    *checked = !*checked;
+                    changed = true;
+                }
                 KeyCode::Down => self.next(),
                 KeyCode::Up => self.prev(),
                 _ => {}
@@ -367,6 +685,22 @@ impl DialogState {
     /// Field change hooks (pf local port follow, drain live validation).
     fn on_change(&mut self, idx: usize, _ctx: &mut Ctx) -> Option<Vec<ViewCmd>> {
         match self.kind {
+            // Download toggles the message and swaps From/To.
+            Some(Dialog::Transfer { .. }) if idx == 0 => {
+                let (from, to) = (self.items[1].value(), self.items[2].value());
+                // ShowUploads re-sets opts.Message, dropping the containers line.
+                self.text = if self.items[0].checked() {
+                    "Download Files".into()
+                } else {
+                    "Upload Files".into()
+                };
+                for (i, v) in [(1, to), (2, from)] {
+                    if let Item::Input { value, .. } = &mut self.items[i] {
+                        *value = v;
+                    }
+                }
+                None
+            }
             Some(Dialog::PortForward { .. }) if idx == 0 => {
                 let p = extract_port(&self.items[0].value());
                 if let Item::Input { value, .. } = &mut self.items[1] {
@@ -402,9 +736,25 @@ impl DialogState {
         }
     }
 
+    /// Cancel/Esc: a Launching prompt cancels its action first.
+    fn cancelled(&mut self, ctx: &mut Ctx) -> Vec<ViewCmd> {
+        match self.kind.take() {
+            Some(Dialog::Launching {
+                cancel, on_cancel, ..
+            }) => {
+                cancel.cancel();
+                on_cancel(ctx)
+            }
+            other => {
+                self.kind = other;
+                Vec::new()
+            }
+        }
+    }
+
     fn press(&mut self, button: &str, ctx: &mut Ctx) -> Option<Vec<ViewCmd>> {
         match button {
-            "Cancel" | "Dismiss" => Some(Vec::new()),
+            "Cancel" | "Dismiss" => Some(self.cancelled(ctx)),
             "OK" => self.ok(ctx),
             _ => None,
         }
@@ -414,6 +764,77 @@ impl DialogState {
         let kind = self.kind.take()?;
         match kind {
             Dialog::Confirm { on_ok, .. } => Some(on_ok(ctx)),
+            Dialog::Launching { .. } => Some(Vec::new()),
+            Dialog::ConfirmAck {
+                title,
+                msg,
+                accept,
+                on_ok,
+            } => {
+                // OK is inert until the text matches.
+                if self.items[0].value() != accept {
+                    self.kind = Some(Dialog::ConfirmAck {
+                        title,
+                        msg,
+                        accept,
+                        on_ok,
+                    });
+                    return None;
+                }
+                Some(on_ok(ctx))
+            }
+            Dialog::Transfer {
+                pod,
+                containers,
+                retries,
+                mut on_ok,
+            } => {
+                // Retries keeps its last valid number (strconv.Atoi on change).
+                let retries = self.items[5].value().parse().unwrap_or(retries);
+                let args = crate::ui::TransferArgs {
+                    download: self.items[0].checked(),
+                    from: self.items[1].value(),
+                    to: self.items[2].value(),
+                    no_preserve: self.items[3].checked(),
+                    container: self.items[4].value(),
+                    retries,
+                };
+                match on_ok(ctx, args) {
+                    Ok(cmds) => Some(cmds),
+                    Err(e) => {
+                        self.kind = Some(Dialog::Transfer {
+                            pod,
+                            containers,
+                            retries,
+                            on_ok,
+                        });
+                        self.pending_flash = Some((FlashLevel::Err, e));
+                        None
+                    }
+                }
+            }
+            Dialog::SetImage {
+                containers, on_ok, ..
+            } => {
+                // imageFormSpec.modified: trimmed, non-empty and different.
+                let specs = containers
+                    .iter()
+                    .zip(&self.items)
+                    .filter_map(|((name, old, init), item)| {
+                        let img = item.value().trim().to_string();
+                        (!img.is_empty() && img != *old).then(|| crate::k8s::ImageSpec {
+                            name: name.clone(),
+                            docker_image: img,
+                            init: *init,
+                        })
+                    })
+                    .collect();
+                Some(on_ok(ctx, specs))
+            }
+            Dialog::Restart { on_ok, .. } => {
+                let fm = self.items[0].value();
+                Some(on_ok(ctx, fm))
+            }
             Dialog::Delete { on_ok, .. } => {
                 let prop = match self.items[0].value().as_str() {
                     "Background" => Some(Propagation::Background),
@@ -443,20 +864,33 @@ impl DialogState {
                     )]),
                 }
             }
-            Dialog::PortForward { spec, ports, on_ok } => {
+            Dialog::PortForward {
+                spec,
+                ports,
+                prefill,
+                on_ok,
+            } => {
                 let co = self.items[0].value();
                 let lo = self.items[1].value();
                 let address = self.items[2].value();
-                if co.is_empty() || lo.is_empty() {
-                    self.kind = Some(Dialog::PortForward { spec, ports, on_ok });
-                    self.pending_flash =
-                        Some((FlashLevel::Err, "container to local port mismatch".into()));
-                    return None;
-                }
-                match to_tunnel(&address, &co, &lo, &spec) {
-                    Ok(s) => Some(on_ok(ctx, s)),
+                // pf_dialog OK, then startFwdCB: errors flash and keep the form.
+                let res = if co.is_empty() || lo.is_empty() {
+                    Err("container to local port mismatch".to_string())
+                } else {
+                    to_tunnels(&address, &co, &lo, &spec).and_then(|tt| {
+                        check_tunnels(&tt, &fqn(&spec.namespace, &spec.pod), ctx)?;
+                        Ok(tt)
+                    })
+                };
+                match res {
+                    Ok(tt) => Some(on_ok(ctx, tt)),
                     Err(e) => {
-                        self.kind = Some(Dialog::PortForward { spec, ports, on_ok });
+                        self.kind = Some(Dialog::PortForward {
+                            spec,
+                            ports,
+                            prefill,
+                            on_ok,
+                        });
                         self.pending_flash = Some((FlashLevel::Err, e));
                         None
                     }
@@ -470,27 +904,48 @@ impl DialogState {
                 o.disable_eviction = self.items[5].checked();
                 Some(on_ok(ctx, o))
             }
-            Dialog::Prompt { on_ok, .. } => {
+            Dialog::Prompt { on_ok, .. } | Dialog::Rename { on_ok, .. } => {
                 let v = self.items[0].value();
                 Some(on_ok(ctx, v))
             }
+            Dialog::Selection { .. } => Some(Vec::new()),
         }
     }
 
     /// Draw the modal centered on `screen`; returns the input cursor if any.
     pub fn draw(&self, buf: &mut Buffer, screen: Rect, styles: &Styles) -> Option<Position> {
-        let mut w = (screen.width / 3).max(BUTTONS_WIDTH);
-        let lines = word_wrap(&self.text, w.saturating_sub(2) as usize);
+        if self.list.is_some() {
+            self.draw_list(buf, screen, styles);
+            return None;
+        }
+        // tview ModalForm: text width is a third of the screen, at least the buttons row.
+        let buttons_w: u16 = self
+            .buttons
+            .iter()
+            .map(|s| width(s) as u16 + 4)
+            .sum::<u16>()
+            + 2 * self.buttons.len().saturating_sub(1) as u16;
+        let mut w = (screen.width / 3).max(buttons_w);
+        // Frame.AddText prints with color tags; WordWrap skips them.
+        let lines = word_wrap_tagged(
+            &self.text,
+            w as usize,
+            &crate::ui::views::print_tags(&self.text),
+        );
         let has_text = !self.text.is_empty();
-        let text_rows = if has_text { lines.len() as u16 + 1 } else { 0 };
         let items = self.items.len() as u16;
-        let mut h = 2 + 2 + text_rows + items + if items > 0 { 1 } else { 0 } + 1;
-        w += 2;
+        // tview ModalForm: text lines + items + one row per button + 5.
+        let mut h = lines.len() as u16 + items + self.buttons.len() as u16 + 5;
+        w += 4;
         w = w.min(screen.width);
         h = h.min(screen.height);
         let x = screen.x + (screen.width - w) / 2;
         let y = screen.y + (screen.height - h) / 2;
         let area = Rect::new(x, y, w, h);
+        let mut hits = Hits {
+            area,
+            ..Default::default()
+        };
         let body = Style::default().fg(styles.dialog_fg).bg(styles.dialog_bg);
         fill(buf, area, body);
         let bs = Style::default().fg(styles.border).bg(styles.dialog_bg);
@@ -544,7 +999,10 @@ impl DialogState {
                     ix,
                     yy,
                     iw,
-                    &[seg(line.clone(), text_style)],
+                    &crate::ui::views::print_markup(line, text_style)
+                        .into_iter()
+                        .map(|(t, st)| seg(t, st))
+                        .collect::<Vec<_>>(),
                     Align::Center,
                     false,
                 );
@@ -564,7 +1022,8 @@ impl DialogState {
             if yy >= b {
                 break;
             }
-            let focused = self.focus == i;
+            let focused = !self.blurred && self.focus == i;
+            hits.elems.push((i, Rect::new(ix, yy, iw, 1)));
             let label = Style::default()
                 .fg(styles.dialog_label_fg)
                 .bg(styles.dialog_bg);
@@ -641,27 +1100,29 @@ impl DialogState {
             }
             yy += 1;
         }
-        // Buttons row.
+        // Buttons row: tview Form centers them with one blank column between.
+        // Form leaves button colors unset (BOZO), so unfocused buttons use
+        // tview.Styles (body fg/bg); k9s only sets the activated colors.
         let by = b.saturating_sub(2);
         let total: u16 = self
             .buttons
             .iter()
-            .map(|s| width(s) as u16 + 4)
+            .map(|s| width(s) as u16 + 5)
             .sum::<u16>()
-            + 2 * self.buttons.len().saturating_sub(1) as u16;
-        let mut bx = ix + iw.saturating_sub(total) / 2;
+            .saturating_sub(1);
+        let mut bx = (ix + ix + iw).saturating_sub(total) / 2;
         for (i, label) in self.buttons.iter().enumerate() {
-            let focused = self.focus == self.items.len() + i;
+            let focused = !self.blurred && self.focus == self.items.len() + i;
             let st = if focused {
                 Style::default()
                     .fg(styles.dialog_button_focus_fg)
                     .bg(styles.dialog_button_focus_bg)
             } else {
-                Style::default()
-                    .fg(styles.dialog_button_fg)
-                    .bg(styles.dialog_button_bg)
+                Style::default().fg(styles.fg).bg(styles.bg)
             };
             let bw = width(label) as u16 + 4;
+            hits.elems
+                .push((self.items.len() + i, Rect::new(bx, by, bw, 1)));
             draw_segs(
                 buf,
                 bx,
@@ -671,7 +1132,7 @@ impl DialogState {
                 Align::Left,
                 false,
             );
-            bx += bw + 2;
+            bx += bw + 1;
         }
         if let Some((
             dx,
@@ -695,9 +1156,11 @@ impl DialogState {
                     Style::default().fg(styles.dialog_fg).bg(styles.dialog_bg)
                 };
                 fill(buf, Rect::new(dx, y, ow, 1), st);
+                hits.options.push((i, Rect::new(dx, y, ow, 1)));
                 draw_segs(buf, dx, y, ow, &[seg(o.clone(), st)], Align::Left, false);
             }
         }
+        *self.hits.borrow_mut() = hits;
         cursor
     }
 }
@@ -717,12 +1180,12 @@ pub(crate) fn extract_port(p: &str) -> String {
 }
 
 /// port.ToTunnels for a single tunnel.
-fn to_tunnel(
+fn to_tunnels(
     address: &str,
     co: &str,
     lo: &str,
     spec: &PortForwardSpec,
-) -> Result<PortForwardSpec, String> {
+) -> Result<Vec<PortForwardSpec>, String> {
     let pp: Vec<&str> = co.split(',').collect();
     let lps: Vec<&str> = lo.split(',').collect();
     if pp.len() != lps.len() {
@@ -732,27 +1195,75 @@ fn to_tunnel(
             lps.len()
         ));
     }
-    let p = pp[0].trim();
-    let (container, port) = match p.split_once("::") {
-        Some((c, port)) => (c.to_string(), port),
-        None => (spec.container.clone(), p),
+    pp.iter()
+        .zip(&lps)
+        .map(|(p, l)| {
+            let (container, cport) = parse_pf(p)?;
+            let lport: u16 = l
+                .trim()
+                .parse()
+                .map_err(|_| format!("invalid local port {l}"))?;
+            Ok(PortForwardSpec {
+                namespace: spec.namespace.clone(),
+                pod: spec.pod.clone(),
+                container: container.unwrap_or_else(|| spec.container.clone()),
+                address: address.to_string(),
+                local_port: lport,
+                container_port: cport,
+            })
+        })
+        .collect()
+}
+
+/// port.ParsePF + PFAnn.PortNum: `[container::][local:]port[/num]` to
+/// (container, container port number).
+fn parse_pf(p: &str) -> Result<(Option<String>, u16), String> {
+    static PLAIN: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"\A(\d*):?(\d*|[\w-]*)\z").unwrap());
+    static FULL: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"\A([\w-]+)::(\d*):?(\d*|[\w-]*)/?(\d+)?\z").unwrap()
+    });
+    let t = p.trim();
+    let (container, port, num) = if let Some(m) = PLAIN.captures(t).filter(|_| !t.is_empty()) {
+        let port = if m[2].is_empty() { &m[1] } else { &m[2] };
+        (None, port.to_string(), String::new())
+    } else if let Some(m) = FULL.captures(t) {
+        let port = if m[3].is_empty() { &m[2] } else { &m[3] };
+        let num = m.get(4).map(|n| n.as_str().to_string()).unwrap_or_default();
+        (Some(m[1].to_string()), port.to_string(), num)
+    } else {
+        return Err(format!("invalid port-forward specification {p}"));
     };
-    let port = port.split('/').next().unwrap_or(port);
-    let cport: u16 = port
-        .parse()
-        .map_err(|_| format!("invalid port-forward specification {p}"))?;
-    let lport: u16 = lps[0]
-        .trim()
-        .parse()
-        .map_err(|_| format!("invalid local port {}", lps[0]))?;
-    Ok(PortForwardSpec {
-        namespace: spec.namespace.clone(),
-        pod: spec.pod.clone(),
-        container,
-        address: address.to_string(),
-        local_port: lport,
-        container_port: cport,
-    })
+    port.parse()
+        .or_else(|_| num.parse())
+        .map(|n| (container, n))
+        .map_err(|_| "no port number assigned".to_string())
+}
+
+/// port.IsPortFree: listen on address:port (Go resolves to IPv4 first).
+pub(crate) fn port_free(address: &str, port: u16) -> bool {
+    use std::net::ToSocketAddrs as _;
+    let Ok(addrs) = (address, port).to_socket_addrs() else {
+        return false;
+    };
+    let addrs: Vec<_> = addrs.collect();
+    let Some(a) = addrs.iter().find(|a| a.is_ipv4()).or(addrs.first()) else {
+        return false;
+    };
+    std::net::TcpListener::bind(a).is_ok()
+}
+
+/// startFwdCB: every local port must be free and no tunnel may exist yet.
+fn check_tunnels(tt: &[PortForwardSpec], path: &str, ctx: &Ctx) -> Result<(), String> {
+    for t in tt {
+        if !port_free(&t.address, t.local_port) {
+            return Err(format!("port {} is not available on host", t.local_port));
+        }
+    }
+    if tt.iter().any(|t| ctx.port_forwards.contains_key(&t.id())) {
+        return Err(format!("port-forward is already active on pod {path}"));
+    }
+    Ok(())
 }
 
 /// Go time.Duration.String for whole seconds.
@@ -870,11 +1381,23 @@ mod tests {
         assert!(find(&buf, "Delete it?").is_some());
         let (x, y) = find(&buf, "Cancel").unwrap();
         assert_eq!(bg(&buf, x, y), st.dialog_button_focus_bg);
+        // Idle buttons use the body colors (tview Form drops button colors),
+        // one column after the focused one.
         let (x, y) = find(&buf, "OK").unwrap();
-        assert_eq!(bg(&buf, x, y), st.dialog_button_bg);
-        // Box is centered: 52 wide.
-        let (bx, _) = find(&buf, "┌").unwrap();
-        assert_eq!(bx, 24);
+        // tview Form ignores the skin's button colors for unfocused buttons.
+        assert_eq!(bg(&buf, x, y), st.bg);
+        assert_eq!(fg(&buf, x, y), st.fg);
+        // Centered with one blank column between buttons: "  Cancel   OK  ".
+        let (cx, _) = find(&buf, "Cancel").unwrap();
+        assert_eq!(x - cx, 11);
+        // Box is centered: tview ModalForm is screen/3 + 4 = 37 wide.
+        let (bx, by) = find(&buf, "┌").unwrap();
+        assert_eq!(bx, 31);
+        // Height: 1 text line + 2 buttons + 5; a blank row precedes the buttons.
+        let (_, bottom) = find(&buf, "└").unwrap();
+        assert_eq!(bottom - by + 1, 8);
+        let (_, cy) = find(&buf, "Cancel").unwrap();
+        assert_eq!(cy, bottom - 2);
 
         assert!(d.handle_key(k(KeyCode::Right), &mut c).is_none());
         let out = d.handle_key(k(KeyCode::Enter), &mut c).unwrap();
@@ -962,6 +1485,231 @@ mod tests {
         );
     }
 
+    /// dialog.ShowConfirmAck: OK only acts once the magic text is typed.
+    #[test]
+    fn confirm_ack_needs_text() {
+        let mut c = ctx();
+        let hit = Arc::new(Mutex::new(false));
+        let h2 = hit.clone();
+        let mut d = DialogState::new(
+            Dialog::ConfirmAck {
+                title: "Sanitize".into(),
+                msg: "Please enter Yes Please! to proceed.".into(),
+                accept: "Yes Please!".into(),
+                on_ok: Box::new(move |_| {
+                    *h2.lock().unwrap() = true;
+                    vec![]
+                }),
+            },
+            &c,
+        );
+        assert_eq!(d.title, "<Sanitize>");
+        assert_eq!(d.buttons, ["Cancel", "OK"]);
+        assert_eq!(d.focus, 0);
+        d.focus = 2;
+        assert!(d.handle_key(k(KeyCode::Enter), &mut c).is_none());
+        assert!(d.pending_flash.is_none() && !*hit.lock().unwrap());
+        d.focus = 0;
+        for ch in "Yes Please!".chars() {
+            d.handle_key(k(KeyCode::Char(ch)), &mut c);
+        }
+        d.focus = 2;
+        assert!(d.handle_key(k(KeyCode::Enter), &mut c).is_some());
+        assert!(*hit.lock().unwrap());
+    }
+
+    /// dialog.ShowUploads: Download toggles the message and swaps From/To;
+    /// a failed Ack keeps the form open with a flash.
+    #[test]
+    fn transfer_form() {
+        let mut c = ctx();
+        let got = Arc::new(Mutex::new(Vec::new()));
+        let g2 = got.clone();
+        let mut d = DialogState::new(
+            Dialog::Transfer {
+                pod: "default/p:".into(),
+                containers: vec!["a".into(), "b".into()],
+                retries: 999,
+                on_ok: Box::new(move |_, args| {
+                    g2.lock().unwrap().push(args.clone());
+                    if args.download {
+                        Ok(vec![])
+                    } else {
+                        Err("stat x: no such file or directory".into())
+                    }
+                }),
+            },
+            &c,
+        );
+        assert_eq!(d.title, "<Transfer>");
+        assert_eq!(d.text, "Download Files\nAvailable Containers:a,b");
+        assert_eq!(d.buttons, ["Cancel", "OK"]);
+        assert_eq!(d.items[1].value(), "default/p:");
+        assert_eq!(d.items[4].value(), "a");
+        assert_eq!(d.items[5].value(), "999");
+        // Toggle Download off: Upload message, From/To swapped.
+        d.handle_key(k(KeyCode::Char(' ')), &mut c);
+        assert_eq!(d.text, "Upload Files");
+        assert_eq!(
+            (d.items[1].value(), d.items[2].value()),
+            (String::new(), "default/p:".into())
+        );
+        d.focus = 7;
+        assert!(d.handle_key(k(KeyCode::Enter), &mut c).is_none());
+        assert!(matches!(d.pending_flash.take(), Some((FlashLevel::Err, _))));
+        d.focus = 0;
+        d.handle_key(k(KeyCode::Char(' ')), &mut c);
+        d.focus = 7;
+        assert!(d.handle_key(k(KeyCode::Enter), &mut c).is_some());
+        let last = got.lock().unwrap().last().cloned().unwrap();
+        assert!(last.download && !last.no_preserve);
+        assert_eq!(
+            (last.from.as_str(), last.container.as_str(), last.retries),
+            ("default/p:", "a", 999)
+        );
+    }
+
+    /// tview Frame prints color tags in dialog text; `[list]` is not a tag.
+    #[test]
+    fn dialog_text_markup() {
+        let c = ctx();
+        let d = DialogState::new(
+            Dialog::Confirm {
+                title: "Confirm Rollback".into(),
+                msg: "RollingBack chart [yellow::b]alpha[-::-] to release <[orangered::b]1[-::-]>? [list]".into(),
+                on_ok: Box::new(|_| vec![]),
+            },
+            &c,
+        );
+        let st = Styles::default();
+        let mut buf = Buffer::empty(Rect::new(0, 0, 160, 30));
+        let area = buf.area;
+        d.draw(&mut buf, area, &st);
+        let (x, y) = find(&buf, "RollingBack chart alpha to release <1>? [list]").unwrap();
+        let ax = x + "RollingBack chart ".len() as u16;
+        let yellow = crate::ui::views::print_markup("[yellow::]x", Style::default())[0]
+            .1
+            .fg;
+        assert_eq!(Some(fg(&buf, ax, y)), yellow);
+        assert!(buf[(ax, y)]
+            .modifier
+            .contains(ratatui::style::Modifier::BOLD));
+        assert_eq!(fg(&buf, x, y), st.dialog_fg);
+    }
+
+    /// view/image_extender.go: one input per container labelled by name;
+    /// only changed images are submitted.
+    #[test]
+    fn set_image_form() {
+        let mut c = ctx();
+        let got = Arc::new(Mutex::new(None));
+        let g2 = got.clone();
+        let mut d = DialogState::new(
+            Dialog::SetImage {
+                msg: "Set image apps/v1/deployments default/web".into(),
+                containers: vec![
+                    ("init".into(), "busybox:1".into(), true),
+                    ("web".into(), "nginx:1".into(), false),
+                ],
+                on_ok: Box::new(move |_, specs| {
+                    *g2.lock().unwrap() = Some(specs);
+                    vec![]
+                }),
+            },
+            &c,
+        );
+        assert_eq!(d.title, "<Set image>");
+        assert_eq!(d.buttons, ["OK", "Cancel"]);
+        let st = Styles::default();
+        let mut buf = Buffer::empty(Rect::new(0, 0, 160, 45));
+        let area = buf.area;
+        d.draw(&mut buf, area, &st);
+        let (x, y) = find(&buf, "Set image apps").unwrap();
+        assert_eq!(fg(&buf, x, y), st.fg);
+        assert!(find(&buf, "init busybox:1").is_some());
+        assert!(find(&buf, "web  nginx:1").is_some());
+        // Edit the second container, then OK.
+        d.handle_key(k(KeyCode::Tab), &mut c);
+        d.handle_key(k(KeyCode::Backspace), &mut c);
+        d.handle_key(k(KeyCode::Char('2')), &mut c);
+        d.handle_key(k(KeyCode::Tab), &mut c);
+        assert!(d.handle_key(k(KeyCode::Enter), &mut c).is_some());
+        let specs = got.lock().unwrap().clone().unwrap();
+        assert_eq!(
+            specs,
+            vec![crate::k8s::ImageSpec {
+                name: "web".into(),
+                docker_image: "nginx:2".into(),
+                init: false,
+            }]
+        );
+    }
+
+    /// dialog.ShowSelection / ui.ModalList: options listed twice, centered
+    /// box (width = longest + 4, height = items + 4), focus-colored border,
+    /// wrap-around keys, Enter/space/click pick the list index, Esc closes.
+    #[test]
+    fn selection_modal_list() {
+        let mut c = ctx();
+        let picked: Arc<Mutex<Option<usize>>> = Default::default();
+        let mk = |p: Arc<Mutex<Option<usize>>>| Dialog::Selection {
+            title: "Jump To".into(),
+            options: vec!["0: ReplicaSet".into(), "1: Job".into()],
+            on_select: Box::new(move |_, i| {
+                *p.lock().unwrap() = Some(i);
+                Vec::new()
+            }),
+        };
+        let st = Styles::default();
+        let d = DialogState::new(mk(picked.clone()), &c);
+        let mut buf = Buffer::empty(Rect::new(0, 0, 80, 20));
+        {
+            let a = buf.area;
+            d.draw(&mut buf, a, &st);
+        }
+        let rows = all_rows(&buf);
+        let (tx, ty) = find(&buf, "<Jump To>").unwrap();
+        assert_eq!(fg(&buf, tx, ty), AQUA);
+        // 13 + 4 wide, 4 + 4 high, centered.
+        let (bx, by) = ((80 - 17) / 2, (20 - 8) / 2);
+        assert_eq!(rows[by as usize].chars().nth(bx as usize), Some('┌'));
+        assert_eq!(rows[by as usize].chars().nth(bx as usize + 16), Some('┐'));
+        assert_eq!(fg(&buf, bx, by), st.border_focus);
+        assert_eq!(
+            rows[by as usize + 2].trim_matches(|c| c == ' ' || c == '│'),
+            "0: ReplicaSet"
+        );
+        assert_eq!(
+            rows[by as usize + 3].trim_matches(|c| c == ' ' || c == '│'),
+            "0: ReplicaSet"
+        );
+        assert_eq!(
+            rows[by as usize + 4].trim_matches(|c| c == ' ' || c == '│'),
+            "1: Job"
+        );
+        assert_eq!(bg(&buf, bx + 2, by + 2), st.dialog_button_focus_bg);
+        // Up wraps to the last item; Enter picks its index.
+        let mut d = DialogState::new(mk(picked.clone()), &c);
+        assert!(d.handle_key(k(KeyCode::Up), &mut c).is_none());
+        assert!(d.handle_key(k(KeyCode::Enter), &mut c).is_some());
+        assert_eq!(*picked.lock().unwrap(), Some(3));
+        let mut d = DialogState::new(mk(picked.clone()), &c);
+        d.handle_key(k(KeyCode::Down), &mut c);
+        assert!(d.handle_key(k(KeyCode::Char(' ')), &mut c).is_some());
+        assert_eq!(*picked.lock().unwrap(), Some(1));
+        let mut d = DialogState::new(mk(picked.clone()), &c);
+        assert!(d.handle_key(k(KeyCode::Char('x')), &mut c).is_none());
+        assert!(d.handle_key(k(KeyCode::Esc), &mut c).unwrap().is_empty());
+        // A click on an item picks it.
+        let mut d = DialogState::new(mk(picked.clone()), &c);
+        {
+            let a = buf.area;
+            d.draw(&mut buf, a, &st);
+        }
+        assert!(d.click(bx + 3, by + 4, &mut c).is_some());
+        assert_eq!(*picked.lock().unwrap(), Some(2));
+    }
+
     #[test]
     fn error_dialog_has_cow() {
         let mut c = ctx();
@@ -972,7 +1720,8 @@ mod tests {
             &c,
         );
         let st = Styles::default();
-        let mut buf = Buffer::empty(Rect::new(0, 0, 100, 30));
+        // Text wraps at screen/3, so use a wide screen to keep the message on one line.
+        let mut buf = Buffer::empty(Rect::new(0, 0, 160, 30));
         {
             let a = buf.area;
             d.draw(&mut buf, a, &st)
@@ -1033,9 +1782,13 @@ mod tests {
                     namespace: "default".into(),
                     pod: "nginx".into(),
                     container: "nginx".into(),
+                    // pf_choices fills the preferred port.
+                    container_port: 80,
+                    local_port: 80,
                     ..Default::default()
                 },
-                ports: vec!["nginx::80".into(), "sidecar::9090".into()],
+                ports: vec!["nginx::80(http)".into(), "sidecar::9090".into()],
+                prefill: ("nginx::80".into(), "80".into()),
                 on_ok: Box::new(move |_, s| {
                     *g2.lock().unwrap() = Some(s);
                     vec![]
@@ -1045,29 +1798,43 @@ mod tests {
         );
         assert!(d
             .text
-            .starts_with("default/nginx\n\nExposed Ports:\nnginx::80"));
+            .starts_with("default/nginx\n\nExposed Ports:\nnginx::80(http)"));
+        // PFAnn.AsSpec drops the port name.
+        assert_eq!(d.items[0].value(), "nginx::80");
+        // Placeholders only for fields that start empty.
+        assert!(matches!(&d.items[1], Item::Input { placeholder, .. } if placeholder.is_empty()));
         assert_eq!(d.items[1].value(), "80");
         assert_eq!(d.items[2].value(), "localhost");
         // Edit container port -> local port follows.
         d.handle_key(k(KeyCode::Backspace), &mut c);
         d.handle_key(k(KeyCode::Backspace), &mut c);
-        d.handle_key(k(KeyCode::Char('9')), &mut c);
-        d.handle_key(k(KeyCode::Char('1')), &mut c);
-        assert_eq!(d.items[1].value(), "91");
+        for ch in "29091,sidecar::9090".chars() {
+            d.handle_key(k(KeyCode::Char(ch)), &mut c);
+        }
+        d.focus = 1;
+        for _ in 0..20 {
+            d.handle_key(k(KeyCode::Backspace), &mut c);
+        }
+        for ch in "29091,29090".chars() {
+            d.handle_key(k(KeyCode::Char(ch)), &mut c);
+        }
         d.focus = 3;
         assert!(d.handle_key(k(KeyCode::Enter), &mut c).is_some());
+        // ToTunnels keeps every comma-separated tunnel.
         let s = got.lock().unwrap().clone().unwrap();
-        assert_eq!(
-            (s.container.as_str(), s.container_port, s.local_port),
-            ("nginx", 91, 91)
-        );
-        assert_eq!(s.address, "localhost");
+        let tt: Vec<_> = s
+            .iter()
+            .map(|t| (t.container.as_str(), t.container_port, t.local_port))
+            .collect();
+        assert_eq!(tt, [("nginx", 29091, 29091), ("sidecar", 9090, 29090)]);
+        assert_eq!(s[0].address, "localhost");
 
         // Empty ports flash an error and stay open.
         let mut d = DialogState::new(
             Dialog::PortForward {
                 spec: PortForwardSpec::default(),
                 ports: vec![],
+                prefill: Default::default(),
                 on_ok: Box::new(|_, _| panic!("no")),
             },
             &c,
@@ -1078,6 +1845,92 @@ mod tests {
             d.pending_flash.take(),
             Some((FlashLevel::Err, "container to local port mismatch".into()))
         );
+    }
+
+    /// port.ParsePF + PortNum and startFwdCB checks keep the form open.
+    #[test]
+    fn port_forward_specs_and_checks() {
+        let spec = PortForwardSpec {
+            namespace: "default".into(),
+            pod: "p".into(),
+            container: "web".into(),
+            ..Default::default()
+        };
+        assert_eq!(parse_pf("web::80"), Ok((Some("web".into()), 80)));
+        assert_eq!(parse_pf("8080:80"), Ok((None, 80)));
+        assert_eq!(parse_pf("web::http/8080"), Ok((Some("web".into()), 8080)));
+        assert_eq!(parse_pf("web::http"), Err("no port number assigned".into()));
+        assert_eq!(
+            parse_pf("web::80(http)"),
+            Err("invalid port-forward specification web::80(http)".into())
+        );
+        assert_eq!(
+            to_tunnels("localhost", "web::80,web::81", "8080", &spec).unwrap_err(),
+            "spec to local port count mismatch. Expected 2 but got 1"
+        );
+        // A busy host port is refused.
+        let l = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let busy = l.local_addr().unwrap().port();
+        let mut c = ctx();
+        let mut d = DialogState::new(
+            Dialog::PortForward {
+                spec,
+                ports: vec![],
+                prefill: ("web::80".into(), busy.to_string()),
+                on_ok: Box::new(|_, _| panic!("no")),
+            },
+            &c,
+        );
+        d.items[2] = Item::input("Address:", "localhost", 30);
+        d.focus = 3;
+        assert!(d.handle_key(k(KeyCode::Enter), &mut c).is_none());
+        assert_eq!(
+            d.pending_flash.take(),
+            Some((
+                FlashLevel::Err,
+                format!("port {busy} is not available on host")
+            ))
+        );
+    }
+
+    #[test]
+    fn mouse_clicks_toggle_and_press() {
+        let mut c = ctx();
+        let got = Arc::new(Mutex::new(None));
+        let g2 = got.clone();
+        let mut d = DialogState::new(
+            Dialog::Drain {
+                node: "n1".into(),
+                on_ok: Box::new(move |_, o| {
+                    *g2.lock().unwrap() = Some(o);
+                    vec![]
+                }),
+            },
+            &c,
+        );
+        let st = Styles::default();
+        let mut buf = Buffer::empty(Rect::new(0, 0, 160, 45));
+        let a = buf.area;
+        d.draw(&mut buf, a, &st);
+        let elem = |d: &DialogState, i: usize| {
+            let h = d.hits.borrow();
+            h.elems.iter().find(|(j, _)| *j == i).unwrap().1
+        };
+        // Checkbox (item 4, Force): a click focuses and toggles it.
+        let r = elem(&d, 4);
+        assert!(d.contains(r.x, r.y));
+        assert!(!d.contains(0, 0));
+        assert!(d.click(r.x + 1, r.y, &mut c).is_none());
+        assert_eq!(d.focus, 4);
+        // Clicking empty form space keeps the focus.
+        let area = d.hits.borrow().area;
+        assert!(d.click(area.x + 1, area.y + 1, &mut c).is_none());
+        assert_eq!(d.focus, 4);
+        // OK button presses.
+        let ok = d.items.len() + 1;
+        let r = elem(&d, ok);
+        assert!(d.click(r.x + 2, r.y, &mut c).is_some());
+        assert!(got.lock().unwrap().clone().unwrap().force);
     }
 
     #[test]
@@ -1096,7 +1949,9 @@ mod tests {
             &c,
         );
         assert_eq!(d.text, "Drain n1?");
-        assert_eq!(d.items[1].value(), "5m0s");
+        // view/node.go drainCmd defaults: 5s timeout, all checkboxes off.
+        assert_eq!(d.items[1].value(), "5s");
+        assert!(!d.items[2].checked() && !d.items[3].checked());
         d.handle_key(k(KeyCode::Backspace), &mut c);
         d.handle_key(k(KeyCode::Backspace), &mut c);
         d.handle_key(k(KeyCode::Char('3')), &mut c);
@@ -1121,7 +1976,7 @@ mod tests {
         assert_eq!(o.grace_period_seconds, 3);
         assert_eq!(o.timeout_secs, 120);
         assert!(o.force);
-        assert!(o.ignore_all_daemon_sets);
+        assert!(!o.ignore_all_daemon_sets);
     }
 
     #[test]

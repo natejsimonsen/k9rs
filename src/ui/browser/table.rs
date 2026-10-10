@@ -82,7 +82,8 @@ impl TableState {
             || (!self.wide && h.wide && !h.show)
             || (h.name == "NAMESPACE" && !is_cluster_wide(ns))
             || (h.mx && !has_metrics)
-            || h.vs
+            // Hidden unless an image scanner exists (imageScans.enable).
+            || (h.vs && crate::vul::scanner().is_none())
     }
 
     /// Indices of displayed header columns.
@@ -495,9 +496,10 @@ pub(crate) fn draw_table(
     // `[fg:bg:-]` resets attributes: the bold border must not leak in.
     let title_spans: Vec<Span<'static>> = styled_spans(
         &input.title,
+        // `-` falls back to the box title color (body fg) and table bg.
         Style::default()
-            .fg(styles.title_fg)
-            .bg(styles.title_bg)
+            .fg(styles.fg)
+            .bg(styles.table_bg)
             .remove_modifier(Modifier::BOLD),
     );
     let block = Block::default()
@@ -574,23 +576,29 @@ pub(crate) fn draw_table(
         })
         .collect();
 
-    // Column widths (tview: max cell width; columns from the offset while they fit).
-    if st.col_offset >= cols.len() {
-        st.col_offset = cols.len().saturating_sub(1);
-    }
+    // Column widths (tview Table.Draw): leading columns are only skipped
+    // while the table overflows, so the offset is clamped back to what was
+    // actually skipped (a table that fits never scrolls horizontally).
     let mut widths: Vec<usize> = Vec::new();
     let mut table_width = 0;
-    for ci in st.col_offset..cols.len() {
+    let mut skipped = 0;
+    for ci in 0..cols.len() {
+        // tview: `tableWidth-1 >= width`.
+        if table_width > width && (skipped >= st.col_offset || widths.is_empty()) {
+            break;
+        }
+        while table_width > width && skipped < st.col_offset && !widths.is_empty() {
+            skipped += 1;
+            table_width -= widths.remove(0) + 1;
+        }
         let mut w = tagged_width(&header_cells[ci].text);
         for r in &row_cells {
             w = w.max(tagged_width(&r[ci].text));
         }
         widths.push(w);
         table_width += w + 1;
-        if table_width >= width {
-            break;
-        }
     }
+    st.col_offset = skipped;
     if table_width < width && !widths.is_empty() {
         let mut to_distribute = width - table_width;
         let mut total = widths.len();

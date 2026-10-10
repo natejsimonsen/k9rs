@@ -100,7 +100,11 @@ impl Renderer for Pod {
         row.fields = vec![
             pns.to_string(),
             name.to_string(),
-            NA_VALUE.to_string(),
+            crate::vul::compute_vul_score(
+                pns,
+                &o.metadata.labels.clone().unwrap_or_default(),
+                spec,
+            ),
             "●".to_string(),
             format!("{c_ready}/{all_counts}"),
             phase.clone(),

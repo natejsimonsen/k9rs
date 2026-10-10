@@ -226,3 +226,68 @@ async fn skin_applied() {
     h.goto("deploy").await.unwrap();
     assert_eq!(h.render().fg_of("nginx"), color("gold"), "addColor");
 }
+
+/// model/table.go: with views.yaml columns, server tables are fetched with
+/// full objects so `.spec` JSONPath and JQ columns resolve. (`{range}` specs
+/// never reach JSONPath: kubectl's RelaxedJSONPathExpression rejects them.)
+async fn ingress_harness(cols: &str) -> Harness {
+    let views: &'static str = Box::leak(
+        format!("views:\n  networking.k8s.io/v1/ingresses:\n    columns:\n{cols}").into_boxed_str(),
+    );
+    let h = Harness::with(Setup {
+        views_yaml: Some(views),
+        ..Default::default()
+    })
+    .await;
+    h.acc
+        .objects
+        .lock()
+        .unwrap()
+        .entry(k9rs::k8s::Gvr::parse("networking.k8s.io/v1/ingresses"))
+        .or_default()
+        .push(k9rs::k8s::fake::obj(serde_json::json!({
+            "apiVersion": "networking.k8s.io/v1", "kind": "Ingress",
+            "metadata": {"name": "web", "namespace": "default"},
+            "spec": {"ingressClassName": "nginx",
+                     "rules": [{"host": "a.io"}, {"host": "b.io"}]}
+        })));
+    h
+}
+
+#[tokio::test]
+async fn custom_columns_on_server_table_resources() {
+    let mut h = ingress_harness(
+        "      - NAME\n      - CLASS:.spec.ingressClassName\n      - JQ:{.spec.rules | map(.host) | join(\"+\")}\n",
+    )
+    .await;
+    h.goto("ing").await.unwrap();
+    let s = h.render();
+    dump(&s);
+    let hdr: Vec<String> = s
+        .line(1)
+        .split_whitespace()
+        .filter(|w| *w != "│")
+        .map(String::from)
+        .collect();
+    assert_eq!(hdr[1..3], ["CLASS", "JQ"]);
+    let row = s.line(2);
+    for want in ["web", "nginx", "a.io+b.io"] {
+        assert!(row.contains(want), "{want}: {row}");
+    }
+}
+
+/// A custom column JSONPath that does not parse fails the table load the
+/// way k9s does (seen live: "column2 is an incomplete jsonpath template").
+#[tokio::test]
+async fn bad_custom_column_fails_the_load() {
+    let mut h = ingress_harness(
+        "      - NAME\n      - CLASS:.spec.ingressClassName\n      - BAD:{.spec[}\n",
+    )
+    .await;
+    h.goto("ing").await.unwrap();
+    let f = h.last_flash().cloned().unwrap();
+    assert_eq!(
+        f.1,
+        "Watcher failed for networking.k8s.io/v1/ingresses -- column2 is an incomplete jsonpath template"
+    );
+}

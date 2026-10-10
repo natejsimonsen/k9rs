@@ -4,7 +4,7 @@ use anyhow::Result;
 use kube::api::DynamicObject;
 use serde_json::Value;
 
-use crate::model::{HeaderColumn, MISSING_VALUE, NA_VALUE};
+use crate::model::{HeaderColumn, MISSING_VALUE};
 
 use super::util;
 use super::Def;
@@ -112,7 +112,11 @@ impl Def for Job {
             vec![
                 obj_ns(o).to_string(),
                 obj_name(o).to_string(),
-                NA_VALUE.into(),
+                crate::vul::compute_vul_score(
+                    obj_ns(o),
+                    &o.metadata.labels.clone().unwrap_or_default(),
+                    pod_spec,
+                ),
                 ready,
                 to_duration(status),
                 job_selector(spec),
@@ -160,7 +164,11 @@ impl Def for CronJob {
             vec![
                 obj_ns(o).to_string(),
                 obj_name(o).to_string(),
-                NA_VALUE.into(),
+                crate::vul::compute_vul_score(
+                    obj_ns(o),
+                    &o.metadata.labels.clone().unwrap_or_default(),
+                    pod_spec,
+                ),
                 str_at(d, "spec.schedule").to_string(),
                 bool_to_str(util::opt_bool_at(d, "spec.suspend").unwrap_or(false)),
                 array_at(d, "status.active").len().to_string(),

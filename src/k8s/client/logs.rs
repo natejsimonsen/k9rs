@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use futures::AsyncBufReadExt;
 use k8s_openapi::api::core::v1::Pod;
 use kube::api::LogParams;
@@ -48,7 +48,8 @@ pub(crate) fn pod_log_params(opts: &LogOptions, container: &str) -> LogParams {
 /// Split a raw log line (always fetched with timestamps) into timestamp + text.
 pub(crate) fn parse_line(raw: &[u8], pod: &str, container: &str, show_ts: bool) -> LogLine {
     let mut s = String::from_utf8_lossy(raw).into_owned();
-    if s.ends_with('\n') {
+    let partial = !s.ends_with('\n');
+    if !partial {
         s.pop();
     }
     let (ts, text) = match s.split_once(' ') {
@@ -62,6 +63,9 @@ pub(crate) fn parse_line(raw: &[u8], pod: &str, container: &str, show_ts: bool) 
         container: container.to_string(),
         timestamp: if show_ts { ts } else { None },
         text,
+        partial,
+        is_error: false,
+        single: false,
     }
 }
 
@@ -136,6 +140,8 @@ pub(crate) struct Tail {
     pub(crate) pod: String,
     pub(crate) container: String,
     pub(crate) opts: LogOptions,
+    /// Pod.TailLogs: the pod has exactly one container.
+    pub(crate) single: bool,
 }
 
 impl Tail {
@@ -194,10 +200,10 @@ impl Tail {
                 }
             }
         }
+        // k9s reports it as a log item; the other containers keep streaming.
+        let msg = format!("failed to maintain log stream after {LOG_RETRY_COUNT} retries");
         let _ = tx
-            .send(Err(anyhow!(
-                "failed to maintain log stream after {LOG_RETRY_COUNT} retries"
-            )))
+            .send(Ok(LogLine::error(msg, self.opts.show_timestamp)))
             .await;
     }
 
@@ -212,13 +218,16 @@ impl Tail {
             buf.clear();
             match reader.read_until(b'\n', &mut buf).await {
                 Ok(0) => {
+                    // readLogs: an error log item, not a stream failure.
                     let msg = format!("stream closed: EOF for {}", self.info());
-                    let _ = tx.send(Err(anyhow!(msg))).await;
+                    let line = LogLine::error(msg, self.opts.show_timestamp);
+                    let _ = tx.send(Ok(line)).await;
                     return StreamResult::Eof;
                 }
                 Ok(_) => {
-                    let line =
+                    let mut line =
                         parse_line(&buf, &self.pod, &self.container, self.opts.show_timestamp);
+                    line.single = self.single;
                     if tx.send(Ok(line)).await.is_err() {
                         return StreamResult::Canceled;
                     }

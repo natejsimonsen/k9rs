@@ -28,6 +28,20 @@ pub struct FakeAccessor {
     pub metrics: bool,
     /// `(gvr, namespace)` pairs `can(.., "list")` refuses.
     pub denied: Mutex<Vec<(String, String)>>,
+    /// `check_connectivity` fails with this error.
+    pub unreachable: Mutex<Option<String>>,
+    /// `(gvr, fqn)` pairs `can_named(.., "get")` refuses.
+    pub denied_get: Mutex<Vec<(String, String)>>,
+    /// `(gvr, fqn)` pairs `can_named(.., "patch")` refuses.
+    pub denied_patch: Mutex<Vec<(String, String)>>,
+    /// GVRs whose `list` fails (RBAC forbidden).
+    pub list_errors: Mutex<Vec<String>>,
+    /// Senders that make the started port forwards die with a message.
+    pub pf_kill: Mutex<Vec<tokio::sync::oneshot::Sender<String>>>,
+    /// GVRs whose `list` panics (crash-audit tests).
+    pub list_panics: Mutex<Vec<String>>,
+    /// `cluster_info` never resolves (a slow API server).
+    pub cluster_info_hangs: std::sync::atomic::AtomicBool,
 }
 
 /// Build a DynamicObject from JSON (must contain apiVersion, kind, metadata).
@@ -70,6 +84,12 @@ impl FakeAccessor {
     }
     fn find(&self, gvr: &Gvr, path: &str) -> Option<DynamicObject> {
         let (ns, name) = namespaced(path);
+        // "-/name" is a cluster-scoped id (like the real accessor's clean_ns).
+        let ns = if ns == crate::k8s::CLUSTER_SCOPE {
+            ""
+        } else {
+            ns
+        };
         self.objects.lock().unwrap().get(gvr).and_then(|v| {
             v.iter()
                 .find(|o| {
@@ -141,9 +161,25 @@ pub fn default_resources() -> Vec<ResourceMeta> {
 
 #[async_trait]
 impl Accessor for FakeAccessor {
+    async fn check_connectivity(&self) -> Result<()> {
+        match self.unreachable.lock().unwrap().clone() {
+            Some(e) => Err(anyhow::anyhow!(e)),
+            None => Ok(()),
+        }
+    }
     async fn can(&self, gvr: &Gvr, ns: &str, verb: &str) -> Result<bool> {
         let key = (gvr.to_string(), ns.to_string());
         Ok(verb != "list" || !self.denied.lock().unwrap().contains(&key))
+    }
+    async fn can_named(&self, gvr: &Gvr, ns: &str, name: &str, verb: &str) -> Result<bool> {
+        let key = (gvr.to_string(), crate::k8s::fqn(ns, name));
+        if verb == "get" && self.denied_get.lock().unwrap().contains(&key) {
+            return Ok(false);
+        }
+        if verb == "patch" && self.denied_patch.lock().unwrap().contains(&key) {
+            return Ok(false);
+        }
+        self.can(gvr, ns, verb).await
     }
     async fn resources(&self) -> Result<Vec<ResourceMeta>> {
         Ok(self.resources.lock().unwrap().clone())
@@ -163,6 +199,12 @@ impl Accessor for FakeAccessor {
         Ok(out)
     }
     async fn cluster_info(&self) -> Result<ClusterInfo> {
+        if self
+            .cluster_info_hangs
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            futures::future::pending::<()>().await;
+        }
         Ok(ClusterInfo {
             context: self.active_context(),
             cluster: "fake-cluster".into(),
@@ -207,6 +249,28 @@ impl Accessor for FakeAccessor {
         self.record(format!("switch_context {name}"));
         Ok(ns)
     }
+    async fn rename_context(&self, old: &str, new: &str) -> Result<()> {
+        let mut cc = self.contexts.lock().unwrap();
+        if cc.iter().any(|c| c.name == new) {
+            return Err(anyhow!("context with name {new} already exists"));
+        }
+        if let Some(c) = cc.iter_mut().find(|c| c.name == old) {
+            c.name = new.into();
+        }
+        drop(cc);
+        let mut a = self.active.lock().unwrap();
+        if *a == old {
+            *a = new.into();
+        }
+        drop(a);
+        self.record(format!("rename_context {old} {new}"));
+        Ok(())
+    }
+    async fn delete_context(&self, name: &str) -> Result<()> {
+        self.contexts.lock().unwrap().retain(|c| c.name != name);
+        self.record(format!("delete_context {name}"));
+        Ok(())
+    }
     fn default_namespace(&self) -> String {
         "default".into()
     }
@@ -216,6 +280,12 @@ impl Accessor for FakeAccessor {
         ns: &str,
         label_selector: Option<&str>,
     ) -> Result<Vec<DynamicObject>> {
+        if self.list_errors.lock().unwrap().contains(&gvr.to_string()) {
+            anyhow::bail!("{gvr} is forbidden");
+        }
+        if self.list_panics.lock().unwrap().contains(&gvr.to_string()) {
+            panic!("fake list of {gvr} blew up");
+        }
         let all = self
             .objects
             .lock()
@@ -256,7 +326,36 @@ impl Accessor for FakeAccessor {
         ns: &str,
         label_selector: Option<&str>,
     ) -> Result<Option<ServerTable>> {
-        let objs = self.list(gvr, ns, label_selector).await?;
+        self.list_table_with(gvr, ns, label_selector, false, None)
+            .await
+    }
+    async fn list_table_with(
+        &self,
+        gvr: &Gvr,
+        ns: &str,
+        label_selector: Option<&str>,
+        include_object: bool,
+        field_selector: Option<&str>,
+    ) -> Result<Option<ServerTable>> {
+        let mut objs = self.list(gvr, ns, label_selector).await?;
+        // Server-side `k=v[,k=v]` field selector over the object JSON.
+        if let Some(fs) = field_selector.filter(|s| !s.is_empty()) {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("fieldSelector {gvr} {fs}"));
+            objs.retain(|o| {
+                let v = serde_json::to_value(o).unwrap_or_default();
+                fs.split(',').all(|kv| match kv.split_once('=') {
+                    Some((k, want)) => {
+                        let ptr = format!("/{}", k.replace('.', "/"));
+                        v.pointer(&ptr).and_then(|x| x.as_str())
+                            == Some(want.trim_start_matches('='))
+                    }
+                    None => false,
+                })
+            });
+        }
         let col = |n: &str, t: &str, f: &str| ServerTableColumn {
             name: n.into(),
             type_: t.into(),
@@ -283,6 +382,12 @@ impl Accessor for FakeAccessor {
                         namespace: o.metadata.namespace.clone().unwrap_or_default(),
                         creation_timestamp: ts,
                         labels: o.metadata.labels.clone().unwrap_or_default(),
+                        // includeObject=Metadata sends PartialObjectMetadata.
+                        object: Some(if include_object {
+                            serde_json::to_value(&o).unwrap_or_default()
+                        } else {
+                            serde_json::json!({"metadata": o.metadata})
+                        }),
                     }
                 })
                 .collect(),
@@ -294,6 +399,12 @@ impl Accessor for FakeAccessor {
     }
     async fn delete(&self, gvr: &Gvr, path: &str, opts: DeleteOptions) -> Result<()> {
         let (ns, name) = namespaced(path);
+        // "-/name" is a cluster-scoped id (like the real accessor's clean_ns).
+        let ns = if ns == crate::k8s::CLUSTER_SCOPE {
+            ""
+        } else {
+            ns
+        };
         let mut objs = self.objects.lock().unwrap();
         let v = objs
             .get_mut(gvr)
@@ -322,6 +433,14 @@ impl Accessor for FakeAccessor {
         let v = serde_json::to_value(self.get(gvr, path).await?)?;
         Ok(super::goyaml::to_yaml(&v))
     }
+    async fn patch_json(&self, gvr: &Gvr, path: &str, patch: &serde_json::Value) -> Result<()> {
+        self.record(format!("patch_json {gvr} {path} {patch}"));
+        Ok(())
+    }
+    async fn create(&self, gvr: &Gvr, path: &str, _body: &serde_json::Value) -> Result<()> {
+        self.record(format!("create {gvr} {path}"));
+        Ok(())
+    }
     async fn apply_yaml(&self, gvr: &Gvr, path: &str, _yaml: &str) -> Result<()> {
         self.record(format!("apply {gvr} {path}"));
         Ok(())
@@ -337,8 +456,8 @@ impl Accessor for FakeAccessor {
             .and_then(|v| v.as_i64())
             .unwrap_or(1) as i32)
     }
-    async fn restart(&self, gvr: &Gvr, path: &str) -> Result<()> {
-        self.record(format!("restart {gvr} {path}"));
+    async fn restart(&self, gvr: &Gvr, path: &str, field_manager: &str) -> Result<()> {
+        self.record(format!("restart {gvr} {path} {field_manager}"));
         Ok(())
     }
     async fn set_images(&self, gvr: &Gvr, path: &str, images: Vec<ImageSpec>) -> Result<()> {
@@ -361,9 +480,16 @@ impl Accessor for FakeAccessor {
         self.record(format!("cordon {node} {cordon}"));
         Ok(())
     }
-    async fn drain(&self, node: &str, _opts: DrainOptions) -> Result<String> {
+    async fn drain(
+        &self,
+        node: &str,
+        _opts: DrainOptions,
+        progress: crate::k8s::DrainProgress,
+    ) -> Result<String> {
         self.record(format!("drain {node}"));
-        Ok(format!("node/{node} drained\n"))
+        let out = format!("node/{node} drained\n");
+        progress(&out);
+        Ok(out)
     }
     async fn pod_metrics(&self, ns: &str) -> Result<HashMap<String, PodMetrics>> {
         Ok(self
@@ -396,10 +522,22 @@ impl Accessor for FakeAccessor {
                     .unwrap_or(true)
             })
             .collect();
+        // Like a real tail, the stream ends with readLogs' EOF error item.
+        let info = match opts.container.as_deref().filter(|c| !c.is_empty()) {
+            Some(c) => format!("{key} ({c})"),
+            None => key.clone(),
+        };
+        let mut lines = lines;
+        lines.push(LogLine::error(
+            format!("stream closed: EOF for {info}"),
+            opts.show_timestamp,
+        ));
         Ok(futures::stream::iter(lines.into_iter().map(Ok)).boxed())
     }
     async fn port_forward(&self, spec: PortForwardSpec) -> Result<PortForwardHandle> {
         self.record(format!("port_forward {}", spec.id()));
+        let (tx, died) = tokio::sync::oneshot::channel();
+        self.pf_kill.lock().unwrap().push(tx);
         Ok(PortForwardHandle {
             info: PortForwardInfo {
                 spec,
@@ -407,6 +545,7 @@ impl Accessor for FakeAccessor {
                 active: true,
             },
             cancel: tokio_util::sync::CancellationToken::new(),
+            died: Some(died),
         })
     }
     fn exec_argv(&self, ns: &str, pod: &str, container: &str, shell: &str) -> Vec<String> {
@@ -419,6 +558,12 @@ impl Accessor for FakeAccessor {
     }
     fn edit_argv(&self, gvr: &Gvr, path: &str) -> Vec<String> {
         let (ns, name) = namespaced(path);
+        // "-/name" is a cluster-scoped id (like the real accessor's clean_ns).
+        let ns = if ns == crate::k8s::CLUSTER_SCOPE {
+            ""
+        } else {
+            ns
+        };
         let mut v: Vec<String> = vec![
             "kubectl".into(),
             "edit".into(),

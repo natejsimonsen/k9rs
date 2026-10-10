@@ -1,7 +1,5 @@
 //! ConfigMap, Secret and ServiceAccount describers.
 
-use std::collections::BTreeSet;
-
 use anyhow::Result;
 use base64::Engine;
 use serde_json::Value;
@@ -64,9 +62,8 @@ pub(crate) fn describe_secret(_ctx: &Ctx, secret: J, _events: &[Value]) -> Resul
     Ok(w.finish())
 }
 
-const SA_NAME_KEY: &str = "kubernetes.io/service-account.name";
-const SA_UID_KEY: &str = "kubernetes.io/service-account.uid";
-
+/// kubectl v0.35 describeServiceAccount: only image pull secrets (the
+/// mountable secrets and tokens sections were dropped).
 pub(crate) fn describe_service_account(ctx: &Ctx, sa: J, events: &[Value]) -> Result<String> {
     let meta = sa.get("metadata");
     let pull: Vec<String> = sa
@@ -74,60 +71,19 @@ pub(crate) fn describe_service_account(ctx: &Ctx, sa: J, events: &[Value]) -> Re
         .into_iter()
         .map(|s| s.s("name").to_string())
         .collect();
-    let mount: Vec<String> = sa
-        .arr("secrets")
-        .into_iter()
-        .map(|s| s.s("name").to_string())
-        .collect();
-    let mut tokens = Vec::new();
-    let mut missing = BTreeSet::new();
-    if let Some(secrets) = &ctx.rel.secrets {
-        let mut existing = BTreeSet::new();
-        for s in secrets.iter().map(J) {
-            if s.s("metadata.namespace") != meta.s("namespace") {
-                continue;
-            }
-            if s.s("type") == "kubernetes.io/service-account-token" {
-                let ann = s.get("metadata.annotations");
-                if ann.key(SA_NAME_KEY).as_str() == meta.s("name")
-                    && ann.key(SA_UID_KEY).as_str() == meta.s("uid")
-                {
-                    tokens.push(s.s("metadata.name").to_string());
-                }
-            }
-            existing.insert(s.s("metadata.name").to_string());
-        }
-        for n in mount.iter().chain(pull.iter()) {
-            if !existing.contains(n) {
-                missing.insert(n.clone());
-            }
-        }
-    }
     let mut w = PrefixWriter::new();
     w.write(L0, &format!("Name:\t{}\n", meta.s("name")));
     w.write(L0, &format!("Namespace:\t{}\n", meta.s("namespace")));
     print_labels_multiline(&mut w, "Labels", &meta.smap("labels"));
     print_annotations_multiline(&mut w, "Annotations", &meta.smap("annotations"));
-    let empty_header = "                   ";
-    let sections = [
-        ("Image pull secrets:", &pull),
-        ("Mountable secrets: ", &mount),
-        ("Tokens:            ", &tokens),
-    ];
-    for (header, names) in sections {
-        if names.is_empty() {
-            w.write(L0, &format!("{header}\t<none>\n"));
-            continue;
-        }
-        let mut prefix = header;
-        for n in names.iter() {
-            if missing.contains(n) {
-                w.write(L0, &format!("{prefix}\t{n} (not found)\n"));
-            } else {
-                w.write(L0, &format!("{prefix}\t{n}\n"));
-            }
-            prefix = empty_header;
-        }
+    let (empty_header, header) = ("                   ", "Image pull secrets:");
+    if pull.is_empty() {
+        w.write(L0, &format!("{header}\t<none>\n"));
+    }
+    let mut prefix = header;
+    for n in &pull {
+        w.write(L0, &format!("{prefix}\t{n}\n"));
+        prefix = empty_header;
     }
     describe_events(ctx, &mut w, events);
     Ok(w.finish())

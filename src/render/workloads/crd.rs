@@ -72,7 +72,7 @@ impl Def for CustomResourceDefinition {
             tracing::warn!(fqn = %obj_name(o).to_string(), "Unable to assert CRD versions");
         }
         Ok((
-            obj_fqn(o),
+            meta_fqn(o),
             vec![
                 str_at(d, "spec.names.plural").to_string(),
                 str_at(d, "spec.group").to_string(),
@@ -118,7 +118,8 @@ mod tests {
     fn render_fixture() {
         let o = load("crd");
         let r = render("apiextensions.k8s.io/v1/customresourcedefinitions", &o);
-        assert_eq!(r.id, "adapters.config.istio.io");
+        // k9s render tests: cluster-scoped ids keep the "-/" prefix.
+        assert_eq!(r.id, "-/adapters.config.istio.io");
         assert_eq!(
             r.fields,
             sv(&[

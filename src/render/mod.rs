@@ -104,10 +104,10 @@ pub fn default_colorer(_ns: &str, h: &Header, re: &RowEvent, p: &Palette) -> Col
 }
 
 /// Convenience: render a batch of objects with a renderer into rows.
-pub fn render_all(
+pub fn render_all<O: std::borrow::Borrow<DynamicObject>>(
     r: &dyn Renderer,
     gvr: &Gvr,
-    objs: &[DynamicObject],
+    objs: &[O],
     ns: &str,
     metrics: Option<&MetricsSnapshot>,
 ) -> Vec<Row> {
@@ -115,7 +115,10 @@ pub fn render_all(
     let mut out = Vec::with_capacity(objs.len());
     for o in objs {
         let mut row = Row::new(size);
-        let input = RenderInput { obj: o, metrics };
+        let input = RenderInput {
+            obj: o.borrow(),
+            metrics,
+        };
         match r.render(&input, ns, &mut row) {
             Ok(()) => out.push(row),
             Err(e) => tracing::warn!(gvr = %gvr, error = %e, "render failed"),
@@ -123,3 +126,6 @@ pub fn render_all(
     }
     out
 }
+
+#[cfg(test)]
+mod fuzz_tests;

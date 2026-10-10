@@ -78,7 +78,7 @@ impl Def for ClusterRole {
 
     fn row(&self, o: &DynamicObject) -> Result<(String, Vec<String>)> {
         Ok((
-            crate::k8s::fqn(crate::k8s::CLUSTER_SCOPE, obj_name(o)),
+            crate::k8s::cluster_fqn(obj_name(o)),
             vec![obj_name(o).to_string(), labels_str(o), obj_age(o)],
         ))
     }
@@ -137,7 +137,7 @@ impl Def for ClusterRoleBinding {
         let d = &o.data;
         let (kind, ss) = render_subjects(array_at(d, "subjects"));
         Ok((
-            crate::k8s::fqn(crate::k8s::CLUSTER_SCOPE, obj_name(o)),
+            crate::k8s::cluster_fqn(obj_name(o)),
             vec![
                 obj_name(o).to_string(),
                 str_at(d, "roleRef.name").to_string(),
@@ -188,7 +188,8 @@ mod tests {
         );
         let o = load("cr");
         let r = render("rbac.authorization.k8s.io/v1/clusterroles", &o);
-        assert_eq!(r.id, "blee");
+        // k9s render tests: cluster-scoped ids keep the "-/" prefix.
+        assert_eq!(r.id, "-/blee");
         assert_eq!(r.fields[0], "blee");
         assert_eq!(r.fields[2], age(&o));
     }
@@ -241,7 +242,8 @@ mod tests {
         );
         let o = load("crb");
         let r = render("rbac.authorization.k8s.io/v1/clusterrolebindings", &o);
-        assert_eq!(r.id, "blee");
+        // k9s render tests: cluster-scoped ids keep the "-/" prefix.
+        assert_eq!(r.id, "-/blee");
         assert_eq!(
             r.fields,
             sv(&["blee", "blee", "User", "fernand", "", &age(&o)])

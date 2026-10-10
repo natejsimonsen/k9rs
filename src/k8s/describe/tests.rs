@@ -151,6 +151,7 @@ fn pod_events() -> Vec<Value> {
         }),
         json!({
             "metadata": {"name": "e3", "namespace": "default"},
+            "involvedObject": {"kind": "Pod", "name": "nginx", "fieldPath": "spec.containers{nginx}"},
             "type": "Warning", "reason": "BackOff",
             "source": {"component": "kubelet"},
             "firstTimestamp": "2024-01-01T10:04:00Z", "lastTimestamp": "2024-01-01T10:04:30Z",
@@ -253,7 +254,8 @@ fn pod_full() {
         "  Type     Reason     Age                  From               Message",
         "  ----     ------     ----                 ----               -------",
         "  Normal   Scheduled  120m                 default-scheduler  Successfully assigned default/nginx to node-1",
-        "  Warning  BackOff    116m                 kubelet            Back-off restarting failed container",
+        // kubectl v0.35 prefixes involvedObject.fieldPath.
+        "  Warning  BackOff    116m                 kubelet            spec.containers{nginx}: Back-off restarting failed container",
         "  Normal   Pulled     115m (x3 over 119m)  kubelet            Container image \"nginx:1.25\" already present on machine",
     ]);
     assert_eq!(got, want);
@@ -1184,47 +1186,32 @@ Events:  <none>
     assert_eq!(got, want);
 }
 
-/// kubectl describe_test.go TestDescribeServiceAccount.
+/// kubectl v0.35 describe_test.go TestDescribeServiceAccount (v0.35 dropped
+/// the `Mountable secrets:`/`Tokens:` sections and `(not found)` markers).
 #[test]
 fn service_account_kubectl_golden() {
     let sa = json!({"metadata": {"name": "bar", "namespace": "foo"},
         "secrets": [{"name": "test-objectref"}], "imagePullSecrets": [{"name": "test-local-ref"}]});
-    let rel = Rel {
-        secrets: Some(vec![]),
-        ..Default::default()
-    };
-    let got = desc_rel("v1/serviceaccounts", sa, vec![], rel);
+    let got = desc_rel("v1/serviceaccounts", sa, vec![], Rel::default());
     let want = "Name:                bar
 Namespace:           foo
 Labels:              <none>
 Annotations:         <none>
-Image pull secrets:  test-local-ref (not found)
-Mountable secrets:   test-objectref (not found)
-Tokens:              <none>
+Image pull secrets:  test-local-ref
 Events:              <none>
 ";
     assert_eq!(got, want);
 }
 
 #[test]
-fn service_account_tokens() {
-    let sa = json!({"metadata": {"name": "bot", "namespace": "ns", "uid": "sa-uid"},
-        "secrets": [{"name": "bot-token"}, {"name": "extra"}]});
-    let token = |name: &str, uid: &str| {
-        json!({"metadata": {"name": name, "namespace": "ns",
-        "annotations": {"kubernetes.io/service-account.name": "bot", "kubernetes.io/service-account.uid": uid}},
-        "type": "kubernetes.io/service-account-token"})
-    };
-    let rel = Rel {
-        secrets: Some(vec![
-            token("bot-token", "sa-uid"),
-            token("stale", "old-uid"),
-            json!({"metadata": {"name": "extra", "namespace": "ns"}}),
-        ]),
-        ..Default::default()
-    };
-    let got = desc_rel("v1/serviceaccounts", sa, vec![], rel);
-    assert!(got.contains("Image pull secrets:  <none>\nMountable secrets:   bot-token\n                     extra\nTokens:              bot-token\n"));
+fn service_account_multiple_pull_secrets() {
+    let sa = json!({"metadata": {"name": "bot", "namespace": "ns"},
+        "imagePullSecrets": [{"name": "a"}, {"name": "b"}]});
+    let got = desc_rel("v1/serviceaccounts", sa, vec![], Rel::default());
+    assert!(
+        got.contains("Image pull secrets:  a\n                     b\nEvents:"),
+        "{got}"
+    );
 }
 
 #[test]
@@ -2026,4 +2013,74 @@ fn invalid_selector_is_an_error_for_deployments() {
         TimeZone::UTC,
     );
     assert!(err.is_err());
+}
+
+/// kubectl v0.35 describeWorkloadReference on pods.
+#[test]
+fn pod_workload_ref() {
+    let mut pod = pod_fixture();
+    pod["spec"]["workloadRef"] = json!({"name": "wl", "podGroup": "pg", "podGroupReplicaKey": "k"});
+    let got = desc("v1/pods", pod, vec![]);
+    assert!(
+        got.contains("WorkloadRef:\n  Name:                wl\n  PodGroup:            pg\n  PodGroupReplicaKey:  k\nEvents:"),
+        "{got}"
+    );
+}
+
+/// kubectl CertificateSigningRequestDescriber: subject and SANs parsed out
+/// of the PKCS#10 request, status from conditions.
+#[test]
+fn certificate_signing_request() {
+    let csr = json!({"metadata": {"name": "csr-1", "creationTimestamp": "2024-01-01T11:00:00Z"},
+        "spec": {"request": "LS0tLS1CRUdJTiBDRVJUSUZJQ0FURSBSRVFVRVNULS0tLS0KTUlJQlNUQ0I3d0lCQURCTU1Rc3dDUVlEVlFRR0V3SlZVekVWTUJNR0ExVUVDZ3dNYzNsemRHVnRPbTV2WkdWegpNUTB3Q3dZRFZRUUtEQVJ2Y21jeU1SY3dGUVlEVlFRRERBNXplWE4wWlcwNmJtOWtaVHB1TVRCWk1CTUdCeXFHClNNNDlBZ0VHQ0NxR1NNNDlBd0VIQTBJQUJCVDJRUmtSdzZ6NEF0MVFycXZDM29SNkZob0UzdXFVQ2VlU1VBWEoKSDZIdGNjWjBqKzB3ZTZ2b01QMUYzWlZYUlQ2RExRYVJPS0lmREJWY3hNaFF3ZXlnUVRBL0Jna3Foa2lHOXcwQgpDUTR4TWpBd01DNEdBMVVkRVFRbk1DV0NCR0V1YVcrQ0JHSXVhVytIQkFvQUFBR0JCWGhBZVM1NmhncHpjR2xtClptVTZMeTk2TUFvR0NDcUdTTTQ5QkFNQ0Ewa0FNRVlDSVFEdm4xSGN1TEpPR0RyNFJPS0hsV2tDNDZaT2RXUUkKVEJyYm5aSUpCajM3c3dJaEFOSEhHSTVzRVJUNEtWNGx3OWJUY2pwMzlRSngveDJWWkpVMVVqeEoxelBxCi0tLS0tRU5EIENFUlRJRklDQVRFIFJFUVVFU1QtLS0tLQo=", "signerName": "kubernetes.io/kubelet-serving",
+                 "username": "system:node:n1", "expirationSeconds": 3600},
+        "status": {"conditions": [{"type": "Approved"}], "certificate": "Y2VydA=="}});
+    let got = desc(
+        "certificates.k8s.io/v1/certificatesigningrequests",
+        csr,
+        vec![],
+    );
+    for want in [
+        "Name:",
+        "csr-1",
+        "Requesting User:",
+        "system:node:n1",
+        "Signer:",
+        "kubernetes.io/kubelet-serving",
+        "Requested Duration:",
+        "60m",
+        "Status:",
+        "Approved,Issued",
+        "Common Name:",
+        "system:node:n1",
+        "Organization:",
+        "system:nodes",
+        "Country:",
+        "US",
+        "DNS Names:",
+        "a.io",
+        "b.io",
+        "Email Addresses:",
+        "x@y.z",
+        "URIs:",
+        "spiffe://z",
+        "IP Addresses:",
+        "10.0.0.1",
+        "Events:",
+    ] {
+        assert!(got.contains(want), "{want}:\n{got}");
+    }
+    // A garbage request fails like kubectl.
+    let bad = json!({"metadata": {"name": "x"}, "spec": {"request": "bm9wZQ=="}});
+    let err = run(
+        &Gvr::parse("certificates.k8s.io/v1/certificatesigningrequests"),
+        &bad,
+        &[],
+        &Rel::default(),
+        now(),
+        TimeZone::UTC,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.starts_with("Error parsing CSR:"), "{err}");
 }

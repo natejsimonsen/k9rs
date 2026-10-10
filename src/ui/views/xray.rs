@@ -766,6 +766,9 @@ struct TreeRow {
     last_chain: Vec<bool>,
     title: String,
     expanded: bool,
+    /// Node identity: path plus its rank among same-id siblings (a pod's
+    /// container and service account often share an id, hence a path).
+    key: String,
 }
 
 pub(crate) struct XrayView {
@@ -776,7 +779,25 @@ pub(crate) struct XrayView {
     shown: Option<TreeNode>,
     count: usize,
     query: String,
+    /// ui.Tree selectedItem: set on selection changes, kept when the node
+    /// disappears.
     selected: String,
+    /// tview currentNode (row key); falls back to the root when not visible.
+    cur: String,
+    /// Set on rebuild: the current node becomes the last node whose path is
+    /// `selected` (update walks the whole tree calling SetCurrentNode).
+    cur_from_selected: bool,
+    /// Rebuilt trees expand every node whose path is the selected item.
+    force_open: String,
+    /// GVR of the node the key actions were last bound for (refreshActions
+    /// runs on Init with no node, then on each selection change).
+    act: Option<String>,
+    /// `act` as of the last redraw: k9s hydrates the menu while drawing the
+    /// tree, after the menu itself was drawn, so it lags one redraw behind.
+    menu_act: Option<String>,
+    /// Plugin hints bound by the last refreshActions, and as last drawn.
+    act_plugins: Vec<Hint>,
+    menu_plugins: Vec<Hint>,
     expand_nodes: bool,
     expanded: HashMap<String, bool>,
     top: usize,
@@ -787,6 +808,10 @@ pub(crate) struct XrayView {
     refresh: Duration,
     styles: Styles,
     resources: Vec<crate::k8s::ResourceMeta>,
+    /// gvr -> singular name (node categories).
+    categs: HashMap<String, String>,
+    /// Visible rows; rebuilt only when the tree or expansions change.
+    rows_cache: std::sync::Mutex<Option<std::sync::Arc<Vec<TreeRow>>>>,
 }
 
 impl XrayView {
@@ -794,14 +819,14 @@ impl XrayView {
         let (no_icons, rate) = ctx
             .config
             .read()
-            .map(|c| (c.k9s.ui.no_icons, c.k9s.refresh_rate))
+            .map(|c| (c.k9s.ui.no_icons, c.k9s.get_refresh_rate()))
             .unwrap_or((false, 2.0));
         let ns = if is_all_namespaces(&ns) {
             String::new()
         } else {
             ns
         };
-        XrayView {
+        let mut v = XrayView {
             id: ctx.new_view_id(),
             gvr,
             ns,
@@ -810,6 +835,13 @@ impl XrayView {
             count: 0,
             query: String::new(),
             selected: String::new(),
+            cur: String::new(),
+            cur_from_selected: false,
+            force_open: String::new(),
+            act: None,
+            menu_act: None,
+            act_plugins: Vec::new(),
+            menu_plugins: Vec::new(),
             expand_nodes: true,
             expanded: HashMap::new(),
             top: 0,
@@ -817,10 +849,30 @@ impl XrayView {
             gen: 0,
             token: None,
             no_icons,
-            refresh: Duration::from_secs_f32(rate.max(0.5)),
+            refresh: crate::config::k9s::secs(rate.max(0.5) as f64),
             styles: ctx.styles.clone(),
-            resources: ctx.resources.clone(),
+            resources: Vec::new(),
+            categs: HashMap::new(),
+            rows_cache: Default::default(),
+        };
+        v.set_resources(&ctx.resources);
+        v
+    }
+
+    fn set_resources(&mut self, rr: &[crate::k8s::ResourceMeta]) {
+        if self.resources == rr {
+            return;
         }
+        self.resources = rr.to_vec();
+        self.categs = rr
+            .iter()
+            .map(|m| (m.gvr.to_string(), m.singular_name.clone()))
+            .collect();
+        self.invalidate();
+    }
+
+    fn invalidate(&self) {
+        *self.rows_cache.lock().expect("rows cache") = None;
     }
 
     fn labels(&self) -> Option<String> {
@@ -906,59 +958,65 @@ impl XrayView {
     /// Xray.update: rebuild display state.
     fn update(&mut self) {
         self.shown = self.filtered();
+        self.invalidate();
+        // Every rebuild resets expansions to ExpandNodes, except the
+        // selected item which is expanded and made current.
         self.expanded.clear();
         if let Some(root) = &self.shown {
             if self.selected.is_empty() {
                 self.selected = root.id.clone();
             }
+            self.force_open = self.selected.clone();
+            self.cur_from_selected = true;
         }
     }
 
-    fn rows(&self) -> Vec<TreeRow> {
+    fn rows(&self) -> std::sync::Arc<Vec<TreeRow>> {
+        let mut cache = self.rows_cache.lock().expect("rows cache");
+        if let Some(rows) = cache.as_ref() {
+            return rows.clone();
+        }
         let mut out = Vec::new();
-        let Some(root) = &self.shown else {
-            return out;
-        };
-        let mut chain = vec![(root.gvr.clone(), root.id.clone(), root.status.clone())];
-        self.walk(root, 0, &mut chain, &mut Vec::new(), &mut out);
-        out
+        if let Some(root) = &self.shown {
+            let mut chain = vec![(root.gvr.clone(), root.id.clone(), root.status.clone())];
+            self.walk(root, 0, 0, &mut chain, &mut Vec::new(), &mut out);
+        }
+        let rows = std::sync::Arc::new(out);
+        *cache = Some(rows.clone());
+        rows
     }
 
     fn categ(&self, gvr: &str) -> String {
         if gvr == CONTAINERS {
             return "container".into();
         }
-        self.resources
-            .iter()
-            .find(|m| m.gvr.to_string() == gvr)
-            .map(|m| m.singular_name.clone())
-            .unwrap_or_default()
+        self.categs.get(gvr).cloned().unwrap_or_default()
     }
 
     fn walk(
         &self,
         n: &TreeNode,
         depth: usize,
+        nth: usize,
         chain: &mut Vec<(String, String, String)>,
         lasts: &mut Vec<bool>,
         out: &mut Vec<TreeRow>,
     ) {
         let spec = NodeSpec::from_chain(chain);
         let path = spec.as_path();
-        let expanded = if depth == 0 {
-            true
-        } else {
-            self.expanded
-                .get(&path)
-                .copied()
-                .unwrap_or(self.expand_nodes || path == self.selected)
-        };
+        let key = format!("{path}#{nth}");
+        let expanded = self
+            .expanded
+            .get(&key)
+            .copied()
+            .unwrap_or(depth == 0 || self.expand_nodes || path == self.force_open);
         out.push(TreeRow {
             spec,
             depth,
             last_chain: lasts.clone(),
             title: node_title(n, self.no_icons, &self.categ(&n.gvr)),
             expanded,
+            key,
         });
         if !expanded {
             return;
@@ -967,16 +1025,15 @@ impl XrayView {
         for (k, c) in n.children.iter().enumerate() {
             chain.push((c.gvr.clone(), c.id.clone(), c.status.clone()));
             lasts.push(k + 1 == len);
-            self.walk(c, depth + 1, chain, lasts, out);
+            let nth = n.children[..k].iter().filter(|o| o.id == c.id).count();
+            self.walk(c, depth + 1, nth, chain, lasts, out);
             lasts.pop();
             chain.pop();
         }
     }
 
     fn selected_index(&self, rows: &[TreeRow]) -> usize {
-        rows.iter()
-            .position(|r| r.spec.as_path() == self.selected)
-            .unwrap_or(0)
+        rows.iter().position(|r| r.key == self.cur).unwrap_or(0)
     }
 
     fn selected_spec(&self) -> Option<NodeSpec> {
@@ -985,7 +1042,7 @@ impl XrayView {
             return None;
         }
         let i = self.selected_index(&rows);
-        rows.into_iter().nth(i).map(|r| r.spec)
+        rows.get(i).map(|r| r.spec.clone())
     }
 
     fn selected_node(&self) -> Option<TreeNode> {
@@ -1006,6 +1063,73 @@ impl XrayView {
             .iter()
             .find(|m| m.gvr.to_string() == gvr)
             .cloned()
+    }
+
+    /// pluginActions scope: x.meta is the xray resource until a node is
+    /// selected, then the selected node's resource.
+    fn plugin_aliases(&self, ctx: &Ctx) -> Vec<String> {
+        let g = self.act.clone().unwrap_or_else(|| self.gvr.to_string());
+        crate::ui::browser::scope_aliases(ctx, &Gvr::parse(&g))
+    }
+
+    fn refresh_plugins(&mut self, ctx: &Ctx) {
+        // Hotkeys are shared actions: KeyActions.Hints leaves them out.
+        self.act_plugins = crate::ui::shell::plugin_hints(ctx, &self.plugin_aliases(ctx));
+    }
+
+    /// Xray.k9sEnv selection for plugins.
+    fn plugin_selection(&self, spec: &NodeSpec) -> crate::ui::shell::Selection {
+        let mut sel = crate::ui::shell::Selection {
+            path: spec.path().to_string(),
+            ..Default::default()
+        };
+        let (_, name) = namespaced(spec.path());
+        sel.filter = Some(if self.query.is_empty() {
+            name.to_string()
+        } else {
+            self.query.clone()
+        });
+        if spec.gvr() == CONTAINERS {
+            sel.container = Some(name.to_string());
+            if let Some(pp) = spec.parent_path() {
+                sel.pod = Some(namespaced(pp).1.to_string());
+            }
+        }
+        sel
+    }
+
+    /// refreshActions node bindings for resource `act` (None before any
+    /// selection: nothing bound).
+    fn act_hints(&self, act: Option<&str>) -> Vec<Hint> {
+        let mut hh = Vec::new();
+        let Some(g) = act else {
+            return hh;
+        };
+        if let Some(m) = &self.meta(g) {
+            if Self::can(m, &["patch", "update"]) {
+                hh.push(Hint::new("e", "Edit"));
+            }
+            if Self::can(m, &["delete"]) {
+                hh.push(Hint::new("ctrl-d", "Delete"));
+            }
+            hh.push(Hint::new("y", YAML_ACTION));
+            hh.push(Hint::new("d", "Describe"));
+        }
+        match g {
+            CONTAINERS => hh.extend([
+                Hint::new("s", "Shell"),
+                Hint::new("l", "Logs"),
+                Hint::new("p", "Logs Previous"),
+            ]),
+            PODS => hh.extend([
+                Hint::new("s", "Shell"),
+                Hint::new("a", "Attach"),
+                Hint::new("l", "Logs"),
+                Hint::new("p", "Logs Previous"),
+            ]),
+            _ => {}
+        }
+        hh
     }
 
     fn can(meta: &crate::k8s::ResourceMeta, verbs: &[&str]) -> bool {
@@ -1041,7 +1165,59 @@ impl XrayView {
         }
         let cur = self.selected_index(&rows) as isize;
         let next = (cur + delta).clamp(0, rows.len() as isize - 1) as usize;
+        self.select(&rows, next);
+    }
+
+    /// tview TreeView treeParent/treeChild movements (K/J).
+    fn move_tree(&mut self, child: bool) {
+        let rows = self.rows();
+        if rows.is_empty() {
+            return;
+        }
+        let cur = self.selected_index(&rows);
+        let d = rows[cur].depth;
+        let next = if child {
+            rows.get(cur + 1)
+                .filter(|r| r.depth == d + 1)
+                .map(|_| cur + 1)
+        } else {
+            rows[..cur].iter().rposition(|r| r.depth + 1 == d)
+        };
+        if let Some(n) = next {
+            self.select(&rows, n);
+        }
+    }
+
+    /// tview fires the changed callback (Xray refreshActions) only when the
+    /// selected index moves.
+    fn select(&mut self, rows: &[TreeRow], next: usize) {
+        if next == self.selected_index(rows) {
+            return;
+        }
+        self.cur = rows[next].key.clone();
         self.selected = rows[next].spec.as_path();
+        self.act = Some(rows[next].spec.gvr().to_string());
+    }
+
+    /// tview process: a current node that is no longer visible silently
+    /// becomes the first node (no changed callback).
+    fn normalize(&mut self) {
+        let rows = self.rows();
+        let Some(first) = rows.first() else {
+            return;
+        };
+        if std::mem::take(&mut self.cur_from_selected) {
+            if let Some(r) = rows
+                .iter()
+                .rev()
+                .find(|r| r.spec.as_path() == self.selected)
+            {
+                self.cur = r.key.clone();
+            }
+        }
+        if !rows.iter().any(|r| r.key == self.cur) {
+            self.cur = first.key.clone();
+        }
     }
 
     fn open_details(&self, ctx: &Ctx, spec: &NodeSpec, yaml: bool) {
@@ -1088,6 +1264,7 @@ impl XrayView {
 
     fn pick_container(
         &self,
+        ctx: &mut Ctx,
         then: impl FnOnce(String) -> Vec<ViewCmd> + Send + 'static,
     ) -> Vec<ViewCmd> {
         let node = self.selected_node();
@@ -1101,15 +1278,15 @@ impl XrayView {
         if cc.len() == 1 {
             return then(cc[0].clone());
         }
-        vec![ViewCmd::Dialog(Dialog::Prompt {
-            title: "Containers".into(),
-            label: format!("Container ({}):", cc.join(", ")),
-            value: cc.first().cloned().unwrap_or_default(),
-            on_ok: Box::new(move |_ctx: &mut Ctx, co: String| then(co)),
-        })]
+        // pod.go containerShellIn/containerAttachIn: the Containers Picker.
+        vec![ViewCmd::Push(crate::ui::browser::containers_picker(
+            ctx,
+            cc,
+            Box::new(move |_ctx, _, co| then(co)),
+        ))]
     }
 
-    fn shell(&self, ctx: &Ctx, attach: bool) -> Vec<ViewCmd> {
+    fn shell(&self, ctx: &mut Ctx, attach: bool) -> Vec<ViewCmd> {
         let Some(spec) = self.selected_spec() else {
             return Vec::new();
         };
@@ -1123,6 +1300,7 @@ impl XrayView {
         let acc = ctx.accessor.clone();
         let run = move |co: String| -> Vec<ViewCmd> {
             let (ns, pod) = namespaced(&path);
+            let banner = crate::ui::browser::shell_banner(&path, &co);
             let argv = if attach {
                 let mut a: Vec<String> = vec!["kubectl".into(), "attach".into(), "-it".into()];
                 if !ns.is_empty() {
@@ -1139,16 +1317,16 @@ impl XrayView {
             let what = if attach { "Attach" } else { "Shell" };
             vec![ViewCmd::Suspend {
                 argv,
+                banner,
                 env: acc.shell_env(),
                 on_done: Some(Box::new(
                     move |_ctx: &mut Ctx, st: std::process::ExitStatus| {
-                        if st.success() {
-                            Vec::new()
-                        } else {
-                            vec![util::flash(
+                        match crate::ui::browser::exec_failure(&st) {
+                            Some(e) => vec![util::flash(
                                 FlashLevel::Err,
-                                format!("{what} exec failed: {st}"),
-                            )]
+                                format!("{what} exec failed: {e}"),
+                            )],
+                            None => Vec::new(),
                         }
                     },
                 )),
@@ -1156,7 +1334,7 @@ impl XrayView {
         };
         match co {
             Some(c) => run(c),
-            None => self.pick_container(run),
+            None => self.pick_container(ctx, run),
         }
     }
 
@@ -1166,6 +1344,17 @@ impl XrayView {
         };
         let (path, co) = self.pod_target(&spec);
         let (ns, pod) = namespaced(&path);
+        // xray.go showLogs: CanForResource(ns, pods, list) first.
+        let (acc, pods, nsc) = (ctx.accessor.clone(), Gvr::parse(PODS), ns.to_string());
+        let can = crate::ui::browser::block_on(async move { acc.can(&pods, &nsc, "list").await });
+        match can {
+            Ok(true) => {}
+            Ok(false) => {
+                let msg = crate::ui::browser::access_denied(ns, &Gvr::parse(PODS));
+                return vec![util::flash(FlashLevel::Err, msg)];
+            }
+            Err(e) => return vec![util::flash(FlashLevel::Err, e.to_string())],
+        }
         let tail = ctx.config.read().map(|c| c.k9s.logger.tail).unwrap_or(100);
         let opts = LogOptions {
             namespace: ns.to_string(),
@@ -1219,6 +1408,37 @@ impl View for XrayView {
     fn owns_frame(&self) -> bool {
         true
     }
+    /// Xray.ExtraHints: xray.EmojiInfo (resource -> icon) unless noIcons.
+    fn extra_hints(&self, _ctx: &Ctx) -> Vec<(String, String)> {
+        if self.no_icons {
+            return Vec::new();
+        }
+        let gvrs = [
+            CONTAINERS,
+            NAMESPACES,
+            PODS,
+            SVCS,
+            SAS,
+            "v1/persistentvolumes",
+            PVCS,
+            SECRETS,
+            CONFIGMAPS,
+            DEPLOYS,
+            STSS,
+            DSS,
+        ];
+        let mut out: Vec<(String, String)> = gvrs
+            .iter()
+            .map(|g| (Gvr::parse(g).r().to_string(), emoji(g).to_string()))
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// Xray.Init: SetBorderColor(Xray().FgColor).
+    fn blur_border(&self, styles: &Styles) -> ratatui::style::Color {
+        styles.xray_fg
+    }
     fn id(&self) -> ViewId {
         self.id
     }
@@ -1239,47 +1459,22 @@ impl View for XrayView {
             Hint::new("space", "Expand/Collapse"),
             Hint::new("x", "Expand/Collapse All"),
         ];
-        let spec = self.selected_spec();
-        let g = spec
-            .as_ref()
-            .map(|s| s.gvr().to_string())
-            .unwrap_or_default();
+        let g = self.menu_act.clone().unwrap_or_default();
         if g != NAMESPACES && g != CONTAINERS {
             hh.push(Hint::new("enter", "Goto"));
         }
-        if spec.is_some() {
-            if let Some(m) = &self.meta(&g) {
-                if Self::can(m, &["patch", "update"]) {
-                    hh.push(Hint::new("e", "Edit"));
-                }
-                if Self::can(m, &["delete"]) {
-                    hh.push(Hint::new("ctrl-d", "Delete"));
-                }
-                hh.push(Hint::new("y", YAML_ACTION));
-                hh.push(Hint::new("d", "Describe"));
-            }
-            match g.as_str() {
-                CONTAINERS => hh.extend([
-                    Hint::new("s", "Shell"),
-                    Hint::new("l", "Logs"),
-                    Hint::new("p", "Logs Previous"),
-                ]),
-                PODS => hh.extend([
-                    Hint::new("s", "Shell"),
-                    Hint::new("a", "Attach"),
-                    Hint::new("l", "Logs"),
-                    Hint::new("p", "Logs Previous"),
-                ]),
-                _ => {}
-            }
-        }
+        hh.extend(self.act_hints(self.menu_act.as_deref()));
+        hh.extend(self.menu_plugins.iter().cloned());
         util::sort_hints(&mut hh);
         hh
     }
 
     fn start(&mut self, ctx: &mut Ctx) -> Vec<ViewCmd> {
         self.styles = ctx.styles.clone();
-        self.resources = ctx.resources.clone();
+        self.set_resources(&ctx.resources);
+        self.refresh_plugins(ctx);
+        self.menu_act = self.act.clone();
+        self.menu_plugins = self.act_plugins.clone();
         let acc = ctx.accessor.clone();
         self.start_watch(acc, ctx);
         Vec::new()
@@ -1290,23 +1485,144 @@ impl View for XrayView {
     }
 
     fn handle_key(&mut self, key: KeyEvent, ctx: &mut Ctx) -> Vec<ViewCmd> {
-        self.resources = ctx.resources.clone();
+        self.set_resources(&ctx.resources);
+        self.menu_act = self.act.clone();
+        self.menu_plugins = self.act_plugins.clone();
+        self.normalize();
+        let out = self.handle(key, ctx);
+        self.refresh_plugins(ctx);
+        out
+    }
+
+    fn on_event(&mut self, ev: &AppEvent, ctx: &mut Ctx) -> Vec<ViewCmd> {
+        self.on_ev(ev, ctx)
+    }
+
+    /// tview TreeView.MouseHandler: a click selects the node under the
+    /// mouse (changed callback) and fires its selected func (expand toggle);
+    /// the wheel moves the selection up/down.
+    fn on_mouse(&mut self, m: crate::ui::Mouse, area: Rect, ctx: &mut Ctx) -> Vec<ViewCmd> {
+        use crate::ui::Mouse;
+        self.menu_act = self.act.clone();
+        self.menu_plugins = self.act_plugins.clone();
+        self.normalize();
+        match m {
+            Mouse::Click { y, .. } => {
+                let rows = self.rows();
+                let i = (y as i64 - (area.y as i64 + 1)) + self.top as i64;
+                if i >= 0 && (i as usize) < rows.len() {
+                    let i = i as usize;
+                    self.select(&rows, i);
+                    let r = &rows[i];
+                    self.expanded.insert(r.key.clone(), !r.expanded);
+                    self.invalidate();
+                }
+            }
+            Mouse::ScrollUp { .. } => self.move_sel(-1),
+            Mouse::ScrollDown { .. } => self.move_sel(1),
+        }
+        self.refresh_plugins(ctx);
+        // A click fires the changed callback right away (not while drawing),
+        // so the menu is current; wheel moves lag like keys.
+        if matches!(m, Mouse::Click { .. }) {
+            self.menu_act = self.act.clone();
+            self.menu_plugins = self.act_plugins.clone();
+        }
+        Vec::new()
+    }
+
+    fn on_filter(&mut self, text: &str, ctx: &mut Ctx) -> Vec<ViewCmd> {
+        self.on_filter_text(text, ctx)
+    }
+
+    fn draw(&mut self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx) {
+        self.draw_tree(frame, area, ctx)
+    }
+
+    fn filter_text(&self) -> String {
+        self.query.clone()
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+}
+
+/// Keys xray binds itself (xray.go bindKeys + refreshActions).
+const XRAY_OWN_KEYS: [&str; 13] = [
+    "space", "x", "/", "esc", "enter", "e", "ctrl-d", "y", "d", "s", "a", "l", "p",
+];
+
+impl XrayView {
+    fn handle(&mut self, key: KeyEvent, ctx: &mut Ctx) -> Vec<ViewCmd> {
         let k = util::key_label(&key);
+        // pluginActions: bound after the view's own keys (no override here).
+        let own = XRAY_OWN_KEYS;
+        // hotKeyActions(x, aa): aa holds the node actions and plugins of the
+        // last refreshActions; a key taken there needs override. The merge
+        // into the view's actions then beats the base keys (space, x, enter).
+        if let Some(hk) = crate::ui::shell::plugins::hotkey_for_key(ctx, &key) {
+            let aliases = self.plugin_aliases(ctx);
+            let taken = self
+                .act_hints(self.act.as_deref())
+                .iter()
+                .any(|h| h.mnemonic == k)
+                || crate::ui::shell::plugin_for_key(ctx, &aliases, &key).is_some();
+            if !taken || hk.override_ {
+                // x.EnvFn()(): the selected node's k9sEnv.
+                let cmd = match self.selected_spec() {
+                    Some(spec) => crate::ui::shell::plugins::substitute(
+                        &crate::ui::shell::plugins::plugin_env(ctx, &self.plugin_selection(&spec)),
+                        &hk.command,
+                    ),
+                    None => crate::ui::shell::plugins::hotkey_command(ctx, &hk.command),
+                };
+                return vec![crate::ui::shell::plugins::hotkey_goto(cmd, hk.keep_history)];
+            }
+        }
+        if !own.contains(&k.as_str()) {
+            let aliases = self.plugin_aliases(ctx);
+            if let Some(p) = crate::ui::shell::plugin_for_key(ctx, &aliases, &key) {
+                return match self.selected_spec() {
+                    Some(spec) => {
+                        crate::ui::shell::run_plugin(ctx, &p, &self.plugin_selection(&spec))
+                    }
+                    None => Vec::new(),
+                };
+            }
+        }
         let spec = self.selected_spec();
-        let g = spec
-            .as_ref()
-            .map(|s| s.gvr().to_string())
-            .unwrap_or_default();
-        let meta = self.meta(&g);
+        // Bound actions follow the last refreshActions, not the cursor.
+        let g = self.act.clone().unwrap_or_default();
+        let bound = self.act.is_some();
+        let meta = self.meta(&g).filter(|_| bound);
         match k.as_str() {
             "/" => vec![ViewCmd::OpenFilterPrompt],
-            "esc" => vec![ViewCmd::Pop],
-            "j" | "down" => {
+            // resetCmd: CmdBuff.Reset re-filters with an empty buffer, then PrevCmd.
+            "esc" => {
+                if !self.query.is_empty() {
+                    self.on_filter("", ctx);
+                }
+                vec![ViewCmd::Pop]
+            }
+            "j" | "down" | "right" => {
                 self.move_sel(1);
                 Vec::new()
             }
-            "k" | "up" => {
+            "k" | "up" | "left" => {
                 self.move_sel(-1);
+                Vec::new()
+            }
+            "shift-j" => {
+                self.move_tree(true);
+                Vec::new()
+            }
+            "shift-k" => {
+                self.move_tree(false);
                 Vec::new()
             }
             "g" | "home" => {
@@ -1326,18 +1642,23 @@ impl View for XrayView {
                 Vec::new()
             }
             "space" => {
-                if let Some(s) = &spec {
+                if spec.is_some() {
                     let rows = self.rows();
                     let idx = self.selected_index(&rows);
                     if let Some(r) = rows.get(idx) {
-                        self.expanded.insert(s.as_path(), !r.expanded);
+                        self.expanded.insert(r.key.clone(), !r.expanded);
+                        self.invalidate();
                     }
                 }
                 Vec::new()
             }
             "x" => {
+                // toggleCollapseCmd: every node but the root.
                 self.expand_nodes = !self.expand_nodes;
-                self.expanded.clear();
+                self.force_open.clear();
+                let root = self.rows().first().map(|r| r.key.clone());
+                self.expanded.retain(|p, _| Some(p) == root.as_ref());
+                self.invalidate();
                 Vec::new()
             }
             "enter" => {
@@ -1347,36 +1668,45 @@ impl View for XrayView {
                 if g == NAMESPACES || g == CONTAINERS || s.path().split('/').count() == 1 {
                     return Vec::new();
                 }
-                let ns = namespaced(s.path()).0;
-                let ns = if ns.is_empty() { "all" } else { ns };
-                vec![ViewCmd::Command(format!("{} {ns}", s.gvr()))]
+                vec![ViewCmd::Goto {
+                    cmd: s.gvr().to_string(),
+                    path: s.path().to_string(),
+                }]
             }
-            "e" if meta
-                .as_ref()
-                .is_some_and(|m| Self::can(m, &["patch", "update"])) =>
+            // Bound actions can outlive the selection (e.g. a filter
+            // emptied the tree): no selection, no action.
+            "e" if spec.is_some()
+                && meta
+                    .as_ref()
+                    .is_some_and(|m| Self::can(m, &["patch", "update"])) =>
             {
-                let s = spec.expect("spec");
+                let Some(s) = spec else {
+                    return Vec::new();
+                };
                 let argv = ctx.accessor.edit_argv(&Gvr::parse(s.gvr()), s.path());
                 vec![ViewCmd::Suspend {
                     argv,
+                    banner: String::new(),
                     env: ctx.accessor.shell_env(),
                     on_done: Some(Box::new(|_ctx: &mut Ctx, st: std::process::ExitStatus| {
-                        if st.success() {
-                            Vec::new()
-                        } else {
-                            vec![util::flash(
+                        match crate::ui::browser::exec_failure(&st) {
+                            Some(e) => vec![util::flash(
                                 FlashLevel::Err,
-                                format!("Edit exec failed: {st}"),
-                            )]
+                                format!("Edit exec failed: {e}"),
+                            )],
+                            None => Vec::new(),
                         }
                     })),
                 }]
             }
-            "ctrl-d" if meta.as_ref().is_some_and(|m| Self::can(m, &["delete"])) => {
-                self.delete(&spec.expect("spec"))
-            }
+            "ctrl-d" if meta.as_ref().is_some_and(|m| Self::can(m, &["delete"])) => match spec {
+                Some(s) => self.delete(&s),
+                None => Vec::new(),
+            },
             "y" | "d" if meta.is_some() => {
-                self.open_details(ctx, &spec.expect("spec"), k == "y");
+                if let Some(s) = spec {
+                    self.open_details(ctx, &s, k == "y");
+                }
                 Vec::new()
             }
             "s" if g == PODS || g == CONTAINERS => self.shell(ctx, false),
@@ -1387,7 +1717,7 @@ impl View for XrayView {
         }
     }
 
-    fn on_event(&mut self, ev: &AppEvent, ctx: &mut Ctx) -> Vec<ViewCmd> {
+    fn on_ev(&mut self, ev: &AppEvent, ctx: &mut Ctx) -> Vec<ViewCmd> {
         match ev {
             AppEvent::Custom { view, payload } if *view == self.id => {
                 if let Some(r) = payload.downcast_ref::<TreeResult>() {
@@ -1401,6 +1731,9 @@ impl View for XrayView {
                                 self.count = root.count(&self.gvr.to_string());
                                 self.model = Some(root.clone());
                                 self.update();
+                                // TreeChanged queues a full redraw.
+                                self.menu_act = self.act.clone();
+                                self.menu_plugins = self.act_plugins.clone();
                             }
                             Vec::new()
                         }
@@ -1431,10 +1764,9 @@ impl View for XrayView {
         }
     }
 
-    fn on_filter(&mut self, text: &str, ctx: &mut Ctx) -> Vec<ViewCmd> {
+    fn on_filter_text(&mut self, text: &str, ctx: &mut Ctx) -> Vec<ViewCmd> {
         let was_labels = self.labels();
         self.query = text.to_string();
-        self.selected.clear();
         if self.labels() != was_labels {
             let acc = ctx.accessor.clone();
             self.start_watch(acc, ctx);
@@ -1443,9 +1775,9 @@ impl View for XrayView {
         Vec::new()
     }
 
-    fn draw(&mut self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx) {
+    fn draw_tree(&mut self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx) {
         self.styles = ctx.styles.clone();
-        self.resources = ctx.resources.clone();
+        self.set_resources(&ctx.resources);
         let s = self.styles.clone();
         let buf = frame.buffer_mut();
         let bg = Style::default().fg(s.xray_fg).bg(s.xray_bg);
@@ -1456,6 +1788,7 @@ impl View for XrayView {
         if inner.height == 0 || inner.width == 0 {
             return;
         }
+        self.normalize();
         let rows = self.rows();
         let node_style = Style::default().fg(s.xray_cursor).bg(s.xray_bg);
         if rows.is_empty() {
@@ -1516,18 +1849,6 @@ impl View for XrayView {
             }
             util::put_line(buf, tx, y, &line, inner.right() - tx);
         }
-    }
-
-    fn filter_text(&self) -> String {
-        self.query.clone()
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn as_any_mut(&mut self) -> &mut dyn Any {
-        self
     }
 }
 
@@ -1674,6 +1995,56 @@ mod tests {
         assert_eq!(pod_phase(&po), "Terminating");
     }
 
+    /// xray.go refreshActions: hotkeys bind after the view's own keys; a
+    /// taken key needs `override`.
+    #[tokio::test]
+    async fn hotkeys_bind_on_xray() {
+        let (mut c, _rx) = ctx(cluster());
+        let hk = |key: &str, cmd: &str, ov: bool| crate::config::HotKey {
+            short_cut: key.into(),
+            description: cmd.into(),
+            command: cmd.into(),
+            override_: ov,
+            ..Default::default()
+        };
+        c.hotkeys
+            .hot_keys
+            .insert("a".into(), hk("Shift-H", "dp", false));
+        c.hotkeys.hot_keys.insert("b".into(), hk("y", "svc", false));
+        let mut v = XrayView::new(&mut c, Gvr::parse(DEPLOYS), "default".into());
+        let shift_h = KeyEvent::new(KeyCode::Char('H'), KeyModifiers::SHIFT);
+        let out = v.handle_key(shift_h, &mut c);
+        assert!(matches!(&out[..], [ViewCmd::Command(s)] if s == "dp"));
+        // `y` is only bound once a node with a YAML action is selected (k9s
+        // refreshActions; before that the hotkey owns it).
+        v.act = Some(DEPLOYS.into());
+        let y = KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE);
+        let out = v.handle_key(y, &mut c);
+        assert!(
+            !matches!(&out[..], [ViewCmd::Command(s)] if s == "svc"),
+            "taken"
+        );
+        c.hotkeys.hot_keys.insert("b".into(), hk("y", "svc", true));
+        let out = v.handle_key(y, &mut c);
+        assert!(
+            matches!(&out[..], [ViewCmd::Command(s)] if s == "svc"),
+            "override"
+        );
+    }
+
+    /// xray.go: model.SetRefreshRate(K9s.RefreshDuration()): the 2s floor
+    /// and the --refresh flag apply (was the raw config value).
+    #[tokio::test]
+    async fn refresh_rate_follows_k9s() {
+        let (mut c, _rx) = ctx(cluster());
+        c.config.write().unwrap().k9s.refresh_rate = 0.5;
+        let v = XrayView::new(&mut c, Gvr::parse(DEPLOYS), "default".into());
+        assert_eq!(v.refresh, std::time::Duration::from_secs(2));
+        c.config.write().unwrap().k9s.manual.refresh_rate = 5.0;
+        let v = XrayView::new(&mut c, Gvr::parse(DEPLOYS), "default".into());
+        assert_eq!(v.refresh, std::time::Duration::from_secs(5));
+    }
+
     #[tokio::test]
     async fn view_renders_navigates_and_acts() {
         let (mut c, mut rx) = ctx(cluster());
@@ -1709,7 +2080,10 @@ mod tests {
             &mut c,
         );
         let cmds = v.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut c);
-        assert!(matches!(&cmds[0], ViewCmd::Command(s) if s == "apps/v1/deployments default"));
+        // xray.go gotoCmd: gotoResource(gvr, path, false, true) pushes an instance view.
+        assert!(
+            matches!(&cmds[0], ViewCmd::Goto { cmd, path } if cmd == "apps/v1/deployments" && path == "default/web")
+        );
         // collapse it.
         v.handle_key(
             KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
@@ -1804,6 +2178,294 @@ mod tests {
         let out = v.on_event(&ev, &mut c);
         assert!(
             matches!(&out[0], ViewCmd::Flash(FlashLevel::Info, m) if m == "v1/pods `default/web-2 deleted successfully")
+        );
+    }
+
+    /// pod.go containerShellIn: several containers open the Containers Picker.
+    #[tokio::test]
+    async fn multi_container_shell_picker() {
+        let f = cluster();
+        f.add(
+            PODS,
+            obj(json!({"apiVersion":"v1","kind":"Pod",
+            "metadata":{"name":"multi","namespace":"default"},
+            "spec":{"containers":[{"name":"a"},{"name":"b"}]},
+            "status":{"phase":"Running","containerStatuses":[
+                {"name":"a","ready":true,"state":{"running":{}}},
+                {"name":"b","ready":true,"state":{"running":{}}}]}})),
+        );
+        let (mut c, mut rx) = ctx(f);
+        let mut v = XrayView::new(&mut c, Gvr::parse(PODS), "default".into());
+        v.start(&mut c);
+        let ev = rx.recv().await.unwrap();
+        v.on_event(&ev, &mut c);
+        for _ in 0..10 {
+            if v.selected_spec()
+                .is_some_and(|s| s.path() == "default/multi")
+            {
+                break;
+            }
+            v.handle_key(key('j'), &mut c);
+        }
+        let cmds = v.handle_key(key('s'), &mut c);
+        let Some(ViewCmd::Push(p)) = cmds.into_iter().next() else {
+            panic!("expected the containers picker");
+        };
+        assert_eq!(p.title(), " Containers Picker ");
+    }
+
+    fn key(c: char) -> KeyEvent {
+        let m = if c.is_ascii_uppercase() {
+            KeyModifiers::SHIFT
+        } else {
+            KeyModifiers::NONE
+        };
+        KeyEvent::new(KeyCode::Char(c), m)
+    }
+
+    fn descs(v: &XrayView) -> Vec<String> {
+        v.hints().into_iter().map(|h| h.description).collect()
+    }
+
+    /// One pod whose container and service account share the id
+    /// `default/builder`, i.e. the same xray path.
+    fn dup_cluster() -> FakeAccessor {
+        let f = FakeAccessor::new();
+        f.add(PODS, obj(json!({"apiVersion":"v1","kind":"Pod",
+            "metadata":{"name":"solo","namespace":"default"},
+            "spec":{"serviceAccountName":"builder","containers":[{"name":"builder"}]},
+            "status":{"phase":"Running","containerStatuses":[{"name":"builder","ready":true,"state":{"running":{}}}]}})));
+        f.add(SAS, obj(json!({"apiVersion":"v1","kind":"ServiceAccount","metadata":{"name":"builder","namespace":"default"}})));
+        f
+    }
+
+    async fn loaded(
+        f: FakeAccessor,
+        gvr: &str,
+    ) -> (XrayView, Ctx, mpsc::UnboundedReceiver<AppEvent>) {
+        let (mut c, mut rx) = ctx(f);
+        let mut v = XrayView::new(&mut c, Gvr::parse(gvr), "default".into());
+        v.start(&mut c);
+        let ev = rx.recv().await.unwrap();
+        v.on_event(&ev, &mut c);
+        (v, c, rx)
+    }
+
+    /// xray.go refreshActions runs in Init (no node yet) and then from the
+    /// tree changed callback; the menu is hydrated while the tree draws, so
+    /// it shows the actions of the previous selection until the next redraw.
+    #[tokio::test]
+    async fn menu_follows_selection_changes_one_redraw_late() {
+        let (mut v, mut c, _rx) = loaded(cluster(), DEPLOYS).await;
+        assert_eq!(
+            descs(&v),
+            ["Expand/Collapse", "Expand/Collapse All", "Goto"]
+        );
+        // Root actions are not bound: no describe before the cursor moves.
+        assert!(v.handle_key(key('d'), &mut c).is_empty());
+        v.handle_key(key('j'), &mut c); // namespace
+        assert_eq!(
+            descs(&v),
+            ["Expand/Collapse", "Expand/Collapse All", "Goto"]
+        );
+        v.handle_key(key('j'), &mut c); // deployment
+        let ns = [
+            "Delete",
+            "Describe",
+            "Edit",
+            "Expand/Collapse",
+            "Expand/Collapse All",
+            YAML_ACTION,
+        ];
+        assert_eq!(descs(&v), ns);
+        // A tree change redraws everything.
+        v.menu_act = None;
+        v.model = None;
+        let root = build_tree(&*c.accessor, &Gvr::parse(DEPLOYS), "default", None)
+            .await
+            .unwrap();
+        v.on_event(
+            &AppEvent::Custom {
+                view: v.id,
+                payload: Box::new(TreeResult {
+                    gen: v.gen,
+                    result: Ok(root),
+                }),
+            },
+            &mut c,
+        );
+        assert!(descs(&v).contains(&"Goto".to_string()));
+        assert!(descs(&v).contains(&"Describe".to_string()));
+    }
+
+    /// tview: a current node hidden by a collapse silently becomes the root;
+    /// J/K move to the first child/parent; Left/Right move like Up/Down.
+    #[tokio::test]
+    async fn collapse_child_parent_moves() {
+        let (mut v, mut c, _rx) = loaded(cluster(), DEPLOYS).await;
+        v.handle_key(key('j'), &mut c);
+        v.handle_key(key('j'), &mut c);
+        assert_eq!(v.selected_spec().unwrap().path(), "default/web");
+        v.handle_key(key('x'), &mut c);
+        assert_eq!(v.rows().len(), 2);
+        v.handle_key(key('j'), &mut c);
+        assert_eq!(v.selected_spec().unwrap().gvr(), NAMESPACES);
+        v.handle_key(key(' '), &mut c);
+        v.handle_key(key('J'), &mut c);
+        assert_eq!(v.selected_spec().unwrap().path(), "default/web");
+        v.handle_key(key('K'), &mut c);
+        assert_eq!(v.selected_spec().unwrap().gvr(), NAMESPACES);
+        v.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE), &mut c);
+        assert_eq!(v.selected_spec().unwrap().path(), "default/web");
+        v.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE), &mut c);
+        assert_eq!(v.selected_spec().unwrap().gvr(), NAMESPACES);
+        // The root can be collapsed too.
+        v.handle_key(key('g'), &mut c);
+        v.handle_key(key(' '), &mut c);
+        assert_eq!(v.rows().len(), 1);
+    }
+
+    /// Xray.update calls SetCurrentNode on every node matching the selected
+    /// path, so the last same-path sibling wins after a rebuild.
+    #[tokio::test]
+    async fn rebuild_selects_last_same_path_node() {
+        let (mut v, mut c, _rx) = loaded(dup_cluster(), PODS).await;
+        for _ in 0..3 {
+            v.handle_key(key('j'), &mut c);
+        }
+        assert_eq!(v.selected_spec().unwrap().gvr(), CONTAINERS);
+        v.model = None;
+        let root = build_tree(&*c.accessor, &Gvr::parse(PODS), "default", None)
+            .await
+            .unwrap();
+        v.on_event(
+            &AppEvent::Custom {
+                view: v.id,
+                payload: Box::new(TreeResult {
+                    gen: v.gen,
+                    result: Ok(root),
+                }),
+            },
+            &mut c,
+        );
+        v.handle_key(key('z'), &mut c);
+        assert_eq!(v.selected_spec().unwrap().gvr(), SAS);
+    }
+
+    /// resetCmd: esc resets the filter buffer and goes back; enter on a
+    /// resource pushes its single instance view (gotoResource(gvr, path)).
+    #[tokio::test]
+    async fn esc_resets_filter_enter_goes_to_instance() {
+        let (mut v, mut c, _rx) = loaded(cluster(), DEPLOYS).await;
+        v.on_filter("empty", &mut c);
+        assert!(v.title().contains("</empty>"));
+        let cmds = v.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &mut c);
+        assert!(matches!(cmds[..], [ViewCmd::Pop]));
+        assert_eq!(v.filter_text(), "");
+        assert!(!v.title().contains("</"));
+        v.handle_key(key('j'), &mut c);
+        v.handle_key(key('j'), &mut c);
+        let cmds = v.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut c);
+        assert!(
+            matches!(&cmds[..], [ViewCmd::Goto { cmd, path }] if cmd == DEPLOYS && path == "default/web")
+        );
+    }
+
+    /// xray.go refreshActions also binds plugins scoped to the selected
+    /// node's resource (x.meta), the xray resource before any selection.
+    #[tokio::test]
+    async fn plugins_follow_selected_resource() {
+        let (mut c, mut rx) = ctx(cluster());
+        c.plugins.plugins.insert(
+            "dp".into(),
+            crate::config::Plugin {
+                scopes: vec!["deployments".into()],
+                short_cut: "Shift-Z".into(),
+                description: "Dp only".into(),
+                command: "echo".into(),
+                confirm: true,
+                args: vec!["$NAMESPACE".into(), "$NAME".into()],
+                ..Default::default()
+            },
+        );
+        let mut v = XrayView::new(&mut c, Gvr::parse(DEPLOYS), "default".into());
+        v.start(&mut c);
+        let ev = rx.recv().await.unwrap();
+        v.on_event(&ev, &mut c);
+        assert!(descs(&v).contains(&"Dp only".to_string()));
+        v.handle_key(key('j'), &mut c); // namespace
+        v.handle_key(key('j'), &mut c); // menu now shows the namespace node's
+        assert!(!descs(&v).contains(&"Dp only".to_string()));
+        // The deployment is selected: the plugin runs on it (confirm first).
+        let cmds = v.handle_key(key('Z'), &mut c);
+        match &cmds[..] {
+            [ViewCmd::Dialog(crate::ui::Dialog::Confirm { title, msg, .. })] => {
+                assert_eq!(title, "Confirm Dp only");
+                assert_eq!(msg, "Run?\necho default web");
+            }
+            _ => panic!("expected confirm"),
+        }
+        // Blurred xray border falls back to the xray fg color.
+        assert_eq!(v.blur_border(&c.styles), c.styles.xray_fg);
+    }
+
+    /// tview TreeView.MouseHandler: a click selects (changed fires at once,
+    /// so the menu is current) and toggles the node; the wheel moves.
+    #[tokio::test]
+    async fn mouse_click_selects_and_toggles() {
+        let (mut v, mut c, _rx) = loaded(cluster(), DEPLOYS).await;
+        let area = Rect::new(0, 0, 70, 16);
+        let n = v.rows().len();
+        // Row 2 (the deployment) sits below the border at y = 1 + 2.
+        v.on_mouse(crate::ui::Mouse::Click { x: 8, y: 3 }, area, &mut c);
+        assert_eq!(v.selected_spec().unwrap().path(), "default/web");
+        assert!(v.rows().len() < n, "clicked node collapsed");
+        assert!(descs(&v).contains(&"Describe".to_string()));
+        v.on_mouse(crate::ui::Mouse::ScrollUp { x: 8, y: 3 }, area, &mut c);
+        assert_eq!(v.selected_spec().unwrap().gvr(), NAMESPACES);
+    }
+
+    /// hotKeyActions details: the selected node's env, base keys lose.
+    #[tokio::test]
+    async fn hotkeys_use_node_env_and_beat_base_keys() {
+        let (mut v, mut c, _rx) = loaded(cluster(), DEPLOYS).await;
+        let hk = |sc: &str, cmd: &str| crate::config::HotKey {
+            short_cut: sc.into(),
+            description: "hk".into(),
+            command: cmd.into(),
+            ..Default::default()
+        };
+        c.hotkeys
+            .hot_keys
+            .insert("a".into(), hk("Shift-P", "pods $NAMESPACE $NAME"));
+        c.hotkeys.hot_keys.insert("b".into(), hk("x", "cm"));
+        v.handle_key(key('j'), &mut c);
+        v.handle_key(key('j'), &mut c); // the deployment
+        let cmds = v.handle_key(key('P'), &mut c);
+        assert!(matches!(&cmds[..], [ViewCmd::Command(s)] if s == "pods default web"));
+        // Shared actions: hotkeys stay out of the menu/help hints.
+        assert!(!descs(&v).contains(&"hk".to_string()));
+        assert!(matches!(&v.handle_key(key('x'), &mut c)[..], [ViewCmd::Command(s)] if s == "cm"));
+    }
+
+    /// xray.go showLogs: no pod list access -> error flash, no logs view.
+    #[tokio::test]
+    async fn logs_need_pod_list_access() {
+        let f = cluster();
+        f.denied
+            .lock()
+            .unwrap()
+            .push((PODS.into(), "default".into()));
+        let (mut v, mut c, _rx) = loaded(f, PODS).await;
+        for _ in 0..2 {
+            v.handle_key(key('j'), &mut c);
+        }
+        assert_eq!(v.selected_spec().unwrap().gvr(), PODS);
+        let cmds = v.handle_key(key('l'), &mut c);
+        assert!(
+            matches!(&cmds[..], [ViewCmd::Flash(FlashLevel::Err, m)] if m == "[list] access denied on resource \"default\":\"v1/pods\""),
+            "{}",
+            cmds.len()
         );
     }
 }

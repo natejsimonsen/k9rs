@@ -182,12 +182,18 @@ async fn command_with_namespace() {
     assert!(s.line(1).contains("NAMESPACE"), "{}", s.line(1));
 }
 
-/// `:po -l sel` and `:po /filter` (cmd interpreter LabelsArg / FilterArg).
+/// `:po sel` and `:po /filter` (cmd interpreter LabelsArg / FilterArg).
 #[tokio::test]
 async fn command_label_and_filter_args() {
     let mut h = Harness::new().await;
-    h.goto("po -l app=nginx").await.unwrap();
+    h.goto("po app=nginx").await.unwrap();
     assert_eq!(h.top().title(), " pods(default)[2] </app=nginx> ");
+    // k9s has no -l flag: `-l` lands in the namespace slot.
+    h.goto("po -l app=nginx").await.unwrap();
+    // TableNoData drops the first empty result; the next one shows.
+    h.tick().await;
+    assert_eq!(h.top().title(), " pods(-l)[0] </app=nginx> ");
+    h.goto("po default").await.unwrap();
     // Filters match every field, labels included (model1 rxFilter).
     h.goto("po /web").await.unwrap();
     assert_eq!(h.top().title(), " pods(default)[3] </web> ");

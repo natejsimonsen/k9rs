@@ -115,7 +115,12 @@ async fn toggles() {
         "{body:?}"
     );
     let (x, y) = s.find("2026-10-09T10:00:01Z").unwrap();
-    assert_eq!(s.fg_at(x, y), color("gray"), "timestamp color");
+    // log_item.go `[gray::]` markup: a palette color, not skin RGB.
+    assert_eq!(
+        s.fg_at(x, y),
+        ratatui::style::Color::DarkGray,
+        "timestamp color"
+    );
     h.press('f').await;
     let s = h.render();
     assert!(s.line(0).contains("FullScreen:On"), "{}", s.line(0));

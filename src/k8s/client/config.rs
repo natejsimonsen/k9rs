@@ -23,29 +23,45 @@ pub(crate) struct LoadedConfig {
     pub(crate) opts: ConnectOptions,
     /// True when no kubeconfig was found and the in-cluster config is used.
     pub(crate) in_cluster: bool,
+    /// Why the kubeconfig could not be read; k9s still starts (client-go
+    /// errors on use).
+    pub(crate) load_err: Option<String>,
 }
 
 impl LoadedConfig {
     /// Load the kubeconfig named by `opts` (or KUBECONFIG / ~/.kube/config).
+    /// Like client-go, missing KUBECONFIG/default files are skipped (an empty
+    /// config) while a missing `--kubeconfig` file or a bad file errors.
     pub(crate) fn load(opts: ConnectOptions) -> Result<LoadedConfig> {
-        match read_kubeconfig(opts.kubeconfig.as_deref()) {
-            Ok(kc) => Ok(LoadedConfig {
-                kubeconfig: kc,
+        let explicit = opts.kubeconfig.as_deref().is_some_and(|p| !p.is_empty());
+        let kc = read_paths(&config_paths(opts.kubeconfig.as_deref())?, explicit)?;
+        if kc.is_none() && !explicit && std::env::var_os("KUBERNETES_SERVICE_HOST").is_some() {
+            return Ok(LoadedConfig {
+                kubeconfig: Kubeconfig::default(),
+                opts,
+                in_cluster: true,
+                load_err: None,
+            });
+        }
+        Ok(LoadedConfig {
+            kubeconfig: kc.unwrap_or_default(),
+            opts,
+            in_cluster: false,
+            load_err: None,
+        })
+    }
+
+    /// `load`, keeping a read error for later (k9s starts without a
+    /// kubeconfig and shows the error on use).
+    pub(crate) fn load_or_empty(opts: ConnectOptions) -> LoadedConfig {
+        match LoadedConfig::load(opts.clone()) {
+            Ok(c) => c,
+            Err(e) => LoadedConfig {
+                kubeconfig: Kubeconfig::default(),
                 opts,
                 in_cluster: false,
-            }),
-            Err(e) => {
-                if opts.kubeconfig.is_none()
-                    && std::env::var_os("KUBERNETES_SERVICE_HOST").is_some()
-                {
-                    return Ok(LoadedConfig {
-                        kubeconfig: Kubeconfig::default(),
-                        opts,
-                        in_cluster: true,
-                    });
-                }
-                Err(e)
-            }
+                load_err: Some(e.to_string()),
+            },
         }
     }
 
@@ -56,6 +72,7 @@ impl LoadedConfig {
             kubeconfig,
             opts,
             in_cluster: false,
+            load_err: None,
         }
     }
 
@@ -237,16 +254,22 @@ impl LoadedConfig {
             client_key: None,
             client_certificate: None,
             token: self.opts.token.clone(),
+            // k9s only ever sets the proxy func, never clears it.
+            proxy: self.opts.proxy.clone(),
         };
         Ok(LoadedConfig {
             kubeconfig: self.kubeconfig.clone(),
             opts,
             in_cluster: false,
+            load_err: None,
         })
     }
 
     /// Build the kube-rs client configuration with all overrides applied.
     pub(crate) async fn kube_config(&self) -> Result<kube::Config> {
+        if let Some(e) = &self.load_err {
+            return Err(anyhow!("{e}"));
+        }
         let mut cfg = if self.in_cluster {
             kube::Config::incluster().context("unable to load in-cluster configuration")?
         } else {
@@ -254,6 +277,10 @@ impl LoadedConfig {
             let context = self.current_context_name()?;
             if context.is_empty() {
                 return Err(anyhow!("no current context set in kubeconfig"));
+            }
+            // client-go DirectClientConfig.ConfirmUsable.
+            if self.context(&context).is_none() {
+                return Err(anyhow!("context {context:?} does not exist"));
             }
             let cluster = self.current_cluster_name()?;
             if let Some(named) = kc.clusters.iter_mut().find(|c| c.name == cluster) {
@@ -288,6 +315,9 @@ impl LoadedConfig {
             cfg.default_namespace = ns;
         }
         cfg.read_timeout = self.opts.request_timeout;
+        if let Some(p) = self.opts.proxy.as_deref().filter(|p| !p.is_empty()) {
+            cfg.proxy_url = Some(p.parse().map_err(|e| anyhow!("parse {p:?}: {e}"))?);
+        }
         if self.in_cluster && self.opts.insecure_skip_tls_verify {
             cfg.accept_invalid_certs = true;
         }
@@ -343,22 +373,27 @@ fn config_paths(explicit: Option<&str>) -> Result<Vec<PathBuf>> {
     })
 }
 
-fn read_kubeconfig(explicit: Option<&str>) -> Result<Kubeconfig> {
-    let paths = config_paths(explicit)?;
-    let mut merged = Kubeconfig::default();
-    let mut found = false;
-    for p in &paths {
-        if !p.exists() {
+/// Read and merge kubeconfig files, first wins. `None` when none exist.
+/// client-go: an explicit (`--kubeconfig`) file must exist.
+fn read_paths(paths: &[PathBuf], explicit: bool) -> Result<Option<Kubeconfig>> {
+    let mut merged: Option<Kubeconfig> = None;
+    for p in paths {
+        if let Err(e) = std::fs::metadata(p) {
+            if explicit {
+                return Err(anyhow!(crate::cli::info::go_path_error("stat", p, &e)));
+            }
             continue;
         }
-        let kc = Kubeconfig::read_from(p)
-            .map_err(|e| anyhow!("unable to load kubeconfig {}: {e}", p.display()))?;
-        merged = merged.merge(kc).map_err(|e| anyhow!("{e}"))?;
-        found = true;
-    }
-    if !found {
-        let list: Vec<String> = paths.iter().map(|p| p.display().to_string()).collect();
-        return Err(anyhow!("kubeconfig not found: {}", list.join(", ")));
+        let kc = Kubeconfig::read_from(p).map_err(|e| {
+            anyhow!(
+                "error loading config file {:?}: {e}",
+                p.display().to_string()
+            )
+        })?;
+        merged = Some(match merged {
+            Some(m) => m.merge(kc).map_err(|e| anyhow!("{e}"))?,
+            None => kc,
+        });
     }
     Ok(merged)
 }
@@ -467,6 +502,8 @@ contexts:
         assert_eq!(c.kubeconfig_paths(), vec![p2, p1]);
     }
 
+    // client-go errors (was "kubeconfig not found: ..."): an explicit file
+    // must exist; missing KUBECONFIG entries are skipped.
     #[test]
     fn missing_files_error() {
         let err = LoadedConfig::load(ConnectOptions {
@@ -474,7 +511,56 @@ contexts:
             ..Default::default()
         })
         .unwrap_err();
-        assert!(err.to_string().contains("kubeconfig not found"), "{err}");
+        assert_eq!(
+            err.to_string(),
+            "stat /nonexistent/k9rs/kubeconfig: no such file or directory"
+        );
+        let c = LoadedConfig::load_or_empty(ConnectOptions {
+            kubeconfig: Some("/nonexistent/k9rs/kubeconfig".into()),
+            ..Default::default()
+        });
+        assert_eq!(c.load_err.as_deref(), Some(err.to_string().as_str()));
+        assert!(c.contexts().is_empty());
+        let paths = [PathBuf::from("/nonexistent/k9rs/a")];
+        assert!(read_paths(&paths, false).unwrap().is_none());
+        let dir = tempfile::tempdir().unwrap();
+        let p = write(&dir, "one", KC1);
+        let kc = read_paths(&[paths[0].clone(), PathBuf::from(&p)], false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(kc.contexts.len(), 2);
+        let bad = write(&dir, "bad", "contexts: 12");
+        let e = read_paths(&[PathBuf::from(&bad)], false).unwrap_err();
+        assert!(
+            e.to_string()
+                .starts_with(&format!("error loading config file {bad:?}: ")),
+            "{e}"
+        );
+    }
+
+    /// Context config proxy.address -> kube proxy_url (SetProxy); carried
+    /// over on a context switch like k9s.
+    #[tokio::test]
+    async fn context_proxy() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write(&dir, "config", KC1);
+        let c = load(ConnectOptions {
+            kubeconfig: Some(p),
+            proxy: Some("http://proxy.local:3128".into()),
+            ..Default::default()
+        });
+        let k = c.kube_config().await.unwrap();
+        assert_eq!(k.proxy_url.unwrap().to_string(), "http://proxy.local:3128/");
+        let s = c.switched("ctx-b").unwrap();
+        assert_eq!(s.opts.proxy.as_deref(), Some("http://proxy.local:3128"));
+        let bad = LoadedConfig {
+            opts: ConnectOptions {
+                proxy: Some("::nope::".into()),
+                ..c.opts.clone()
+            },
+            ..c.clone()
+        };
+        assert!(bad.kube_config().await.is_err());
     }
 
     #[test]

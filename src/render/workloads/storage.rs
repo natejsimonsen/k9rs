@@ -98,7 +98,7 @@ impl Def for PersistentVolume {
             Ok(())
         };
         Ok((
-            obj_fqn(o),
+            meta_fqn(o),
             vec![
                 obj_name(o).to_string(),
                 size,
@@ -219,7 +219,7 @@ impl Def for StorageClass {
             name.push_str(" (default)");
         }
         Ok((
-            crate::k8s::fqn(crate::k8s::CLUSTER_SCOPE, obj_name(o)),
+            crate::k8s::cluster_fqn(obj_name(o)),
             vec![
                 name,
                 str_at(d, "provisioner").to_string(),
@@ -271,7 +271,8 @@ mod tests {
     fn pv_render() {
         let o = load("pv");
         let r = render("v1/persistentvolumes", &o);
-        assert_eq!(r.id, "pvc-07aa4e2c-8726-11e9-a8e8-42010a80015b");
+        // k9s render tests: cluster-scoped ids keep the "-/" prefix.
+        assert_eq!(r.id, "-/pvc-07aa4e2c-8726-11e9-a8e8-42010a80015b");
         assert_eq!(
             r.fields,
             sv(&[
@@ -295,7 +296,8 @@ mod tests {
     fn pv_terminating() {
         let o = load("pv_terminating");
         let r = render("v1/persistentvolumes", &o);
-        assert_eq!(r.id, "pvc-a4d86f51-916c-476b-83af-b551c91a8ac0");
+        // k9s render tests: cluster-scoped ids keep the "-/" prefix.
+        assert_eq!(r.id, "-/pvc-a4d86f51-916c-476b-83af-b551c91a8ac0");
         assert_eq!(
             r.fields[..7],
             sv(&[
@@ -437,7 +439,8 @@ mod tests {
         );
         let o = load("sc");
         let r = render("storage.k8s.io/v1/storageclasses", &o);
-        assert_eq!(r.id, "standard");
+        // k9s render tests: cluster-scoped ids keep the "-/" prefix.
+        assert_eq!(r.id, "-/standard");
         assert_eq!(
             r.fields,
             sv(&[

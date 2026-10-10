@@ -122,7 +122,16 @@ impl Aliases {
     /// Aliases.Load: defaults, then the global file, then the optional
     /// context specific file.
     pub fn load_with(locs: &Locations, context_file: Option<&Path>) -> Result<Aliases> {
-        let mut a = Aliases::defaults();
+        let mut a = Aliases::default();
+        a.reload_with(locs, context_file)?;
+        Ok(a)
+    }
+
+    /// Aliases.Load over the current map (command.Reset without nuke keeps
+    /// what is there; call on a cleared map to nuke).
+    pub fn reload_with(&mut self, locs: &Locations, context_file: Option<&Path>) -> Result<()> {
+        self.load_default_aliases();
+        let a = self;
         let global = match locs.ensure_aliases_cfg_file() {
             Ok(f) => f,
             Err(e) => {
@@ -134,7 +143,7 @@ impl Aliases {
         if let Some(p) = context_file {
             a.load_file(p)?;
         }
-        Ok(a)
+        Ok(())
     }
 
     /// Defaults merged with a single file.

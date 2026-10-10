@@ -38,7 +38,7 @@ pub(crate) const PULSE_GVRS: [&str; 16] = [
     "v1/nodes",
     "v1/namespaces",
     "v1/services",
-    "v1/events",
+    "events.k8s.io/v1/events",
     "v1/pods",
     "apps/v1/deployments",
     "apps/v1/statefulsets",
@@ -160,20 +160,24 @@ fn healthy(gvr: &str, o: &DynamicObject) -> bool {
         "v1/pods" => pod_healthy(&v),
         "v1/nodes" => node_healthy(&v),
         "v1/namespaces" => matches!(st(&v, "/status/phase"), "Active" | "Terminating"),
-        "v1/events" => {
-            let t = st(&v, "/type");
-            t.is_empty() || t == "Normal"
-        }
+        // render.Event.Healthy reads server table cell 2, which for
+        // events.k8s.io is REASON (not TYPE).
+        "events.k8s.io/v1/events" => st(&v, "/reason") == "Normal",
         _ => true,
     }
 }
 
 /// model.PulseHealth.checkPulse.
+/// The first failing list aborts the sweep: later charts get no point.
 pub(crate) async fn check_pulse(acc: &dyn Accessor, ns: &str) -> Vec<HealthPoint> {
     let mut out = Vec::with_capacity(PULSE_GVRS.len());
     for g in PULSE_GVRS {
-        let Ok(oo) = acc.list(&Gvr::parse(g), ns, None).await else {
-            continue;
+        let oo = match acc.list(&Gvr::parse(g), ns, None).await {
+            Ok(oo) => oo,
+            Err(e) => {
+                tracing::error!(error = %e, "Pulse check failed");
+                break;
+            }
         };
         out.push(HealthPoint {
             gvr: g.to_string(),
@@ -325,6 +329,16 @@ pub(crate) struct PulseView {
     sparks: HashMap<String, Spark>,
     focus: usize,
     prev_focus: isize,
+    /// Chart rects of the last draw, by focus index (mouse focus).
+    rects: Vec<(usize, Rect)>,
+    /// A click focuses the chart's bare tview Box, which is not a Graphable:
+    /// Pulse's actions then find no focused chart and do nothing.
+    box_focused: bool,
+    /// The pulses grid holds the app focus (a focused chart is highlighted).
+    has_focus: bool,
+    /// Grid items flagged Focus (Init flags 0, nextFocus adds, enter resets):
+    /// regaining focus, tview Grid.Focus hands it to the first flagged one.
+    flags: std::collections::BTreeSet<usize>,
     gen: u64,
     token: Option<CancellationToken>,
     styles: Styles,
@@ -381,6 +395,10 @@ impl PulseView {
             sparks,
             focus: 0,
             prev_focus: -1,
+            rects: Vec::new(),
+            box_focused: false,
+            has_focus: true,
+            flags: [0].into_iter().collect(),
             gen: 0,
             token: None,
             styles: ctx.styles.clone(),
@@ -488,17 +506,10 @@ impl PulseView {
         }
     }
 
-    /// SparkLine.GetSeriesColorNames.
-    fn spark_color_names(&self, id: &str) -> Vec<String> {
-        let mut nn: Vec<String> = self
-            .series_colors(id)
-            .into_iter()
-            .map(util::color_tag)
-            .collect();
-        if nn.len() < 3 {
-            nn.extend(["green".into(), "orange".into(), "orangered".into()]);
-        }
-        nn
+    /// SparkLine.GetSeriesColorNames: series colors are true colors and never
+    /// equal a tcell.ColorNames entry, so only the fallback names remain.
+    fn spark_color_names(&self, _id: &str) -> Vec<String> {
+        vec!["green".into(), "orange".into(), "orangered".into()]
     }
 
     fn level(&self, kind: &str, v: i64) -> usize {
@@ -628,6 +639,15 @@ impl PulseView {
         } else {
             next as usize
         };
+        self.flags.insert(self.focus);
+    }
+
+    /// tview Grid.Focus: focus the first flagged chart.
+    fn regain_focus(&mut self) {
+        self.box_focused = false;
+        if let Some(&i) = self.flags.first() {
+            self.focus = i;
+        }
     }
 
     fn draw_gauge(&self, buf: &mut Buffer, area: Rect, id: &str, focused: bool) {
@@ -811,13 +831,16 @@ impl PulseView {
     }
 }
 
-/// tview Grid equal-size distribution.
+/// tview Grid proportional distribution: each track takes
+/// remaining/tracks-left (floored), so the remainder lands on the last ones.
 fn split(start: u16, len: u16, n: u16) -> Vec<(u16, u16)> {
+    let (mut rem, mut pos) = (len, start);
     (0..n)
         .map(|i| {
-            let a = (len as u32 * i as u32 / n as u32) as u16;
-            let b = (len as u32 * (i as u32 + 1) / n as u32) as u16;
-            (start + a, b - a)
+            let w = rem / (n - i);
+            rem -= w;
+            pos += w;
+            (pos - w, w)
         })
         .collect()
 }
@@ -843,17 +866,18 @@ impl View for PulseView {
 
     fn hints(&self) -> Vec<Hint> {
         let mut hh = vec![
-            Hint::new("enter", "Goto"),
+            // KeyActions.Hints order (tcell key codes), kept by the stable sort.
             Hint::new("tab", "Next"),
-            Hint::new("backtab", "Prev"),
-            Hint::new("down", "Down").hidden(),
-            Hint::new("up", "Up").hidden(),
-            Hint::new("right", "Next").hidden(),
-            Hint::new("left", "Prev").hidden(),
+            Hint::new("enter", "Goto"),
             Hint::new("h", "Prev").hidden(),
             Hint::new("j", "Down").hidden(),
             Hint::new("k", "Up").hidden(),
             Hint::new("l", "Next").hidden(),
+            Hint::new("up", "Up").hidden(),
+            Hint::new("down", "Down").hidden(),
+            Hint::new("right", "Next").hidden(),
+            Hint::new("left", "Prev").hidden(),
+            Hint::new("backtab", "Prev"),
         ];
         util::sort_hints(&mut hh);
         hh
@@ -861,6 +885,8 @@ impl View for PulseView {
 
     fn start(&mut self, ctx: &mut Ctx) -> Vec<ViewCmd> {
         self.styles = ctx.styles.clone();
+        // Re-focusing the view hands focus to the flagged chart again.
+        self.regain_focus();
         let acc = ctx.accessor.clone();
         self.start_watch(acc, ctx);
         Vec::new()
@@ -871,9 +897,17 @@ impl View for PulseView {
     }
 
     fn handle_key(&mut self, key: KeyEvent, _ctx: &mut Ctx) -> Vec<ViewCmd> {
-        match util::key_label(&key).as_str() {
+        let k = util::key_label(&key);
+        let own = [
+            "enter", "tab", "backtab", "up", "down", "left", "right", "h", "j", "k", "l",
+        ];
+        if self.box_focused && own.contains(&k.as_str()) {
+            return Vec::new();
+        }
+        match k.as_str() {
             "enter" => {
                 self.prev_focus = self.focus as isize;
+                self.flags = [self.focus].into_iter().collect();
                 self.stop_watch();
                 let id = &self.chart_gvrs[self.focus];
                 let res = if id == CPU || id == MEM {
@@ -881,8 +915,12 @@ impl View for PulseView {
                 } else {
                     res_of(id).to_string()
                 };
+                // pulse.go: gotoResource(res+" "+ns, "", false, true) pushes.
                 let cmd = format!("{res} {}", self.ns);
-                vec![ViewCmd::Command(cmd.trim_end().to_string())]
+                vec![ViewCmd::Goto {
+                    cmd: cmd.trim_end().to_string(),
+                    path: String::new(),
+                }]
             }
             "tab" | "right" | "l" => {
                 self.next_focus_cmd(DIR_LEFT);
@@ -938,7 +976,8 @@ impl View for PulseView {
         let bg = Style::default().bg(s.chart_bg).fg(s.fg);
         let title = util::markup_line(&self.title_markup(), util::title_base(&s));
         let inner = util::pad_x(
-            util::draw_box(buf, area, &title, bg.fg(s.border_focus), bg),
+            // The grid box never sets a focus color: always the plain border.
+            util::draw_box(buf, area, &title, bg.fg(s.border), bg),
             1,
         );
         if inner.width == 0 || inner.height == 0 {
@@ -956,17 +995,54 @@ impl View for PulseView {
             let w: u16 = cols[c..c + cs].iter().map(|v| v.1).sum();
             Rect::new(x, y, w, h)
         };
+        let mut rects = Vec::new();
         let gids: Vec<String> = self.chart_gvrs[..self.chart_gvrs.len() - 2].to_vec();
         for (i, id) in gids.iter().enumerate() {
             let (r, c) = ((i / 4) * 2, (i % 4) * 2);
             let rect = cell(r, c, 2, 2);
-            self.draw_gauge(buf, rect, id, self.focus == i);
+            rects.push((i, rect));
+            self.draw_gauge(buf, rect, id, self.has_focus && self.focus == i);
         }
         if !self.sparks.is_empty() {
             let base = self.chart_gvrs.len() - 2;
-            self.draw_spark(buf, cell(gauge_rows, 0, 2, 4), CPU, self.focus == base);
-            self.draw_spark(buf, cell(gauge_rows, 4, 2, 4), MEM, self.focus == base + 1);
+            rects.push((base, cell(gauge_rows, 0, 2, 4)));
+            rects.push((base + 1, cell(gauge_rows, 4, 2, 4)));
+            self.draw_spark(
+                buf,
+                cell(gauge_rows, 0, 2, 4),
+                CPU,
+                self.has_focus && self.focus == base,
+            );
+            self.draw_spark(
+                buf,
+                cell(gauge_rows, 4, 2, 4),
+                MEM,
+                self.has_focus && self.focus == base + 1,
+            );
         }
+        self.rects = rects;
+    }
+
+    fn set_focused(&mut self, focused: bool) {
+        if focused && !self.has_focus {
+            self.regain_focus();
+        }
+        self.has_focus = focused;
+    }
+
+    /// tview Box.MouseHandler: a click focuses the chart under the mouse;
+    /// key navigation then starts from it (nextFocusCmd uses GetFocus).
+    fn on_mouse(&mut self, m: crate::ui::Mouse, _area: Rect, _ctx: &mut Ctx) -> Vec<ViewCmd> {
+        if let crate::ui::Mouse::Click { x, y } = m {
+            let p = ratatui::layout::Position::new(x, y);
+            if let Some((i, _)) = self.rects.iter().find(|(_, r)| r.contains(p)) {
+                self.focus = *i;
+                self.box_focused = true;
+                // The click itself focused the box (no Grid.Focus pass).
+                self.has_focus = true;
+            }
+        }
+        Vec::new()
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -1008,7 +1084,7 @@ mod tests {
         f.add("apps/v1/deployments", obj(json!({"apiVersion":"apps/v1","kind":"Deployment","metadata":{"name":"x","namespace":"default"}})));
         f.add("v1/nodes", obj(json!({"apiVersion":"v1","kind":"Node","metadata":{"name":"n1"},"status":{"conditions":[{"type":"Ready","status":"True"}]}})));
         f.add("v1/nodes", obj(json!({"apiVersion":"v1","kind":"Node","metadata":{"name":"n2"},"spec":{"unschedulable":true},"status":{"conditions":[{"type":"Ready","status":"True"}]}})));
-        f.add("v1/events", obj(json!({"apiVersion":"v1","kind":"Event","metadata":{"name":"e","namespace":"default"},"type":"Warning"})));
+        f.add("events.k8s.io/v1/events", obj(json!({"apiVersion":"events.k8s.io/v1","kind":"Event","metadata":{"name":"e","namespace":"default"},"type":"Normal","reason":"Pulled"})));
         f.pod_metrics.lock().unwrap().insert(
             "default/a".into(),
             PodMetrics {
@@ -1066,9 +1142,17 @@ mod tests {
             }
         );
         assert_eq!(get("v1/nodes").faults, 1);
-        assert_eq!(get("v1/events").faults, 1);
+        assert_eq!(get("events.k8s.io/v1/events").faults, 1);
         assert_eq!(get("apps/v1/deployments").faults, 0);
         assert_eq!(get("batch/v1/jobs").total, 0);
+        // A forbidden events list stops the sweep (live: events.k8s.io denied).
+        f.list_errors
+            .lock()
+            .unwrap()
+            .push("events.k8s.io/v1/events".into());
+        let hh = check_pulse(&f, "").await;
+        let gg: Vec<&str> = hh.iter().map(|h| h.gvr.as_str()).collect();
+        assert_eq!(gg, ["v1/nodes", "v1/namespaces", "v1/services"]);
     }
 
     #[tokio::test]
@@ -1097,6 +1181,8 @@ mod tests {
             cpu.legend
         );
         assert!(v.sparks[MEM].legend.contains("64Mi"));
+        // Value color: fallback names [green orange orangered][level].
+        assert!(cpu.legend.contains("([orangered::]250m"), "{}", cpu.legend);
 
         let mut t = Terminal::new(TestBackend::new(120, 40)).unwrap();
         t.draw(|f| v.draw(f, f.area(), &c)).unwrap();
@@ -1110,6 +1196,8 @@ mod tests {
         assert!(text.contains("⠔"));
         assert!(text.contains("Cpu 100%"));
         assert!(text.contains('┃') || text.contains('╻'));
+        // Outer grid border: plain border color, never the focus color.
+        assert_eq!(b[(0, 0)].fg, c.styles.border);
 
         // focus navigation.
         v.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), &mut c);
@@ -1123,10 +1211,10 @@ mod tests {
         v.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), &mut c);
         assert_eq!(v.focus, 9);
         let cmds = v.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut c);
-        assert!(matches!(&cmds[0], ViewCmd::Command(s) if s == "ingresses default"));
+        assert!(matches!(&cmds[0], ViewCmd::Goto { cmd, .. } if cmd == "ingresses default"));
         v.focus = 12;
         let cmds = v.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut c);
-        assert!(matches!(&cmds[0], ViewCmd::Command(s) if s == "v1/pods default"));
+        assert!(matches!(&cmds[0], ViewCmd::Goto { cmd, .. } if cmd == "v1/pods default"));
     }
 
     #[tokio::test]
@@ -1143,6 +1231,58 @@ mod tests {
         assert!(v.sparks[MEM].legend.contains("[green::b]25%"));
     }
 
+    #[tokio::test]
+    async fn mouse_click_focuses_chart_box() {
+        let (mut c, _rx) = ctx();
+        let mut v = PulseView::new(&mut c, "default".into());
+        let mut t = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        t.draw(|f| v.draw(f, f.area(), &c)).unwrap();
+        let (i, r) = v.rects[5];
+        let area = Rect::new(0, 0, 120, 40);
+        v.set_focused(false); // e.g. a header box was clicked first
+        v.on_mouse(
+            crate::ui::Mouse::Click {
+                x: r.x + 1,
+                y: r.y + 1,
+            },
+            area,
+            &mut c,
+        );
+        v.set_focused(true);
+        assert_eq!(v.focus, i);
+        // pulse.go nextFocusCmd: the focused bare Box is not a Graphable.
+        v.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), &mut c);
+        assert_eq!(v.focus, i);
+        // Regaining focus (prompt closed, view re-entered): tview Grid.Focus
+        // picks the first Focus-flagged item, not the clicked box.
+        v.set_focused(false);
+        v.set_focused(true);
+        assert_eq!(v.focus, 0);
+        v.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), &mut c);
+        assert_eq!(v.focus, 1);
+        v.on_mouse(
+            crate::ui::Mouse::Click {
+                x: r.x + 1,
+                y: r.y + 1,
+            },
+            area,
+            &mut c,
+        );
+        v.start(&mut c);
+        assert_eq!(v.focus, 0, "flags 0 and 1: first wins");
+    }
+
+    #[test]
+    fn hints_keep_key_code_order_within_a_description() {
+        let (mut c, _rx) = ctx();
+        let v = PulseView::new(&mut c, "default".into());
+        let keys: Vec<String> = v.hints().into_iter().map(|h| h.mnemonic).collect();
+        assert_eq!(
+            keys,
+            ["j", "down", "enter", "tab", "l", "right", "h", "left", "backtab", "k", "up"]
+        );
+    }
+
     #[test]
     fn gauge_digits_and_delta() {
         let mut g = Gauge::default();
@@ -1152,5 +1292,8 @@ mod tests {
         assert_eq!((g.delta_ok, g.delta_fault), (-1, 1));
         assert_eq!(digit(1)[1][1], '┃');
         assert_eq!(split(0, 10, 3), vec![(0, 3), (3, 3), (6, 4)]);
+        // 156 cols / 8: 19,19,19,19,20,20,20,20 (live k9s gauges 38,38,40,40).
+        let w: Vec<u16> = split(0, 156, 8).iter().map(|c| c.1).collect();
+        assert_eq!(w, [19, 19, 19, 19, 20, 20, 20, 20]);
     }
 }

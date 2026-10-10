@@ -73,6 +73,8 @@ pub struct Command {
     pub fuzzy: Option<String>,
     /// Trailing positional args (e.g. `xray po ns`, `dir /tmp`, `cow hi`).
     pub args: Vec<String>,
+    /// Single instance fqn (gotoResource path / Browser.SetInstance).
+    pub instance: String,
 }
 
 /// Parse and resolve `input` against `aliases`.
@@ -165,9 +167,18 @@ pub fn interpret(input: &str, aliases: &Aliases) -> anyhow::Result<(Command, Int
         }
         None => return Err(anyhow!("`{}` command not found", p.cmd())),
     };
+    // command.go run: p.Merge(comd) rebuilds the line from args.String().
+    let me = p.clone();
+    p.merge(&me);
     c.gvr = gvr;
     c.namespace = p.ns_arg();
     c.context = p.has_context();
+    apply_view_args(&mut c, &p);
+    Ok((c, p))
+}
+
+/// Filter, fuzzy and label args as command.go reads them (after SwitchNS).
+pub fn apply_view_args(c: &mut Command, p: &Interpreter) {
     c.filter = p.filter_arg();
     c.fuzzy = p.fuzzy_arg();
     c.label_selector = match p.labels_selector() {
@@ -178,7 +189,6 @@ pub fn interpret(input: &str, aliases: &Aliases) -> anyhow::Result<(Command, Int
             None
         }
     };
-    Ok((c, p))
 }
 
 /// Autocomplete suggestions for the partial `input` (k9s suggestion logic):
@@ -256,6 +266,8 @@ mod tests {
         assert_eq!(
             parse("po -l 'app in (b,a)'", &a).unwrap(),
             Command {
+                // k9s has no -l flag: it lands in the namespace slot.
+                namespace: Some("-l".into()),
                 label_selector: Some("app in (a,b)".into()),
                 ..cmd("v1/pods", "po")
             }
@@ -402,8 +414,11 @@ mod tests {
     #[test]
     fn interpret_canonical_line() {
         let a = aliases();
+        // run's p.Merge rebuilds the line from the (lowercased) args.
         let (_, p) = interpret("po Fred", &a).unwrap();
-        assert_eq!(p.get_line(), "v1/pods Fred");
+        assert_eq!(p.get_line(), "v1/pods fred");
+        let (_, p) = interpret("po kube-system /Core -f cdns", &a).unwrap();
+        assert_eq!(p.get_line(), "v1/pods /core cdns kube-system");
         let (_, p) = interpret("ns blee", &a).unwrap();
         assert_eq!(p.get_line(), "v1/pods blee");
         let (_, p) = interpret("ppc", &a).unwrap();

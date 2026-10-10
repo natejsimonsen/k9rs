@@ -36,10 +36,23 @@ pub(crate) enum Source {
     Static { yaml: bool, searchable: bool },
     /// The cow error viewer (view/cow.go).
     Cow,
+    /// Helm notes/manifest: a LiveView over the release (helm dao
+    /// Describe/ToYAML); fetched once, so refresh toggles are inert.
+    Release,
+    /// Helm values (model.Values/RevValues in a LiveView): user supplied
+    /// values, toggled with `v` to all values.
+    Values {
+        all: bool,
+        user: String,
+        computed: String,
+    },
 }
 
 /// Refresh request sent to ourselves after an external edit.
 struct Refetch;
+
+/// editRes's patch access check result.
+struct EditAllowed(bool);
 
 pub(crate) struct DetailsView {
     id: ViewId,
@@ -88,6 +101,30 @@ impl DetailsView {
         body: &str,
     ) -> Self {
         let mut v = Self::base(ctx, title, subject, Source::Static { yaml, searchable });
+        v.set_text(body);
+        v.pane.scroll_to_beginning();
+        v
+    }
+
+    pub(crate) fn values(ctx: &mut Ctx, subject: String, user: String, computed: String) -> Self {
+        let body = user.clone();
+        let mut v = Self::base(
+            ctx,
+            "Values",
+            subject,
+            Source::Values {
+                all: false,
+                user,
+                computed,
+            },
+        );
+        v.set_text(&body);
+        v.pane.scroll_to_beginning();
+        v
+    }
+
+    pub(crate) fn release(ctx: &mut Ctx, title: &str, subject: String, body: &str) -> Self {
+        let mut v = Self::base(ctx, title, subject, Source::Release);
         v.set_text(body);
         v.pane.scroll_to_beginning();
         v
@@ -165,10 +202,8 @@ impl DetailsView {
         self.render_lines();
     }
 
-    /// Rebuild the styled lines (colors + current match highlight).
-    fn render_lines(&mut self) {
-        let base = self.styles.body();
-        let colorize = self.colorize();
+    /// Per line match ranges (start, end, is current).
+    fn line_ranges(&self) -> Vec<Vec<(usize, usize, bool)>> {
         let mut per_line: Vec<Vec<(usize, usize, bool)>> = vec![Vec::new(); self.lines.len()];
         for (i, m) in self.matches.iter().enumerate() {
             if let Some(v) = per_line.get_mut(m.line) {
@@ -177,6 +212,14 @@ impl DetailsView {
                 }
             }
         }
+        per_line
+    }
+
+    /// Rebuild the styled lines (colors + current match highlight).
+    fn render_lines(&mut self) {
+        let base = self.styles.body();
+        let colorize = self.colorize();
+        let per_line = self.line_ranges();
         let out: Vec<SLine> = self
             .lines
             .iter()
@@ -312,9 +355,31 @@ impl DetailsView {
         util::skin_title(&fmat, &self.styles)
     }
 
+    /// tview TextView.GetText(true): colorized text went through tview.Escape
+    /// (escapes are kept since dynamic colors are on); plain text loses its
+    /// color tags. Copy and live saves then apply k9s sanitizeEsc.
+    fn export_text(&self, sanitize: bool) -> String {
+        let text = if self.colorize() {
+            let ranges = self.line_ranges();
+            self.lines
+                .iter()
+                .zip(ranges.iter())
+                .map(|(l, r)| yaml_line_plain(&tview_escape(l), r))
+                .collect::<Vec<_>>()
+                .join("\n")
+        } else {
+            strip_color_tags(&self.lines.join("\n"))
+        };
+        if sanitize {
+            sanitize_esc(&text)
+        } else {
+            text
+        }
+    }
+
     fn save(&self, ctx: &Ctx) -> ViewCmd {
         let dir = util::screen_dump_dir(ctx);
-        let text = self.pane.text();
+        let text = self.export_text(self.is_live());
         if self.is_live() {
             let name = format!(
                 "{}--{}",
@@ -339,6 +404,7 @@ impl DetailsView {
         }
     }
 
+    /// LiveView.editCmd -> editRes: patch access is checked first.
     fn edit(&mut self, ctx: &mut Ctx) -> Vec<ViewCmd> {
         let Some(gvr) = self.gvr().cloned() else {
             return Vec::new();
@@ -346,12 +412,40 @@ impl DetailsView {
         if self.subject.is_empty() {
             return Vec::new();
         }
+        let (ns, n) = crate::k8s::namespaced(&self.subject);
+        let ns = if crate::k8s::is_cluster_scoped(ns) {
+            ""
+        } else {
+            ns
+        };
+        let (acc, ns, n, view, tx) = (
+            ctx.accessor.clone(),
+            ns.to_string(),
+            n.to_string(),
+            self.id,
+            ctx.sender(),
+        );
+        ctx.spawn(async move {
+            let ok = acc.can_named(&gvr, &ns, &n, "patch").await.unwrap_or(false);
+            let _ = tx.send(AppEvent::Custom {
+                view,
+                payload: Box::new(EditAllowed(ok)),
+            });
+        });
+        Vec::new()
+    }
+
+    fn run_edit(&mut self, ctx: &mut Ctx) -> Vec<ViewCmd> {
+        let Some(gvr) = self.gvr().cloned() else {
+            return Vec::new();
+        };
         self.stop_watch();
         let argv = ctx.accessor.edit_argv(&gvr, &self.subject);
         let env = ctx.accessor.shell_env();
         let view = self.id;
         vec![ViewCmd::Suspend {
             argv,
+            banner: String::new(),
             env,
             on_done: Some(Box::new(
                 move |ctx: &mut Ctx, st: std::process::ExitStatus| {
@@ -364,7 +458,7 @@ impl DetailsView {
                     } else {
                         vec![util::flash(
                             FlashLevel::Err,
-                            format!("edit command failed: {st}"),
+                            format!("Edit command failed: {st}"),
                         )]
                     }
                 },
@@ -460,12 +554,19 @@ fn decode_secret_description(desc: &str, o: &kube::api::DynamicObject) -> anyhow
 
 fn key_val_rx() -> &'static Regex {
     static RX: OnceLock<Regex> = OnceLock::new();
-    RX.get_or_init(|| Regex::new(r"\A(\s*)([\w\-./\s]+):\s(.+)\z").expect("kv regex"))
+    // Go's \s and \w are ASCII-only.
+    RX.get_or_init(|| {
+        Regex::new(r"\A([\t\n\x0C\r ]*)([0-9A-Za-z_\-./\t\n\x0C\r ]+):[\t\n\x0C\r ](.+)\z")
+            .expect("kv regex")
+    })
 }
 
 fn key_rx() -> &'static Regex {
     static RX: OnceLock<Regex> = OnceLock::new();
-    RX.get_or_init(|| Regex::new(r"\A(\s*)([\w\-./\s]+):\s*\z").expect("key regex"))
+    RX.get_or_init(|| {
+        Regex::new(r"\A([\t\n\x0C\r ]*)([0-9A-Za-z_\-./\t\n\x0C\r ]+):[\t\n\x0C\r ]*\z")
+            .expect("key regex")
+    })
 }
 
 /// tview TextView region highlight: swap fore and background; a default
@@ -523,15 +624,65 @@ fn highlight(line: SLine, ranges: &[(usize, usize, bool)]) -> SLine {
 /// k9s colorizeYAML for one line. Search region tags inserted in the key
 /// part break the key/value regexes in k9s; mirror that by falling back to
 /// value coloring when any match starts before the value.
+/// Text colorizeYAML leaves once its tags are stripped. Search markers in the
+/// key (or anywhere on a key-only line) defeat the key regexes, as in k9s.
+fn yaml_line_plain(l: &str, ranges: &[(usize, usize, bool)]) -> String {
+    if let Some(c) = key_val_rx().captures(l) {
+        let g3 = c.get(3).expect("value");
+        if ranges.iter().all(|r| r.0 >= g3.start()) {
+            return format!("{}{}: {}", &c[1], &c[2], g3.as_str());
+        }
+    } else if let Some(c) = key_rx().captures(l) {
+        if ranges.is_empty() {
+            return format!("{}{}:", &c[1], &c[2]);
+        }
+    }
+    l.to_string()
+}
+
+/// tview.Escape.
+pub(crate) fn tview_escape(s: &str) -> String {
+    static RX: OnceLock<Regex> = OnceLock::new();
+    RX.get_or_init(|| Regex::new(r##"(\[[a-zA-Z0-9_,;: \-\."#]+\[*)\]"##).expect("escape regex"))
+        .replace_all(s, "${1}[]")
+        .into_owned()
+}
+
+/// tview colorPattern removal done by GetText(true).
+fn strip_color_tags(s: &str) -> String {
+    static RX: OnceLock<Regex> = OnceLock::new();
+    RX.get_or_init(|| {
+        Regex::new(
+            r"\[([a-zA-Z]+|#[0-9a-zA-Z]{6}|\-)?:([a-zA-Z]+|#[0-9a-zA-Z]{6}|\-)?:([lbdru]+|\-)?\]",
+        )
+        .expect("color regex")
+    })
+    .replace_all(s, "")
+    .into_owned()
+}
+
+/// k9s sanitizeEsc (greedy per line, so only the outermost pair unescapes).
+pub(crate) fn sanitize_esc(s: &str) -> String {
+    static RX: OnceLock<Regex> = OnceLock::new();
+    RX.get_or_init(|| Regex::new(r"\[(.+)\[\]").expect("bracket regex"))
+        .replace_all(s, "[${1}]")
+        .into_owned()
+}
+
 pub(crate) fn colorize_yaml_line(
     l: &str,
     ranges: &[(usize, usize, bool)],
     s: &Styles,
     base: Style,
 ) -> SLine {
-    let key = base.fg(s.yaml_key).add_modifier(Modifier::BOLD);
-    let colon = base.fg(s.yaml_colon);
-    let val = base.fg(s.yaml_value);
+    // A `default` color is `-` in the k9s markup: the text view color.
+    let fg = |c: Color| match (c, base.fg) {
+        (Color::Reset, Some(b)) => b,
+        _ => c,
+    };
+    let key = base.fg(fg(s.yaml_key)).add_modifier(Modifier::BOLD);
+    let colon = base.fg(fg(s.yaml_colon));
+    let val = base.fg(fg(s.yaml_value));
     if let Some(c) = key_val_rx().captures(l) {
         let g3 = c.get(3).expect("value");
         if ranges.iter().all(|r| r.0 >= g3.start()) {
@@ -542,7 +693,8 @@ pub(crate) fn colorize_yaml_line(
                 segs.push(Seg::new(g1.as_str(), val));
             }
             segs.push(Seg::new(g2.as_str(), key));
-            segs.push(Seg::new(&l[g2.end()..g3.start()], colon));
+            // yamlFullFmt rewrites the separator as ": ".
+            segs.push(Seg::new(": ", colon));
             segs.push(Seg::new(g3.as_str(), val));
             return highlight(segs, ranges);
         }
@@ -555,7 +707,8 @@ pub(crate) fn colorize_yaml_line(
                 segs.push(Seg::new(g1.as_str(), val));
             }
             segs.push(Seg::new(g2.as_str(), key));
-            segs.push(Seg::new(&l[g2.end()..], colon));
+            // yamlKeyFmt drops whitespace after the colon.
+            segs.push(Seg::new(":", colon));
             return segs;
         }
     }
@@ -575,6 +728,11 @@ impl View for DetailsView {
 
     fn name(&self) -> String {
         self.title.clone()
+    }
+
+    /// details.go / live_view.go SetTitleColor(tcell.ColorAqua).
+    fn title_color(&self, _: &Styles) -> Color {
+        Color::LightCyan
     }
 
     fn title(&self) -> String {
@@ -602,7 +760,14 @@ impl View for DetailsView {
             hh.push(Hint::new("n", "Next Match"));
             hh.push(Hint::new("shift-n", "Prev Match"));
         }
-        if self.is_live() {
+        if matches!(self.source, Source::Values { .. }) {
+            hh.push(Hint::new("r", "Toggle Auto-Refresh"));
+            if !self.readonly {
+                hh.push(Hint::new("e", "Edit"));
+            }
+            hh.push(Hint::new("v", "Toggle All Values"));
+        }
+        if self.is_live() || self.source == Source::Release {
             hh.push(Hint::new("r", "Toggle Auto-Refresh"));
             if !self.readonly {
                 hh.push(Hint::new("e", "Edit"));
@@ -646,7 +811,7 @@ impl View for DetailsView {
             }
             "/" => vec![ViewCmd::OpenFilterPrompt],
             "ctrl-s" => vec![self.save(ctx)],
-            "c" => vec![util::copy_to_clipboard(&self.pane.text())],
+            "c" => vec![util::copy_to_clipboard(&self.export_text(true))],
             "f" => {
                 self.fullscreen = !self.fullscreen;
                 Vec::new()
@@ -666,6 +831,39 @@ impl View for DetailsView {
                 self.render_lines();
                 self.reveal_current();
                 Vec::new()
+            }
+            "v" => {
+                let Source::Values {
+                    all,
+                    user,
+                    computed,
+                } = &mut self.source
+                else {
+                    self.pane.scroll_key(&k);
+                    return Vec::new();
+                };
+                *all = !*all;
+                let body = if *all { computed.clone() } else { user.clone() };
+                self.set_text(&body);
+                vec![util::flash(FlashLevel::Info, "Values toggled")]
+            }
+            "m" if self.source == Source::Release && self.title == YAML_ACTION => {
+                self.managed = !self.managed;
+                vec![util::flash(FlashLevel::Info, "toggled managed fields")]
+            }
+            "x" | "e" if self.source == Source::Release => Vec::new(),
+            // Values never re-fetch, so auto-refresh only flips the flag.
+            "r" if matches!(self.source, Source::Values { .. } | Source::Release) => {
+                self.auto_refresh = !self.auto_refresh;
+                let s = if self.auto_refresh {
+                    "enabled"
+                } else {
+                    "disabled"
+                };
+                vec![util::flash(
+                    FlashLevel::Info,
+                    format!("Auto-refresh is {s}"),
+                )]
             }
             "r" if self.is_live() => {
                 self.auto_refresh = !self.auto_refresh;
@@ -695,6 +893,21 @@ impl View for DetailsView {
         }
     }
 
+    /// tview TextView.MouseHandler: the wheel scrolls the text under the
+    /// pointer; a click only focuses (already focused here).
+    fn on_mouse(&mut self, m: crate::ui::Mouse, _area: Rect, _ctx: &mut Ctx) -> Vec<ViewCmd> {
+        match m {
+            crate::ui::Mouse::ScrollUp { x, y } => {
+                self.pane.wheel(x, y, true);
+            }
+            crate::ui::Mouse::ScrollDown { x, y } => {
+                self.pane.wheel(x, y, false);
+            }
+            crate::ui::Mouse::Click { .. } => {}
+        }
+        Vec::new()
+    }
+
     fn on_event(&mut self, ev: &AppEvent, ctx: &mut Ctx) -> Vec<ViewCmd> {
         match ev {
             AppEvent::Text { view, text } if *view == self.id => {
@@ -720,6 +933,16 @@ impl View for DetailsView {
                 if payload.is::<Refetch>() {
                     self.restart(ctx);
                 }
+                if let Some(EditAllowed(ok)) = payload.downcast_ref::<EditAllowed>() {
+                    if !ok {
+                        let gvr = self.gvr().map(|g| g.to_string()).unwrap_or_default();
+                        return vec![util::flash(
+                            FlashLevel::Err,
+                            format!("current user can't edit resource {gvr}"),
+                        )];
+                    }
+                    return self.run_edit(ctx);
+                }
                 Vec::new()
             }
             _ => Vec::new(),
@@ -733,7 +956,11 @@ impl View for DetailsView {
     }
 
     fn draw(&mut self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx) {
-        self.styles = ctx.styles.clone();
+        // Details.StylesChanged: re-colorize with the new skin.
+        if self.styles != ctx.styles {
+            self.styles = ctx.styles.clone();
+            self.render_lines();
+        }
         let s = &self.styles;
         let buf = frame.buffer_mut();
         let body = s.body();
@@ -741,10 +968,12 @@ impl View for DetailsView {
             util::fill(buf, area, body);
             area
         } else {
+            // Title color aqua (SetTitleColor): what `-` falls back to.
+            let base = util::title_base(s).fg(Color::LightCyan);
             let title = if matches!(self.source, Source::Cow) {
-                util::markup_line(" Error ", util::title_base(s).fg(Color::LightCyan))
+                util::markup_line(" Error ", base)
             } else {
-                util::markup_line(&self.title_markup(), util::title_base(s))
+                util::markup_line(&self.title_markup(), base)
             };
             // The focus sits on the inner text view, so the frame keeps the
             // plain border color (tview Box.HasFocus is false).
@@ -951,6 +1180,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn export_text_matches_tview_get_text_and_sanitize_esc() {
+        let (mut ctx, _rx) = ctx_with(fake());
+        let mut v = DetailsView::live(
+            &mut ctx,
+            "Describe",
+            Gvr::parse("v1/nodes"),
+            "n1".into(),
+            false,
+        );
+        v.set_text("Msg:  Added: [a/b c], Removed: [], Tainted: true\nk: [x] [y]\nz: []");
+        // Live saves/copies: Escape then greedy sanitizeEsc (k9s quirks kept).
+        assert_eq!(
+            v.export_text(true),
+            "Msg:  Added: [a/b c], Removed: ], Tainted: true\nk: [x[] [y]\nz: []"
+        );
+        assert_eq!(
+            v.export_text(false),
+            "Msg:  Added: [a/b c], Removed: [], Tainted: true\nk: [x[] [y[]\nz: []"
+        );
+        // colorizeYAML rewrites separators: key-only lines lose trailing blanks.
+        v.set_text("Annotations:  a: \n              a/job-tracking: \n  k:\tv");
+        assert_eq!(
+            v.export_text(true),
+            "Annotations:  a: \n              a/job-tracking:\n  k: v"
+        );
+        // Plain static text drops color tags instead of escaping.
+        let v = DetailsView::fixed(
+            &mut ctx,
+            "t",
+            "s".into(),
+            false,
+            true,
+            "[red::b]hi[-::-] [x]",
+        );
+        assert_eq!(v.export_text(false), "hi [x]");
+    }
+
+    /// editRes: patch access first; denied flashes, allowed suspends to edit.
+    #[tokio::test]
+    async fn edit_checks_patch_access() {
+        let f = fake();
+        f.denied_patch
+            .lock()
+            .unwrap()
+            .push(("v1/pods".into(), "default/nginx".into()));
+        let (mut ctx, mut rx) = ctx_with(f);
+        let mut v = DetailsView::live(
+            &mut ctx,
+            "YAML",
+            Gvr::parse("v1/pods"),
+            "default/nginx".into(),
+            true,
+        );
+        assert!(v.handle_key(key(KeyCode::Char('e')), &mut ctx).is_empty());
+        let cmds = loop {
+            let ev = rx.recv().await.unwrap();
+            if matches!(&ev, AppEvent::Custom { payload, .. } if payload.is::<EditAllowed>()) {
+                break v.on_event(&ev, &mut ctx);
+            }
+        };
+        assert!(
+            matches!(&cmds[..], [ViewCmd::Flash(FlashLevel::Err, m)] if m == "current user can't edit resource v1/pods"),
+            "{}",
+            cmds.len()
+        );
+        let (mut ctx, mut rx) = ctx_with(fake());
+        let mut v = DetailsView::live(
+            &mut ctx,
+            "YAML",
+            Gvr::parse("v1/pods"),
+            "default/nginx".into(),
+            true,
+        );
+        v.handle_key(key(KeyCode::Char('e')), &mut ctx);
+        let cmds = loop {
+            let ev = rx.recv().await.unwrap();
+            if matches!(&ev, AppEvent::Custom { payload, .. } if payload.is::<EditAllowed>()) {
+                break v.on_event(&ev, &mut ctx);
+            }
+        };
+        assert!(matches!(&cmds[..], [ViewCmd::Suspend { .. }]));
+    }
+
+    #[tokio::test]
     async fn auto_refresh_toggle_and_save() {
         let dir = tempfile::tempdir().unwrap();
         let (mut ctx, mut rx) = ctx_with(fake());
@@ -997,6 +1310,18 @@ mod tests {
         let b = render(&mut c, &ctx, 80, 12);
         assert!(row(&b, 0).contains(" Error "));
         assert!(row(&b, 2).contains("Ruroh? Nothing to report here."));
+    }
+
+    /// secret.go/node.go open their details with contentYAML.
+    #[test]
+    fn decoder_and_drain_text_are_yaml() {
+        let (mut ctx, _rx) = ctx_with(fake());
+        for name in ["Secret Decoder", "Drain Progress"] {
+            let mut v =
+                crate::ui::views::text(&mut ctx, name.into(), "x".into(), "pass: hunter2".into());
+            let b = render(v.as_mut(), &ctx, 40, 5);
+            assert_eq!(b[(2, 1)].fg, ctx.styles.yaml_key, "{name}");
+        }
     }
 
     #[test]

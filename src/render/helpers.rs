@@ -480,6 +480,15 @@ pub fn obj_fqn(o: &DynamicObject) -> String {
     crate::k8s::fqn(obj_ns(o), obj_name(o))
 }
 
+/// client.MetaFQN: cluster-scoped objects get the `-/` prefix.
+pub fn meta_fqn(o: &DynamicObject) -> String {
+    if obj_ns(o).is_empty() {
+        crate::k8s::cluster_fqn(obj_name(o))
+    } else {
+        obj_fqn(o)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Quantities and metrics.
 
@@ -632,23 +641,53 @@ pub fn res_value(list: Option<&Value>, name: &str) -> i64 {
     value_quantity(list.and_then(|l| l.get(name))).value()
 }
 
+static GPU_VENDORS: std::sync::RwLock<Vec<String>> = std::sync::RwLock::new(Vec::new());
+
+/// config.KnownGPUVendors: defaults plus `gpuVendors` from the config.
+pub fn set_gpu_vendors(m: &std::collections::BTreeMap<String, String>) {
+    let mut v: Vec<String> = KNOWN_GPU_VENDORS
+        .iter()
+        .map(|(_, r)| r.to_string())
+        .collect();
+    for r in m.values() {
+        if !v.contains(r) {
+            v.push(r.clone());
+        }
+    }
+    if let Ok(mut g) = GPU_VENDORS.write() {
+        *g = v;
+    }
+}
+
+/// GPU resource names, in lookup order.
+fn gpu_resources() -> Vec<String> {
+    match GPU_VENDORS.read() {
+        Ok(g) if !g.is_empty() => g.clone(),
+        _ => KNOWN_GPU_VENDORS
+            .iter()
+            .map(|(_, r)| r.to_string())
+            .collect(),
+    }
+}
+
 /// k9s `extractGPU`: value of the first known GPU vendor resource in `list`.
 pub fn extract_gpu(list: Option<&Value>) -> i64 {
-    for (_, res) in KNOWN_GPU_VENDORS {
-        if let Some(q) = list.and_then(|l| l.get(*res)) {
+    for res in gpu_resources() {
+        if let Some(q) = list.and_then(|l| l.get(&res)) {
             return value_quantity(Some(q)).value();
         }
     }
     0
 }
 
-/// k9s `extractNodeGPU`: (main, shared) GPU values of a ResourceList.
+/// k9s `extractNodeGPU`: (main, shared) GPU values of a ResourceList; a
+/// resource name ending in `shared` is the shared one.
 pub fn extract_node_gpu(list: Option<&Value>) -> (Option<i64>, Option<i64>) {
     let (mut main, mut shared) = (None, None);
-    for (vendor, res) in KNOWN_GPU_VENDORS {
-        if let Some(q) = list.and_then(|l| l.get(*res)) {
+    for res in gpu_resources() {
+        if let Some(q) = list.and_then(|l| l.get(&res)) {
             let v = value_quantity(Some(q)).value();
-            if vendor.ends_with("shared") {
+            if res.ends_with("shared") {
                 shared = Some(v);
             } else {
                 main = Some(v);
@@ -1153,5 +1192,23 @@ mod tests {
         assert!(is_cluster_wide(""));
         assert!(is_cluster_wide("-"));
         assert!(!is_cluster_wide("default"));
+    }
+}
+
+#[cfg(test)]
+mod gpu_tests {
+    use super::*;
+
+    /// config.KnownGPUVendors: custom `gpuVendors` are looked up too.
+    #[test]
+    fn custom_gpu_vendors() {
+        let mut m = std::collections::BTreeMap::new();
+        m.insert("acme".to_string(), "acme.io/gpu".to_string());
+        set_gpu_vendors(&m);
+        let l = serde_json::json!({"acme.io/gpu": "3"});
+        assert_eq!(extract_gpu(Some(&l)), 3);
+        assert_eq!(extract_node_gpu(Some(&l)), (Some(3), None));
+        let l = serde_json::json!({"nvidia.com/gpu.shared": "2"});
+        assert_eq!(extract_node_gpu(Some(&l)), (None, Some(2)));
     }
 }

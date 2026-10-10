@@ -62,7 +62,7 @@ mod tests {
     #[test]
     fn splash_layout() {
         let st = Styles::default();
-        let mut buf = Buffer::empty(Rect::new(0, 0, 60, 12));
+        let mut buf = Buffer::empty(Rect::new(0, 0, 69, 12));
         {
             let a = buf.area;
             draw(&mut buf, a, "v0.50.18", &st)
@@ -70,6 +70,7 @@ mod tests {
         let rows = all_rows(&buf);
         assert_eq!(rows[0].trim(), "");
         assert_eq!(rows[2], format!("      {}      ", LOGO_BIG[0]));
+        assert_eq!(LOGO_BIG[0].len(), 57);
         assert_eq!(fg(&buf, 7, 3), st.logo);
         assert_eq!(rows[10].trim(), "Revision v0.50.18");
         let (x, y) = find(&buf, "v0.50.18").unwrap();

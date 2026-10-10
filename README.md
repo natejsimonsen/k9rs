@@ -8,6 +8,10 @@ It does not need k9s installed. It reads the same config folder as k9s
 (`$K9S_CONFIG_DIR`, else `$XDG_CONFIG_HOME/k9s`), so your skins, aliases,
 hotkeys and plugins carry over.
 
+For that compatibility k9rs keeps k9s's config names: the `K9S_*` env vars,
+the `k9s` config folders and file names, the `k9s:` key in `config.yaml`
+and the plugin env vars. It logs to its own `k9rs.log`.
+
 ## Install
 
 ### Homebrew

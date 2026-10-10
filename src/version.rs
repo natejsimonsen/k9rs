@@ -1,13 +1,19 @@
 //! Build/version information, shown by `k9rs version` and the header "K9s Rev" line.
 
-/// Upstream k9s version this port tracks.
-pub const VERSION: &str = "v0.50.18";
-/// Git commit (set via `K9RS_COMMIT` at build time, else "dev").
+/// k9rs version as the UI shows it (model.NormalizeVersion).
+pub const VERSION: &str = concat!("v", env!("CARGO_PKG_VERSION"));
+/// The build version as `k9rs version` / `k9rs info` print it (goreleaser
+/// sets cmd.version without the `v`).
+pub const RAW_VERSION: &str = env!("CARGO_PKG_VERSION");
+/// Upstream k9s release whose behavior this port matches.
+pub const K9S_VERSION: &str = "v0.50.18";
+/// Git commit (build.rs: `K9RS_COMMIT` or the git HEAD, else "dev").
 pub const COMMIT: &str = match option_env!("K9RS_COMMIT") {
     Some(c) => c,
     None => "dev",
 };
-/// Build date (set via `K9RS_DATE` at build time, else "n/a").
+/// Build date, RFC3339 UTC (build.rs: `K9RS_DATE`, `SOURCE_DATE_EPOCH` or
+/// the build time of a git checkout, else "n/a").
 pub const DATE: &str = match option_env!("K9RS_DATE") {
     Some(d) => d,
     None => "n/a",
@@ -19,8 +25,9 @@ pub const DATE: &str = match option_env!("K9RS_DATE") {
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+// k9rs releases, not k9s: the badge compares against VERSION.
 const K9S_GIT_HOST: &str = "api.github.com";
-const K9S_GIT_PATH: &str = "/repos/derailed/k9s/releases/latest";
+const K9S_GIT_PATH: &str = "/repos/natejsimonsen/k9rs/releases/latest";
 const FETCH_TIMEOUT: Duration = Duration::from_secs(3);
 /// cluster_info.go cacheExpiry.
 const CACHE_EXPIRY: Duration = Duration::from_secs(3600);
@@ -105,7 +112,7 @@ async fn fetch_latest_rev() -> anyhow::Result<String> {
     });
     let req = http::Request::get(K9S_GIT_PATH)
         .header(http::header::HOST, K9S_GIT_HOST)
-        .header(http::header::USER_AGENT, format!("k9s/{VERSION}"))
+        .header(http::header::USER_AGENT, format!("k9rs/{VERSION}"))
         .header(http::header::ACCEPT, "application/json")
         .body(Empty::<bytes::Bytes>::new())?;
     let resp = s.send_request(req).await?;
@@ -116,22 +123,34 @@ async fn fetch_latest_rev() -> anyhow::Result<String> {
 /// ClusterInfo.fetchK9sLatestRev: the latest k9s release, cached for an
 /// hour on success. Failures are logged and yield "".
 pub(crate) async fn latest_rev() -> String {
-    if let Some((v, at)) = LATEST.lock().expect("latest rev").as_ref() {
+    latest_rev_with(&LATEST, fetch_latest_rev()).await
+}
+
+async fn latest_rev_with(
+    cache: &Mutex<Option<(String, Instant)>>,
+    fetch: impl std::future::Future<Output = anyhow::Result<String>>,
+) -> String {
+    if let Some((v, at)) = cache.lock().expect("latest rev").as_ref() {
         if at.elapsed() < CACHE_EXPIRY {
             return v.clone();
         }
     }
-    match tokio::time::timeout(FETCH_TIMEOUT, fetch_latest_rev()).await {
+    tracing::debug!("Fetching latest k9rs rev...");
+    match tokio::time::timeout(FETCH_TIMEOUT, fetch).await {
         Ok(Ok(v)) => {
-            *LATEST.lock().expect("latest rev") = Some((v.clone(), Instant::now()));
+            tracing::debug!(revision = %v, "K9rs latest rev");
+            *cache.lock().expect("latest rev") = Some((v.clone(), Instant::now()));
             v
         }
         Ok(Err(e)) => {
-            tracing::warn!("k9s latest rev fetch failed: {e}");
+            tracing::warn!(error = %e, "k9rs latest rev fetch failed");
             String::new()
         }
         Err(_) => {
-            tracing::warn!("k9s latest rev fetch failed: timeout");
+            tracing::warn!(
+                error = "context deadline exceeded",
+                "k9rs latest rev fetch failed"
+            );
             String::new()
         }
     }
@@ -139,6 +158,19 @@ pub(crate) async fn latest_rev() -> String {
 
 #[cfg(test)]
 mod tests {
+    /// build.rs embeds a sha and goreleaser-style date, or k9s's defaults.
+    #[test]
+    fn build_info() {
+        assert!(super::COMMIT == "dev" || super::COMMIT.bytes().all(|b| b.is_ascii_alphanumeric()));
+        let d = super::DATE;
+        let ok = d == "n/a"
+            || (d.len() == 20
+                && d.ends_with('Z')
+                && d.as_bytes()[4] == b'-'
+                && d.as_bytes()[10] == b'T');
+        assert!(ok, "{d}");
+    }
+
     use super::*;
 
     #[test]
@@ -164,6 +196,21 @@ mod tests {
             k9s_revs("v0.50.18", "v0.50.18"),
             ("v0.50.18".into(), "".into())
         );
+    }
+
+    /// fetchK9sLatestRev: a success is cached for an hour, a failure (e.g.
+    /// GitHub's rate limit: "no version found") is not, so the next
+    /// refresh retries. No network: the fetch is injected.
+    #[tokio::test]
+    async fn latest_rev_caching() {
+        let cache = Mutex::new(None);
+        let fail = async { Err(anyhow::anyhow!("no version found")) };
+        assert_eq!(latest_rev_with(&cache, fail).await, "");
+        assert!(cache.lock().unwrap().is_none());
+        let ok = async { Ok("v0.51.0".to_string()) };
+        assert_eq!(latest_rev_with(&cache, ok).await, "v0.51.0");
+        let unused = async { Err(anyhow::anyhow!("not called")) };
+        assert_eq!(latest_rev_with(&cache, unused).await, "v0.51.0");
     }
 
     #[test]

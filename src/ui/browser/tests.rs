@@ -158,6 +158,14 @@ fn test_runner() -> Runner {
             if line.starts_with("helm list") {
                 return Ok(r#"[{"name":"web","namespace":"default","revision":"2","updated":"2024-01-02T15:04:05Z","status":"deployed","chart":"web-1.0","app_version":"1.0"}]"#.to_string());
             }
+            if line.starts_with("helm get values") {
+                return Ok(if line.contains("--all") {
+                    r#"{"greeting":"hola","replicas":1}"#
+                } else {
+                    r#"{"greeting":"hola"}"#
+                }
+                .to_string());
+            }
             if line.starts_with("helm history") {
                 return Ok(r#"[{"revision":1,"updated":"2024-01-01T00:00:00Z","status":"superseded","chart":"web-0.9","app_version":"0.9","description":"Install complete"},{"revision":2,"updated":"2024-01-02T00:00:00Z","status":"deployed","chart":"web-1.0","app_version":"1.0","description":"Upgrade complete"}]"#.to_string());
             }
@@ -181,7 +189,7 @@ fn deps() -> Deps {
         parse_filter: FilterSpec::parse,
         apply_filter: crate::model::apply_filter,
         sort_rows: crate::model::sort_rows,
-        server_table: crate::render::core::render_server_table,
+        server_table: crate::render::core::render_server_table_with,
         context_config: test_cc,
         dumps_dir: test_dumps,
         benchmarks_dir: |_| std::env::temp_dir().join("k9rs-browser-bench-none"),
@@ -200,6 +208,8 @@ fn deps() -> Deps {
             )
         },
         text: |ctx, n, t, b| stub(ctx, format!("text {n}|{t}|{b}")),
+        values: |ctx, s, u, a| stub(ctx, format!("values {s}|{u}|{a}")),
+        release: |ctx, n, t, b| stub(ctx, format!("release {n}|{t}|{b}")),
         help: |ctx, h| stub(ctx, format!("help {}", h.len())),
         bench: |_s, _c, _x, n| Box::pin(async move { Ok(PathBuf::from(n)) }),
         run: test_runner(),
@@ -261,6 +271,13 @@ fn open_opts(ctx: &mut Ctx, gvr: &str, opts: Opts) -> Browser {
     let kind = kind_for(&g);
     let meta = meta_for(kind, &g, &ctx.resources).unwrap_or_else(|| fallback_meta(&g));
     Browser::new(ctx, g, kind, meta, deps(), opts)
+}
+
+/// A browser whose model already delivered data, so refreshActions ran.
+fn ready(mut b: Browser, ctx: &Ctx) -> Browser {
+    b.actions_ready = true;
+    b.refresh_actions(ctx);
+    b
 }
 
 fn key(c: char) -> KeyEvent {
@@ -444,11 +461,160 @@ async fn all_namespaces_sorts_by_namespace_and_adds_sort_key() {
     assert_eq!(ids(&b), vec!["default/a", "default/b", "kube-system/c"]);
 }
 
+/// Model.Watch fails once: a tick landing before the failure is handled
+/// must not run the access check again.
+#[tokio::test]
+async fn watch_denied_checks_once() {
+    let f = fake();
+    f.denied
+        .lock()
+        .unwrap()
+        .push(("v1/persistentvolumes".into(), "".into()));
+    let (mut ctx, mut rx) = context(f);
+    let mut b = open(&mut ctx, "v1/persistentvolumes");
+    b.start(&mut ctx);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    b.on_event(&AppEvent::Tick, &mut ctx);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let mut n = 0;
+    while let Ok(ev) = rx.try_recv() {
+        n += matches!(ev, AppEvent::Custom { view, .. } if view == b.id()) as usize;
+    }
+    assert_eq!(n, 1);
+    // No data came, so refreshActions never ran: Help and the kind keys only.
+    assert!(has_hint(&b, "?", "Help") && has_hint(&b, "shift-j", "Jump Owner"));
+    assert!(!has_hint(&b, "d", "Describe") && !has_hint(&b, "y", "YAML"));
+}
+
+/// browser.go switchNamespaceCmd: denied namespaces flash and keep the view;
+/// allowed ones flash once (the table already has columns, so no second flash).
+#[tokio::test(flavor = "multi_thread")]
+async fn switch_ns_checks_access_and_flashes_once() {
+    let f = fake();
+    f.denied
+        .lock()
+        .unwrap()
+        .push(("v1/pods".into(), "kube-system".into()));
+    let (mut ctx, mut rx) = context(f);
+    let mut b = open(&mut ctx, "v1/pods");
+    loaded(&mut b, &mut ctx, &mut rx).await;
+    let cmds = b.run(Act::SwitchNs("kube-system".into()), &mut ctx);
+    assert_eq!(
+        flashes(&cmds),
+        vec![(
+            FlashLevel::Err,
+            "access denied for user on: kube-system/v1/pods".to_string()
+        )]
+    );
+    assert_eq!(b.namespace(), "default");
+    let cmds = b.run(Act::SwitchNs(NAMESPACE_ALL.into()), &mut ctx);
+    assert_eq!(
+        flashes(&cmds),
+        vec![(
+            FlashLevel::Info,
+            "Viewing v1/pods in namespace `all`...".to_string()
+        )]
+    );
+    let cmds = until(&mut b, &mut ctx, &mut rx, is_data).await;
+    assert!(flashes(&cmds).is_empty());
+}
+
+/// dao.Policy.List lists bindings through watch.Factory.List, which runs
+/// CanForResource first.
+#[tokio::test]
+async fn policy_list_checks_access() {
+    let f = fake();
+    f.denied.lock().unwrap().push((
+        "rbac.authorization.k8s.io/v1/clusterrolebindings".into(),
+        "-".into(),
+    ));
+    let (mut ctx, mut rx) = context(f);
+    let mut b = open_opts(
+        &mut ctx,
+        "policy",
+        Opts {
+            subject: Some(("ServiceAccount".into(), "default/fred".into())),
+            ..Default::default()
+        },
+    );
+    b.start(&mut ctx);
+    let cmds = until(&mut b, &mut ctx, &mut rx, is_custom).await;
+    assert_eq!(
+        flashes(&cmds),
+        vec![(
+            FlashLevel::Err,
+            "Watcher failed for policy -- [list] access denied on resource \"-\":\"rbac.authorization.k8s.io/v1/clusterrolebindings\""
+                .to_string()
+        )]
+    );
+}
+
+/// dao.Rbac.List gets the role through watch.Factory.Get (CanForInstance).
+#[tokio::test]
+async fn rbac_get_checks_access() {
+    let f = fake();
+    f.denied_get.lock().unwrap().push((
+        "rbac.authorization.k8s.io/v1/roles".into(),
+        "default/viewer".into(),
+    ));
+    let (mut ctx, mut rx) = context(f);
+    let mut b = open_opts(
+        &mut ctx,
+        "rbac",
+        Opts {
+            source: Some((
+                Gvr::parse("rbac.authorization.k8s.io/v1/roles"),
+                "default/viewer".into(),
+            )),
+            ..Default::default()
+        },
+    );
+    b.start(&mut ctx);
+    let cmds = until(&mut b, &mut ctx, &mut rx, is_custom).await;
+    assert_eq!(
+        flashes(&cmds),
+        vec![(
+            FlashLevel::Err,
+            "Watcher failed for rbac -- [get] access denied on resource \"default\":\"rbac.authorization.k8s.io/v1/roles\""
+                .to_string()
+        )]
+    );
+}
+
+/// dao.Benchmark.List: a missing dir fails the watch with Go's error text.
+#[tokio::test]
+async fn benchmarks_missing_dir_fails_watch() {
+    let (mut ctx, mut rx) = context(fake());
+    let mut b = open(&mut ctx, "benchmarks");
+    b.dir = PathBuf::from("/nonexistent/k9rs-bench");
+    b.start(&mut ctx);
+    let cmds = until(&mut b, &mut ctx, &mut rx, is_custom).await;
+    assert_eq!(
+        flashes(&cmds),
+        vec![(
+            FlashLevel::Err,
+            "Watcher failed for benchmarks -- open /nonexistent/k9rs-bench: no such file or directory"
+                .to_string()
+        )]
+    );
+    b.on_event(&AppEvent::Tick, &mut ctx);
+    assert!(b.loading.as_ref().is_none_or(|h| h.is_finished()));
+}
+
 #[tokio::test]
 async fn empty_result_warns() {
     let (mut ctx, mut rx) = context(fake());
     let mut b = open(&mut ctx, "v1/endpoints");
+    // browser.go TableNoData drops the first empty update: no flash, no header.
     let cmds = loaded(&mut b, &mut ctx, &mut rx).await;
+    assert!(flashes(&cmds).is_empty());
+    assert_eq!(b.title(), "");
+    assert!(!has_hint(&b, "d", "Describe"));
+    // The updater refreshes initRefreshRate (300ms) after Watch, no tick needed.
+    let t = std::time::Instant::now();
+    let cmds = until(&mut b, &mut ctx, &mut rx, is_data).await;
+    assert!(t.elapsed() >= INIT_REFRESH_RATE - Duration::from_millis(50));
+    assert!(has_hint(&b, "d", "Describe"));
     assert_eq!(
         flashes(&cmds),
         vec![(
@@ -486,6 +652,10 @@ async fn label_filter_goes_server_side() {
     loaded(&mut b, &mut ctx, &mut rx).await;
     b.on_filter("-l app=nope", &mut ctx);
     assert_eq!(b.label(), Some("app=nope"));
+    // The first empty update is dropped (browser.go firstView); the next one lands.
+    until(&mut b, &mut ctx, &mut rx, is_data).await;
+    assert!(!ids(&b).is_empty());
+    b.on_event(&AppEvent::Tick, &mut ctx);
     until(&mut b, &mut ctx, &mut rx, is_data).await;
     assert!(ids(&b).is_empty());
 }
@@ -691,7 +861,7 @@ async fn readonly_hides_mutations() {
 #[tokio::test]
 async fn resource_hints() {
     let (mut ctx, _rx) = context(fake());
-    let d = open(&mut ctx, "apps/v1/deployments");
+    let d = ready(open(&mut ctx, "apps/v1/deployments"), &ctx);
     for (m, desc) in [
         ("s", "Scale"),
         ("r", "Restart"),
@@ -701,7 +871,7 @@ async fn resource_hints() {
     ] {
         assert!(has_hint(&d, m, desc), "deploy {m} {desc}");
     }
-    let n = open(&mut ctx, "v1/nodes");
+    let n = ready(open(&mut ctx, "v1/nodes"), &ctx);
     for (m, desc) in [
         ("c", "Cordon"),
         ("u", "Uncordon"),
@@ -715,42 +885,51 @@ async fn resource_hints() {
         !has_hint(&n, "w", "Warp To Namespace"),
         "nodes are cluster scoped"
     );
-    let cj = open(&mut ctx, "batch/v1/cronjobs");
+    let cj = ready(open(&mut ctx, "batch/v1/cronjobs"), &ctx);
     assert!(has_hint(&cj, "t", "Trigger") && has_hint(&cj, "s", "Suspend/Resume"));
-    let rs = open(&mut ctx, "apps/v1/replicasets");
+    let rs = ready(open(&mut ctx, "apps/v1/replicasets"), &ctx);
     assert!(has_hint(&rs, "ctrl-l", "Rollback") && !has_hint(&rs, "s", "Scale"));
-    let sec = open(&mut ctx, "v1/secrets");
+    let sec = ready(open(&mut ctx, "v1/secrets"), &ctx);
     assert!(has_hint(&sec, "x", "Decode") && has_hint(&sec, "u", "UsedBy"));
-    let ctxs = open(&mut ctx, "contexts");
-    assert!(!has_hint(&ctxs, "y", "YAML") && !has_hint(&ctxs, "ctrl-d", "Delete"));
+    let ctxs = ready(open(&mut ctx, "contexts"), &ctx);
+    // context.go bindDangerousKeys: rename and delete unless read-only.
+    assert!(!has_hint(&ctxs, "y", "YAML"));
+    assert!(has_hint(&ctxs, "ctrl-d", "Delete") && has_hint(&ctxs, "r", "Rename"));
     assert!(!ctxs.actions().contains_key(&KEY_SPACE));
-    let al = open(&mut ctx, "aliases");
+    ctx.readonly = true;
+    let ro = ready(open(&mut ctx, "contexts"), &ctx);
+    assert!(!has_hint(&ro, "ctrl-d", "Delete") && !has_hint(&ro, "r", "Rename"));
+    ctx.readonly = false;
+    let al = ready(open(&mut ctx, "aliases"), &ctx);
     assert!(has_hint(&al, "enter", "Goto"));
     assert!(!al.actions().contains_key(&ctrl('s')));
-    let pf = open(&mut ctx, "portforwards");
+    let pf = ready(open(&mut ctx, "portforwards"), &ctx);
     assert!(
         has_hint(&pf, "enter", "View Benchmarks")
             && has_hint(&pf, "ctrl-d", "Delete")
             && has_hint(&pf, "b", "Benchmark Run/Stop")
     );
-    let co = open_opts(
-        &mut ctx,
-        "containers",
-        Opts {
-            path: "default/a".into(),
-            ..Default::default()
-        },
+    let co = ready(
+        open_opts(
+            &mut ctx,
+            "containers",
+            Opts {
+                path: "default/a".into(),
+                ..Default::default()
+            },
+        ),
+        &ctx,
     );
     assert!(has_hint(&co, "shift-f", "PortForward") && has_hint(&co, "s", "Shell"));
     assert!(!co.actions().contains_key(&KEY_SPACE));
     assert!(!has_hint(&co, "e", "Edit") && !has_hint(&co, "y", "YAML"));
-    let ev = open(&mut ctx, "v1/events");
+    let ev = ready(open(&mut ctx, "v1/events"), &ctx);
     assert!(!has_hint(&ev, "ctrl-d", "Delete") && !has_hint(&ev, "e", "Edit"));
-    let gen = open(&mut ctx, "networking.k8s.io/v1/ingresses");
+    let gen = ready(open(&mut ctx, "networking.k8s.io/v1/ingresses"), &ctx);
     assert!(has_hint(&gen, "shift-j", "Jump Owner") && !has_hint(&gen, "s", "Scale"));
-    let wk = open(&mut ctx, "workloads");
+    let wk = ready(open(&mut ctx, "workloads"), &ctx);
     assert!(has_hint(&wk, "y", "YAML") && has_hint(&wk, "ctrl-d", "Delete"));
-    let helm = open(&mut ctx, "helm");
+    let helm = ready(open(&mut ctx, "helm"), &ctx);
     assert!(
         has_hint(&helm, "v", "Values")
             && has_hint(&helm, "r", "Releases")
@@ -799,18 +978,30 @@ async fn plugins_and_hotkeys() {
     assert!(!has_hint(&b, "shift-x", "Other"));
     assert!(b.handle_key(key('D'), &mut ctx).is_empty());
     let cmds = until(&mut b, &mut ctx, &mut rx, is_custom).await;
-    assert_eq!(
-        flashes(&cmds),
-        vec![(
-            FlashLevel::Info,
-            "Plugin command launched successfully: \"Debug\"".to_string()
-        )]
+    // exec.go pipe: the flashed status is the completion line (with the
+    // resolved, truncated command), not the plugin description.
+    let ff = flashes(&cmds);
+    assert_eq!(ff.len(), 1, "{ff:?}");
+    assert_eq!(ff[0].0, FlashLevel::Info);
+    assert!(
+        ff[0].1.starts_with(
+            "Plugin command launched successfully: \"Command completed successfully: \\\""
+        ),
+        "{ff:?}"
     );
     assert!(!runs_matching("echo default a").is_empty());
     let cmds = b.handle_key(key('H'), &mut ctx);
     assert!(
         matches!(&cmds[..], [ViewCmd::Command(c)] if c == "dp"),
         "hotkey"
+    );
+    // keepHistory: gotoCmd(clearStack=false).
+    ctx.hotkeys.hot_keys.get_mut("dp").unwrap().keep_history = true;
+    b.refresh_actions(&ctx);
+    let cmds = b.handle_key(key('H'), &mut ctx);
+    assert!(
+        matches!(&cmds[..], [ViewCmd::Goto { cmd, path }] if cmd == "dp" && path.is_empty()),
+        "keepHistory"
     );
 }
 
@@ -881,8 +1072,10 @@ async fn drill_downs() {
     assert!(cmds
         .iter()
         .any(|c| matches!(c, ViewCmd::SetNamespace(n) if n == "kube-system")));
-    let v = pushed_browser(cmds);
-    assert_eq!(as_browser(v.as_ref()).namespace(), "kube-system");
+    // ns.go switchNs runs it as a command: pods view plus a history entry.
+    assert!(cmds.iter().any(
+        |c| matches!(c, ViewCmd::Goto { cmd, path } if cmd == "v1/pods kube-system" && path.is_empty())
+    ));
 }
 
 #[tokio::test]
@@ -899,21 +1092,32 @@ async fn containers_logs_and_shell() {
     loaded(&mut co, &mut ctx, &mut rx).await;
     assert_eq!(ids(&co), vec!["web"]);
     assert_eq!(co.table().sort.name, "IDX");
+    // showLogs runs the pods list access check first (async).
+    co.handle_key(code(KeyCode::Enter), &mut ctx);
+    let cmds = until(&mut co, &mut ctx, &mut rx, is_custom).await;
     assert_eq!(
-        pushed(co.handle_key(code(KeyCode::Enter), &mut ctx)).name(),
+        pushed(cmds).name(),
         "logs default|a|Some(\"web\")|false|false"
     );
+    co.handle_key(key('p'), &mut ctx);
+    let cmds = until(&mut co, &mut ctx, &mut rx, is_custom).await;
     assert_eq!(
-        pushed(co.handle_key(key('p'), &mut ctx)).name(),
+        pushed(cmds).name(),
         "logs default|a|Some(\"web\")|false|true"
     );
     co.handle_key(key('s'), &mut ctx);
     let cmds = until(&mut co, &mut ctx, &mut rx, is_custom).await;
     match &cmds[..] {
-        [ViewCmd::Suspend { argv, .. }] => {
+        [ViewCmd::Suspend { argv, banner, .. }] => {
             assert_eq!(
                 argv[..6],
                 ["kubectl", "exec", "-it", "-n", "default", "a"].map(String::from)
+            );
+            // view/exec.go bannerFmt, green/black/bold via fatih/color.
+            assert!(
+                banner.ends_with("<<K9rs-Shell>> Pod: default/a | Container: web \n\x1b[0m")
+                    || std::env::var_os("NO_COLOR").is_some(),
+                "{banner:?}"
             );
             assert_eq!(
                 argv[argv.len() - 3..],
@@ -924,8 +1128,9 @@ async fn containers_logs_and_shell() {
     }
     let cmds = co.handle_key(key('a'), &mut ctx);
     match &cmds[..] {
-        [ViewCmd::Suspend { argv, .. }] => {
+        [ViewCmd::Suspend { argv, banner, .. }] => {
             assert_eq!(argv.join(" "), "kubectl attach -it -n default a -c web");
+            assert!(banner.contains("<<K9rs-Shell>> Pod: default/a | Container: web \n"));
         }
         _ => panic!("expected attach suspend"),
     }
@@ -969,6 +1174,14 @@ async fn pod_logs_shell_node_and_owner() {
     let v = pushed(until(&mut b, &mut ctx, &mut rx, is_custom).await);
     let picker = v.as_any().downcast_ref::<Picker>().expect("picker");
     assert_eq!(picker.items(), ["a", "b"]);
+    // view/picker.go: tview list box, border in the frame border color, centered title.
+    let mut v = v;
+    let mut t = Terminal::new(TestBackend::new(60, 6)).unwrap();
+    t.draw(|f| v.draw(f, f.area(), &ctx)).unwrap();
+    let buf = t.backend().buffer().clone();
+    assert_eq!(buf[(0, 0)].fg, ctx.styles.border);
+    let top: String = (0..60).map(|x| buf[(x, 0)].symbol().to_string()).collect();
+    assert!(top.find("Containers Picker").unwrap() > 15, "{top}");
     b.handle_key(key('l'), &mut ctx);
     assert_eq!(
         pushed(until(&mut b, &mut ctx, &mut rx, is_custom).await).name(),
@@ -1144,16 +1357,25 @@ async fn scale_restart_and_set_image() {
         .contains(&"scale apps/v1/deployments default/web 5".to_string()));
     let cmds = d.handle_key(key('r'), &mut ctx);
     let on_ok = match cmds.into_iter().next() {
-        Some(ViewCmd::Dialog(Dialog::Confirm { title, msg, on_ok })) => {
+        Some(ViewCmd::Dialog(Dialog::Restart {
+            title,
+            msg,
+            field_manager,
+            on_ok,
+        })) => {
             assert_eq!(
-                (title.as_str(), msg.as_str()),
-                ("Confirm Restart", "Restart deployment default/web?")
+                (title.as_str(), msg.as_str(), field_manager.as_str()),
+                (
+                    "Confirm Restart",
+                    "Restart deployment default/web?",
+                    "kubectl-rollout"
+                )
             );
             on_ok
         }
         _ => panic!("expected restart confirm"),
     };
-    on_ok(&mut ctx);
+    on_ok(&mut ctx, "mine".into());
     let cmds = until(&mut d, &mut ctx, &mut rx, is_custom).await;
     assert_eq!(
         flashes(&cmds),
@@ -1162,16 +1384,32 @@ async fn scale_restart_and_set_image() {
             "Restart in progress for `default/web...".to_string()
         )]
     );
+    // The edited FieldManager reaches the patch.
+    assert!(f
+        .calls()
+        .contains(&"restart apps/v1/deployments default/web mine".to_string()));
     d.handle_key(key('i'), &mut ctx);
     let cmds = until(&mut d, &mut ctx, &mut rx, is_custom).await;
     let on_ok = match cmds.into_iter().next() {
-        Some(ViewCmd::Dialog(Dialog::Prompt { value, on_ok, .. })) => {
-            assert_eq!(value, "web=nginx:1");
+        Some(ViewCmd::Dialog(Dialog::SetImage {
+            msg,
+            containers,
+            on_ok,
+        })) => {
+            assert_eq!(msg, "Set image apps/v1/deployments default/web");
+            assert_eq!(containers, vec![("web".into(), "nginx:1".into(), false)]);
             on_ok
         }
-        _ => panic!("expected image prompt"),
+        _ => panic!("expected image form"),
     };
-    on_ok(&mut ctx, "web=nginx:2".into());
+    on_ok(
+        &mut ctx,
+        vec![crate::k8s::ImageSpec {
+            name: "web".into(),
+            docker_image: "nginx:2".into(),
+            init: false,
+        }],
+    );
     until(&mut d, &mut ctx, &mut rx, is_custom).await;
     assert!(f
         .calls()
@@ -1180,6 +1418,71 @@ async fn scale_restart_and_set_image() {
     d.handle_key(key('z'), &mut ctx);
     let v = pushed_browser(until(&mut d, &mut ctx, &mut rx, is_custom).await);
     assert_eq!(as_browser(v.as_ref()).label(), Some("app=web"));
+}
+
+/// browser.go editRes: no patch permission, no editor.
+#[tokio::test(flavor = "multi_thread")]
+async fn edit_needs_patch_access() {
+    let f = fake();
+    f.denied_patch
+        .lock()
+        .unwrap()
+        .push(("v1/pods".into(), "default/a".into()));
+    let (mut ctx, mut rx) = context(f);
+    let mut b = open(&mut ctx, "v1/pods");
+    loaded(&mut b, &mut ctx, &mut rx).await;
+    let cmds = b.handle_key(key('e'), &mut ctx);
+    assert_eq!(
+        flashes(&cmds),
+        vec![(
+            FlashLevel::Err,
+            "current user can't edit resource v1/pods".to_string()
+        )]
+    );
+    b.handle_key(key('j'), &mut ctx);
+    assert!(matches!(
+        &b.handle_key(key('e'), &mut ctx)[..],
+        [ViewCmd::Suspend { .. }]
+    ));
+}
+
+/// exec.go launchNodeShell: a cancellable "<Launching>" prompt while the
+/// shell pod starts; Cancel stops waiting and nukes the pod.
+#[tokio::test]
+async fn node_shell_launching_prompt_cancels() {
+    let f = fake();
+    let (mut ctx, mut rx) = context(f.clone());
+    let mut n = open(&mut ctx, "v1/nodes");
+    loaded(&mut n, &mut ctx, &mut rx).await;
+    n.handle_key(key('s'), &mut ctx);
+    let cmds = until(&mut n, &mut ctx, &mut rx, is_custom).await;
+    let (cancel, on_cancel) = match cmds.into_iter().next() {
+        Some(ViewCmd::Dialog(Dialog::Launching {
+            title,
+            msg,
+            cancel,
+            on_cancel,
+        })) => {
+            assert_eq!(
+                (title.as_str(), msg.as_str()),
+                ("Launching", "Launching node shell on node1...")
+            );
+            (cancel, on_cancel)
+        }
+        _ => panic!("expected the launching prompt"),
+    };
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let pod = format!("default/k9rs-shell-{}", std::process::id());
+    assert!(
+        f.calls().contains(&format!("create v1/pods {pod}")),
+        "{:?}",
+        f.calls()
+    );
+    cancel.cancel();
+    on_cancel(&mut ctx);
+    // The launch ends quietly (context.Canceled is not flashed).
+    let cmds = until(&mut n, &mut ctx, &mut rx, is_custom).await;
+    assert!(flashes(&cmds).is_empty());
 }
 
 #[tokio::test]
@@ -1209,9 +1512,18 @@ async fn nodes_cordon_and_drain() {
         }
         _ => panic!("expected drain dialog"),
     };
-    on_ok(&mut ctx, Default::default());
-    let v = pushed(until(&mut n, &mut ctx, &mut rx, is_custom).await);
-    assert_eq!(v.name(), "text Drain Progress|nodes|node/node1 drained\n");
+    // node.go drainNode: the progress view opens first and the drain
+    // output streams into it.
+    let v = pushed(on_ok(&mut ctx, Default::default()));
+    assert_eq!(v.name(), "text Drain Progress|nodes|");
+    let text = loop {
+        match tokio::time::timeout(Duration::from_secs(5), rx.recv()).await {
+            Ok(Some(AppEvent::Text { view, text })) if view == v.id() => break text,
+            Ok(Some(_)) => continue,
+            other => panic!("no progress: {other:?}"),
+        }
+    };
+    assert_eq!(text, "node/node1 drained\n");
 }
 
 #[tokio::test]
@@ -1301,6 +1613,28 @@ async fn used_by_references() {
     );
 }
 
+/// StatefulSet.Scan: claims stamped from volumeClaimTemplates reference the set.
+#[tokio::test]
+async fn used_by_pvc_from_sts_claim_template() {
+    let f = fake();
+    f.add("apps/v1/statefulsets", obj(json!({"apiVersion": "apps/v1", "kind": "StatefulSet", "metadata": {"name": "am", "namespace": "default"},
+        "spec": {"volumeClaimTemplates": [{"metadata": {"name": "db"}}],
+            "template": {"spec": {"containers": [{"name": "a"}]}}}})));
+    let acc: crate::k8s::SharedAccessor = f;
+    let pvc = Gvr::parse("v1/persistentvolumeclaims");
+    let refs = super::loader::scan_refs(&acc, &pvc, "default/db-am-0")
+        .await
+        .unwrap();
+    assert_eq!(
+        refs,
+        vec![("apps/v1/statefulsets".to_string(), "default/am".to_string())]
+    );
+    assert!(super::loader::scan_refs(&acc, &pvc, "default/other-0")
+        .await
+        .unwrap()
+        .is_empty());
+}
+
 #[tokio::test]
 async fn pseudo_aliases_contexts_and_portforwards() {
     let f = fake();
@@ -1325,7 +1659,8 @@ async fn pseudo_aliases_contexts_and_portforwards() {
     assert_eq!(ids(&c), vec!["fake"]);
     // k9s useContext hands the switch to the shell (app.switchContext).
     let cmds = c.handle_key(code(KeyCode::Enter), &mut ctx);
-    assert!(matches!(cmds.as_slice(), [ViewCmd::Command(c)] if c == "ctx fake"));
+    // useCtx also clears the histories once switched (ViewCmd::UseContext).
+    assert!(matches!(cmds.as_slice(), [ViewCmd::UseContext(c)] if c == "fake"));
     // port forwards
     let spec = PortForwardSpec {
         namespace: "default".into(),
@@ -1344,6 +1679,7 @@ async fn pseudo_aliases_contexts_and_portforwards() {
                 active: true,
             },
             cancel: Default::default(),
+            died: None,
         },
     );
     let mut pf = open(&mut ctx, "portforwards");
@@ -1379,16 +1715,16 @@ async fn pod_pf_indicator_and_port_forward_dialog() {
     b.handle_key(key('F'), &mut ctx);
     let cmds = until(&mut b, &mut ctx, &mut rx, is_custom).await;
     let on_ok = match cmds.into_iter().next() {
-        Some(ViewCmd::Dialog(Dialog::PortForward { spec, ports, on_ok })) => {
+        Some(ViewCmd::Dialog(Dialog::PortForward {
+            spec,
+            ports,
+            prefill,
+            on_ok,
+        })) => {
             assert_eq!(ports, vec!["web::80(http)"]);
-            assert_eq!(
-                (
-                    spec.container.as_str(),
-                    spec.container_port,
-                    spec.local_port
-                ),
-                ("web", 80, 80)
-            );
+            assert_eq!(spec.container, "web");
+            // PFAnn.AsSpec: no port name in the prefill.
+            assert_eq!(prefill, ("web::80".to_string(), "80".to_string()));
             on_ok
         }
         _ => panic!("expected pf dialog"),
@@ -1401,13 +1737,33 @@ async fn pod_pf_indicator_and_port_forward_dialog() {
     };
     spec.local_port = 9090;
     spec.container_port = 80;
-    on_ok(&mut ctx, spec.clone());
+    on_ok(&mut ctx, vec![spec.clone()]);
     let cmds = until(&mut b, &mut ctx, &mut rx, is_custom).await;
     assert_eq!(
         flashes(&cmds),
         vec![(FlashLevel::Info, "PortForward activated 9090".to_string())]
     );
     assert!(ctx.port_forwards.contains_key(&spec.id()));
+    // runForward: a forward dying later is reported to the shell.
+    let tx = f.pf_kill.lock().unwrap().pop().expect("kill switch");
+    tx.send("lost connection to pod".into()).unwrap();
+    let died = loop {
+        let ev = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("died event")
+            .expect("open");
+        if let AppEvent::Custom { view, payload } = ev {
+            if view == crate::ui::shell::SHELL_VIEW_ID {
+                break payload
+                    .downcast::<crate::ui::app::PortForwardDied>()
+                    .expect("died payload");
+            }
+        }
+    };
+    assert_eq!(
+        (died.id.as_str(), died.err.as_str()),
+        (spec.id().as_str(), "lost connection to pod")
+    );
     // f now opens the port-forward view for the pod
     b.handle_key(key('f'), &mut ctx);
     let v = pushed_browser(until(&mut b, &mut ctx, &mut rx, is_custom).await);
@@ -1447,7 +1803,10 @@ async fn screendumps_save_and_dir() {
     assert_eq!(files.len(), 1);
     let body = std::fs::read_to_string(files[0].path()).unwrap();
     assert!(
-        body.starts_with("NAME,READY,STATUS,RESTARTS,IP,VALID,AGE\na,1/1,Running"),
+        // k9s saves the full header, NAMESPACE included, in a namespaced view.
+        body.starts_with(
+            "NAMESPACE,NAME,READY,STATUS,RESTARTS,IP,VALID,AGE\ndefault,a,1/1,Running"
+        ),
         "{body}"
     );
     let mut sd = open(&mut ctx, "screendumps");
@@ -1471,6 +1830,7 @@ async fn screendumps_save_and_dir() {
     std::fs::write(tmp.path().join("a.yaml"), "kind: Pod\n").unwrap();
     std::fs::write(tmp.path().join("notes.txt"), "x").unwrap();
     std::fs::create_dir(tmp.path().join("sub")).unwrap();
+    std::fs::write(tmp.path().join("sub/c.yaml"), "kind: Pod\n").unwrap();
     let cmd = Command {
         gvr: "dir".into(),
         args: vec![tmp.path().to_string_lossy().to_string()],
@@ -1502,15 +1862,44 @@ async fn screendumps_save_and_dir() {
     d.handle_key(key('a'), &mut ctx);
     until(d, &mut ctx, &mut rx, is_custom).await;
     assert!(!runs_matching("kubectl apply -f").is_empty());
+    // dir.go gotoCmd: NewDir(sel) is a client.DirGVR ("dirs") browser,
+    // keeping the path as listed (no symlink resolution: /tmp stays /tmp).
+    d.table.cursor = ids(d).iter().position(|p| p.ends_with("sub")).unwrap();
+    let mut sub = pushed_browser(d.handle_key(code(KeyCode::Enter), &mut ctx));
+    sub.start(&mut ctx);
+    let sub = sub.as_any_mut().downcast_mut::<Browser>().unwrap();
+    until(sub, &mut ctx, &mut rx, is_data).await;
+    assert_eq!(sub.gvr().to_string(), "dirs");
+    let want = tmp.path().join("sub").to_string_lossy().to_string();
+    assert!(sub.title().contains(&want), "{} vs {want}", sub.title());
 }
 
 #[tokio::test]
 async fn helm_releases_and_history() {
-    let (mut ctx, mut rx) = context(fake());
+    // helm's secret storage: base64 of the gzipped release JSON.
+    let release = {
+        use base64::Engine as _;
+        use std::io::Write as _;
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gz.write_all(br#"{"chart":{"values":{"replicas":1,"greeting":"hello"}}}"#)
+            .unwrap();
+        let b64 = base64::engine::general_purpose::STANDARD;
+        b64.encode(b64.encode(gz.finish().unwrap()))
+    };
+    let f = fake();
+    f.add(
+        "v1/secrets",
+        obj(json!({"apiVersion": "v1", "kind": "Secret",
+            "metadata": {"name": "sh.helm.release.v1.web.v2", "namespace": "default"},
+            "data": {"release": release}})),
+    );
+    let (mut ctx, mut rx) = context(f);
     let mut h = open(&mut ctx, "helm");
     loaded(&mut h, &mut ctx, &mut rx).await;
     assert_eq!(ids(&h), vec!["default/web"]);
-    assert!(!runs_matching("helm list -o json -n default --kube-context fake").is_empty());
+    assert!(
+        !runs_matching("helm list -o json --all --max 0 -n default --kube-context fake").is_empty()
+    );
     let mut v = pushed_browser(h.handle_key(code(KeyCode::Enter), &mut ctx));
     v.start(&mut ctx);
     let hist = v.as_any_mut().downcast_mut::<Browser>().unwrap();
@@ -1525,11 +1914,21 @@ async fn helm_releases_and_history() {
     assert_eq!(ids(hist)[0], "default/web:2");
     hist.handle_key(code(KeyCode::Enter), &mut ctx);
     let t = pushed(until(hist, &mut ctx, &mut rx, is_custom).await);
-    assert!(
-        t.name()
-            .starts_with("text Values|default/web|ran helm get values web -n default --revision 2"),
-        "{}",
-        t.name()
+    // History values: the revision's user values, toggling to the chart's own.
+    assert_eq!(
+        t.name(),
+        "values default/web:2|greeting: hola\n|greeting: hello\nreplicas: 1\n"
+    );
+    assert!(!runs_matching("helm get values web -o json -n default --revision 2").is_empty());
+    let t = pushed(
+        h.handle_key(key('v'), &mut ctx)
+            .into_iter()
+            .chain(until(&mut h, &mut ctx, &mut rx, is_custom).await)
+            .collect(),
+    );
+    assert_eq!(
+        t.name(),
+        "values default/web|greeting: hola\n|greeting: hola\nreplicas: 1\n"
     );
     match hist.handle_key(key('r'), &mut ctx).into_iter().next() {
         Some(ViewCmd::Dialog(Dialog::Confirm { title, .. })) => {
@@ -1727,7 +2126,7 @@ fn hints_are_in_tcell_order() {
         tx,
     );
     ctx.resources = crate::k8s::fake::default_resources();
-    let b = open(&mut ctx, "v1/configmaps");
+    let b = ready(open(&mut ctx, "v1/configmaps"), &ctx);
     let m: Vec<String> = b.hints().into_iter().map(|h| h.mnemonic).collect();
     let pos = |k: &str| {
         m.iter()
@@ -1740,4 +2139,622 @@ fn hints_are_in_tcell_order() {
     assert!(pos("?") < pos("shift-a"));
     assert!(pos("shift-a") < pos("c"));
     let _ = HashMap::<u8, u8>::new();
+}
+
+#[tokio::test]
+async fn ns_switch_keeps_live_table_and_skips_no_data_warning() {
+    let f = FakeAccessor::new();
+    f.add("v1/pods", pod("default", "a", "Running"));
+    let (mut ctx, mut rx) = context(Arc::new(f));
+    let mut b = open(&mut ctx, "v1/pods");
+    loaded(&mut b, &mut ctx, &mut rx).await;
+    // browser.go switchNamespaceCmd: model.SetNamespace resets the model only;
+    // the UI keeps the old rows, the title shows the new ns with the old count.
+    let cmds = b.handle_key(key('2'), &mut ctx);
+    assert_eq!(flashes(&cmds).len(), 1);
+    assert_eq!(b.namespace(), "kube-system");
+    assert_eq!(ids(&b), vec!["default/a"]);
+    assert_eq!(b.title(), " pods(kube-system)[1] ");
+    // Start resets firstView: the first empty refresh is skipped...
+    let c1 = until(&mut b, &mut ctx, &mut rx, is_data).await;
+    assert_eq!(ids(&b), vec!["default/a"]);
+    // ...the initRefreshRate one paints the empty table, without a warning
+    // since the table already has columns.
+    let c2 = until(&mut b, &mut ctx, &mut rx, is_data).await;
+    assert!(ids(&b).is_empty());
+    assert!(b.table().data.header.index_of("NAME").is_some());
+    assert!(flashes(&c1).is_empty() && flashes(&c2).is_empty());
+    assert_eq!(b.title(), " pods(kube-system)[0] ");
+}
+
+#[tokio::test]
+async fn favorites_unknown_to_cluster_are_dropped() {
+    let (mut ctx, mut rx) = context(fake());
+    // Config.FavNamespaces validates favorites against the cluster list.
+    ctx.namespaces = vec!["default".into()];
+    ctx.namespaces_known = true;
+    let mut b = open(&mut ctx, "v1/pods");
+    loaded(&mut b, &mut ctx, &mut rx).await;
+    let h = visible_hints(&b);
+    assert!(h.contains(&("1".into(), "default".into())));
+    assert!(!h.iter().any(|(m, _)| m == "2"), "{h:?}");
+    // No namespace list yet: keep them all.
+    let (mut ctx, mut rx) = context(fake());
+    let mut b = open(&mut ctx, "v1/pods");
+    loaded(&mut b, &mut ctx, &mut rx).await;
+    assert!(visible_hints(&b).contains(&("2".into(), "kube-system".into())));
+    // The list failed (e.g. no list access): nothing validates, but pruning
+    // only runs when the active namespace itself checks out ("all" does).
+    let (mut ctx, mut rx) = context(fake());
+    ctx.namespaces_known = true;
+    let mut b = open(&mut ctx, "v1/pods");
+    loaded(&mut b, &mut ctx, &mut rx).await;
+    // Active "default" is not valid either: nothing pruned.
+    assert!(visible_hints(&b).contains(&("2".into(), "kube-system".into())));
+    b.handle_key(key('0'), &mut ctx);
+    until(&mut b, &mut ctx, &mut rx, is_data).await;
+    until(&mut b, &mut ctx, &mut rx, is_data).await;
+    let h = visible_hints(&b);
+    assert!(h.contains(&("0".into(), "all".into())));
+    assert!(!h.iter().any(|(m, _)| m == "1"), "{h:?}");
+}
+
+#[tokio::test]
+async fn use_namespace_marks_it_favorite() {
+    let f = fake();
+    f.add(
+        "v1/namespaces",
+        obj(json!({"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": "extra"}})),
+    );
+    let (mut ctx, mut rx) = context(f);
+    let mut ns = open(&mut ctx, "v1/namespaces");
+    loaded(&mut ns, &mut ctx, &mut rx).await;
+    let row = ns
+        .table()
+        .rows
+        .iter()
+        .position(|r| r.row.id == "-/extra")
+        .unwrap();
+    for _ in 0..row {
+        ns.handle_key(code(KeyCode::Down), &mut ctx);
+    }
+    let cmds = ns.handle_key(key('u'), &mut ctx);
+    assert!(cmds
+        .iter()
+        .any(|c| matches!(c, ViewCmd::SetNamespace(n) if n == "extra")));
+    ctx.namespace = "extra".into();
+    ns.on_filter("", &mut ctx);
+    let names: Vec<String> = ns
+        .table()
+        .rows
+        .iter()
+        .map(|r| r.row.fields[0].clone())
+        .collect();
+    assert!(names.contains(&"extra+(*)".to_string()), "{names:?}");
+}
+
+#[tokio::test]
+async fn filter_history_needs_rows() {
+    let (mut ctx, mut rx) = context(fake());
+    let mut b = open(&mut ctx, "v1/pods");
+    loaded(&mut b, &mut ctx, &mut rx).await;
+    // browser.go BufferActive pushes only while GetRowCount() > 1.
+    b.on_filter("zzz", &mut ctx);
+    assert!(!b.keeps_filter_history());
+    b.on_filter("a", &mut ctx);
+    assert!(b.keeps_filter_history());
+}
+
+#[tokio::test]
+async fn context_rename_and_delete() {
+    let f = fake();
+    let acc = f.clone();
+    let (mut ctx, mut rx) = context(f);
+    let mut c = open(&mut ctx, "contexts");
+    loaded(&mut c, &mut ctx, &mut rx).await;
+    // context.go renameCmd: modal prefilled with the selected name.
+    let cmds = c.handle_key(key('r'), &mut ctx);
+    let on_ok = match cmds.into_iter().next() {
+        Some(ViewCmd::Dialog(Dialog::Rename { name, on_ok })) => {
+            assert_eq!(name, "fake");
+            on_ok
+        }
+        _ => panic!("expected the rename dialog"),
+    };
+    assert!(on_ok(&mut ctx, "fake2".into()).is_empty());
+    until(&mut c, &mut ctx, &mut rx, is_custom).await;
+    assert!(acc
+        .calls()
+        .contains(&"rename_context fake fake2".to_string()));
+    // The view picks the change up on its next refresh.
+    c.handle_key(ctrl_key('r'), &mut ctx);
+    until(&mut c, &mut ctx, &mut rx, is_data).await;
+    assert_eq!(ids(&c), vec!["fake2"]);
+    // deleteCmd: confirm, then DelContext.
+    let cmds = c.handle_key(ctrl_key('d'), &mut ctx);
+    let on_ok = match cmds.into_iter().next() {
+        Some(ViewCmd::Dialog(Dialog::Confirm { title, msg, on_ok })) => {
+            assert_eq!(
+                (title.as_str(), msg.as_str()),
+                ("Delete", "Delete context \"fake2\"?")
+            );
+            on_ok
+        }
+        _ => panic!("expected the delete confirm"),
+    };
+    on_ok(&mut ctx);
+    until(&mut c, &mut ctx, &mut rx, is_custom).await;
+    assert!(acc.calls().contains(&"delete_context fake2".to_string()));
+}
+
+#[tokio::test]
+async fn zero_key_needs_cluster_wide_namespace_list() {
+    let f = FakeAccessor::new();
+    f.add("v1/pods", pod("default", "a", "Running"));
+    f.denied
+        .lock()
+        .unwrap()
+        .push(("v1/namespaces".into(), String::new()));
+    let (mut ctx, mut rx) = context(Arc::new(f));
+    let mut b = open(&mut ctx, "v1/pods");
+    loaded(&mut b, &mut ctx, &mut rx).await;
+    while visible_hints(&b).contains(&("0".into(), "all".into())) {
+        until(&mut b, &mut ctx, &mut rx, is_custom).await;
+    }
+    // browser.go namespaceActions: no `0` all; favorites start at `0`.
+    let h = visible_hints(&b);
+    assert!(h.contains(&("0".into(), "default".into())), "{h:?}");
+    assert!(h.contains(&("1".into(), "kube-system".into())), "{h:?}");
+}
+
+#[tokio::test]
+async fn typed_filter_lands_on_the_next_refresh() {
+    let (mut ctx, mut rx) = context(fake());
+    let mut b = open(&mut ctx, "v1/pods");
+    loaded(&mut b, &mut ctx, &mut rx).await;
+    let all = ids(&b).len();
+    // ui.Table filters on its next model refresh, not per keystroke.
+    b.on_filter_typing("b", &mut ctx);
+    assert_eq!(ids(&b).len(), all);
+    assert_eq!(b.filter_text(), "");
+    assert_eq!(b.title(), format!(" pods(default)[{all}] "));
+    // keyEntryDelay (100ms) later Table.Filter retitles with the old count.
+    let t = std::time::Instant::now();
+    until(&mut b, &mut ctx, &mut rx, is_custom).await;
+    assert!(t.elapsed() >= Duration::from_millis(90));
+    assert_eq!(b.title(), format!(" pods(default)[{all}] </b> "));
+    assert_eq!(ids(&b).len(), all);
+    b.on_event(&AppEvent::Tick, &mut ctx);
+    assert_eq!(ids(&b), vec!["default/b"]);
+    assert_eq!(b.title(), " pods(default)[1] </b> ");
+    // Enter applies at once.
+    b.on_filter("running", &mut ctx);
+    assert_eq!(ids(&b), vec!["default/a"]);
+}
+
+#[tokio::test]
+async fn copy_flashes_clipboard_errors() {
+    let (mut ctx, mut rx) = context(fake());
+    let g = Gvr::parse("v1/pods");
+    let kind = kind_for(&g);
+    let meta = meta_for(kind, &g, &ctx.resources).unwrap();
+    let mut d = deps();
+    d.clipboard = |_| Err(anyhow::anyhow!("clipboard unavailable"));
+    let mut b = Browser::new(&mut ctx, g, kind, meta, d, Opts::default());
+    loaded(&mut b, &mut ctx, &mut rx).await;
+    // table.go cpCmd: flash.Err on a failed write, no success flash.
+    let cmds = b.handle_key(key('c'), &mut ctx);
+    assert_eq!(
+        flashes(&cmds),
+        vec![(FlashLevel::Err, "clipboard unavailable".to_string())]
+    );
+}
+
+#[tokio::test]
+async fn namespace_and_danger_keys_need_a_connection() {
+    let (mut ctx, mut rx) = context(fake());
+    ctx.con_ok = false;
+    let mut b = open(&mut ctx, "v1/pods");
+    loaded(&mut b, &mut ctx, &mut rx).await;
+    // browser.go refreshActions: namespaceActions and edit/delete need ConOK.
+    let h = visible_hints(&b);
+    assert!(
+        !h.iter()
+            .any(|(m, _)| m == "0" || m == "w" || m == "e" || m == "ctrl-d"),
+        "{h:?}"
+    );
+    assert!(has_hint(&b, "d", "Describe"));
+}
+
+/// views.go getVS via table.go Start: `gvr@ns-regex` keys win for matching
+/// namespaces, the alias form is tried before the gvr, and the setting is
+/// re-resolved when the view starts again in another namespace.
+#[tokio::test]
+async fn namespace_scoped_custom_views() {
+    let (mut ctx, _rx) = context(fake());
+    let vs = |c: &[&str]| crate::config::ViewSetting {
+        columns: c.iter().map(|s| s.to_string()).collect(),
+        sort_column: String::new(),
+    };
+    ctx.views.views.insert("v1/pods".into(), vs(&["NAME"]));
+    ctx.views
+        .views
+        .insert("v1/pods@kube-.*".into(), vs(&["NAME", "IP"]));
+    let b = open_opts(
+        &mut ctx,
+        "v1/pods",
+        Opts {
+            ns: Some("default".into()),
+            ..Default::default()
+        },
+    );
+    assert_eq!(b.view_setting.as_ref().unwrap().columns, ["NAME"]);
+    let mut b = open_opts(
+        &mut ctx,
+        "v1/pods",
+        Opts {
+            ns: Some("kube-system".into()),
+            ..Default::default()
+        },
+    );
+    assert_eq!(b.view_setting.as_ref().unwrap().columns, ["NAME", "IP"]);
+    b.set_namespace("default");
+    assert!(b.apply_view_setting(&ctx));
+    assert_eq!(b.view_setting.as_ref().unwrap().columns, ["NAME"]);
+    // A setting keyed by the typed alias.
+    ctx.views.views.insert("po".into(), vs(&["AGE"]));
+    let b = open_opts(
+        &mut ctx,
+        "v1/pods",
+        Opts {
+            alias: "po".into(),
+            ..Default::default()
+        },
+    );
+    assert_eq!(b.view_setting.as_ref().unwrap().columns, ["AGE"]);
+}
+
+/// ui.useFullGVRTitle shows `apps/v1/deployments` instead of `deployments`.
+#[tokio::test]
+async fn full_gvr_title() {
+    let (mut ctx, _rx) = context(fake());
+    let b = open(&mut ctx, "apps/v1/deployments");
+    assert_eq!(b.title_parts().0, "deployments");
+    ctx.config.write().unwrap().k9s.ui.use_full_gvr_name = true;
+    let b = open(&mut ctx, "apps/v1/deployments");
+    assert_eq!(b.title_parts().0, "apps/v1/deployments");
+    let b = open(&mut ctx, "v1/pods");
+    assert_eq!(b.title_parts().0, "v1/pods");
+}
+
+/// exec.go k9sShellPod: imagePullPolicy and imagePullSecrets from shellPod.
+#[test]
+fn shell_pod_pull_settings() {
+    let mut cfg = crate::config::ShellPod {
+        image: "busybox:1.37.0".into(),
+        namespace: "default".into(),
+        ..Default::default()
+    };
+    let m = super::actions::shell_pod_manifest("n1", "k9rs-shell-1", &cfg);
+    assert!(m.pointer("/spec/imagePullSecrets").is_none());
+    assert!(m.pointer("/spec/containers/0/imagePullPolicy").is_none());
+    cfg.image_pull_policy = "IfNotPresent".into();
+    cfg.image_pull_secrets = vec![crate::config::k9s::LocalObjectReference { name: "reg".into() }];
+    let m = super::actions::shell_pod_manifest("n1", "k9rs-shell-1", &cfg);
+    assert_eq!(m.pointer("/spec/imagePullSecrets/0/name").unwrap(), "reg");
+    assert_eq!(
+        m.pointer("/spec/containers/0/imagePullPolicy").unwrap(),
+        "IfNotPresent"
+    );
+    assert_eq!(
+        m.pointer("/spec/containers/0/resources/limits/cpu")
+            .unwrap(),
+        "100m"
+    );
+}
+
+/// vul_extender.go: `v`/`shift-v` only with imageScans.enable; `v` opens the
+/// scans view for the selection (no rows without a scanner).
+#[tokio::test]
+async fn vulnerability_keys_and_scans_view() {
+    let (mut ctx, mut rx) = context(fake());
+    let mut p = open(&mut ctx, "v1/pods");
+    loaded(&mut p, &mut ctx, &mut rx).await;
+    assert!(!has_hint(&p, "v", "Show Vulnerabilities"));
+    ctx.config.write().unwrap().k9s.image_scans.enable = true;
+    let mut p = open(&mut ctx, "v1/pods");
+    loaded(&mut p, &mut ctx, &mut rx).await;
+    assert!(visible_hints(&p).contains(&("v".into(), "Show Vulnerabilities".into())));
+    assert!(has_hint(&p, "shift-v", "Sort Vulnerabilities"));
+    assert!(!visible_hints(&p).iter().any(|(m, _)| m == "shift-v"));
+    let mut v = pushed_browser(p.handle_key(key('v'), &mut ctx));
+    v.start(&mut ctx);
+    let sc = v.as_any_mut().downcast_mut::<Browser>().unwrap();
+    assert_eq!(sc.gvr().to_string(), "scans");
+    until(sc, &mut ctx, &mut rx, is_data).await;
+    let names: Vec<String> = sc
+        .renderer
+        .header("")
+        .iter()
+        .map(|h| h.name.clone())
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "SEVERITY",
+            "VULNERABILITY",
+            "IMAGE",
+            "LIBRARY",
+            "VERSION",
+            "FIXED-IN",
+            "TYPE"
+        ]
+    );
+    assert_eq!(sc.table.sort.name, "SEVERITY");
+    assert_eq!(sc.path, "default/a", "the title shows the scanned resource");
+    assert!(has_hint(sc, "shift-l", "Sort Lib") && has_hint(sc, "shift-f", "Sort Fixed-in"));
+    assert!(!has_hint(sc, "shift-a", "Sort Age"));
+}
+
+#[test]
+fn cve_urls() {
+    assert_eq!(
+        super::actions::cve_url("img|lib|1|2|apk|CVE-1|SEV-1").as_deref(),
+        Some("https://nvd.nist.gov/vuln/detail/CVE-1")
+    );
+    assert_eq!(
+        super::actions::cve_url("img|lib|1|2|npm|GHSA-x|SEV-2").as_deref(),
+        Some("https://github.com/advisories/GHSA-x")
+    );
+    assert_eq!(super::actions::cve_url("img|lib"), None);
+}
+
+/// logs_extender.go showLogs: CanForResource(ns, pods, list) gates the view.
+#[tokio::test]
+async fn logs_need_pod_list_access() {
+    let f = fake();
+    f.denied
+        .lock()
+        .unwrap()
+        .push(("v1/pods".into(), "default".into()));
+    let (mut ctx, mut rx) = context(f);
+    let mut p = open(&mut ctx, "apps/v1/deployments");
+    loaded(&mut p, &mut ctx, &mut rx).await;
+    p.handle_key(key('l'), &mut ctx);
+    let cmds = until(&mut p, &mut ctx, &mut rx, |e| {
+        matches!(e, AppEvent::Error { .. })
+    })
+    .await;
+    assert_eq!(
+        flashes(&cmds),
+        vec![(
+            FlashLevel::Err,
+            "[list] access denied on resource \"default\":\"v1/pods\"".to_string()
+        )]
+    );
+}
+
+/// exec.go pipe errors as k9s flashes them after a shell/attach/edit.
+#[cfg(unix)]
+#[test]
+fn exec_failure_text_like_go() {
+    use std::os::unix::process::ExitStatusExt;
+    let st = std::process::ExitStatus::from_raw(1 << 8);
+    assert_eq!(
+        super::exec_failure(&st).as_deref(),
+        Some("command failed. Check k9rs logs: exit status 1")
+    );
+    assert_eq!(
+        super::exec_failure(&std::process::ExitStatus::from_raw(0)),
+        None
+    );
+    // Killed by a signal: no error.
+    assert_eq!(
+        super::exec_failure(&std::process::ExitStatus::from_raw(9)),
+        None
+    );
+}
+
+/// helm_history.go: ids without `:revision` flash on Enter; a non-numeric
+/// revision fails the rollback like strconv.Atoi.
+#[tokio::test]
+async fn helm_history_bad_revision_ids() {
+    let (mut ctx, mut rx) = context(fake());
+    let mut h = open_opts(
+        &mut ctx,
+        "helm-history",
+        Opts {
+            path: "default/web".into(),
+            ..Default::default()
+        },
+    );
+    let cmds = h.helm_values(Some("default/web".into()), &ctx);
+    assert_eq!(
+        flashes(&cmds),
+        vec![(
+            FlashLevel::Err,
+            "unable to parse version in \"default/web\"".to_string()
+        )]
+    );
+    assert_eq!(h.helm_target("default/web:x:y").1.as_deref(), Some(""));
+    let on_ok = match h
+        .helm_rollback(Some("default/web".into()), &ctx)
+        .into_iter()
+        .next()
+    {
+        Some(ViewCmd::Dialog(Dialog::Confirm { on_ok, .. })) => on_ok,
+        _ => panic!("expected rollback confirm"),
+    };
+    on_ok(&mut ctx);
+    let cmds = until(&mut h, &mut ctx, &mut rx, |e| {
+        matches!(e, AppEvent::Error { .. })
+    })
+    .await;
+    assert_eq!(
+        flashes(&cmds),
+        vec![(
+            FlashLevel::Err,
+            "could not convert revision to a number: strconv.Atoi: parsing \"\": invalid syntax"
+                .to_string()
+        )]
+    );
+}
+
+/// crd.go showCRD: Enter runs the CRD name as a command.
+#[tokio::test]
+async fn crd_enter_runs_name_as_command() {
+    let f = fake();
+    f.add(
+        "apiextensions.k8s.io/v1/customresourcedefinitions",
+        obj(json!({"apiVersion": "apiextensions.k8s.io/v1", "kind": "CustomResourceDefinition",
+            "metadata": {"name": "certificates.cert-manager.io"},
+            "spec": {"group": "cert-manager.io", "names": {"plural": "certificates", "kind": "Certificate"},
+                "scope": "Namespaced", "versions": [{"name": "v1", "served": true, "storage": true}]}})),
+    );
+    let (mut ctx, mut rx) = context(f);
+    let mut c = open(
+        &mut ctx,
+        "apiextensions.k8s.io/v1/customresourcedefinitions",
+    );
+    loaded(&mut c, &mut ctx, &mut rx).await;
+    let cmds = c.handle_key(code(KeyCode::Enter), &mut ctx);
+    assert!(
+        matches!(&cmds[..], [ViewCmd::Goto { cmd, path }] if cmd == "certificates.cert-manager.io" && path.is_empty()),
+        "{:?}",
+        cmds.len()
+    );
+}
+
+#[tokio::test]
+async fn clashing_hotkey_warns_on_the_logo() {
+    let (mut ctx, mut rx) = context(fake());
+    ctx.hotkeys.hot_keys.insert(
+        "dup".into(),
+        crate::config::HotKey {
+            short_cut: "d".into(),
+            command: "svc".into(),
+            ..Default::default()
+        },
+    );
+    let mut b = open(&mut ctx, "v1/pods");
+    // hotKeyActions: "duplicate hotkey" -> Logo().Warn on refreshActions.
+    let cmds = loaded(&mut b, &mut ctx, &mut rx).await;
+    assert!(cmds
+        .iter()
+        .any(|c| matches!(c, ViewCmd::LogoWarn(m) if m == "HotKeys load failed!")));
+    assert!(has_hint(&b, "d", "Describe"), "the view key stays");
+    ctx.hotkeys.hot_keys.get_mut("dup").unwrap().override_ = true;
+    b.handle_key(ctrl_key('r'), &mut ctx);
+    let cmds = until(&mut b, &mut ctx, &mut rx, is_data).await;
+    assert!(!cmds.iter().any(|c| matches!(c, ViewCmd::LogoWarn(_))));
+}
+
+/// Table-view plugins share exec.go's pipe handling: each pipe is split on
+/// spaces and quoted (no shell expansion); pipes under 2 tokens are dropped.
+#[tokio::test]
+async fn plugin_pipes_like_k9s() {
+    let (mut ctx, mut rx) = context(fake());
+    ctx.plugins.plugins.insert(
+        "p".into(),
+        crate::config::Plugin {
+            scopes: vec!["po".into()],
+            short_cut: "Shift-T".into(),
+            description: "Pipe".into(),
+            command: "echo".into(),
+            args: vec!["$NAME".into()],
+            pipes: vec!["grep $HOME".into(), "bad".into()],
+            ..Default::default()
+        },
+    );
+    ctx.aliases.aliases.insert("po".into(), "v1/pods".into());
+    let mut b = open(&mut ctx, "v1/pods");
+    loaded(&mut b, &mut ctx, &mut rx).await;
+    let cmds = b.handle_key(key('T'), &mut ctx);
+    let [ViewCmd::Suspend { argv, .. }] = cmds.as_slice() else {
+        panic!("expected suspend");
+    };
+    assert_eq!(argv[0], "sh");
+    assert_eq!(argv[2], "echo a | 'grep' '$HOME'");
+}
+
+/// exec.go oneShoot: a failed command keeps its output and Go's exit text
+/// (dir.go shows both in "Applied Manifest").
+#[tokio::test]
+async fn runner_failure_keeps_output() {
+    let run = super::default_runner();
+    let e = run(
+        vec![
+            "sh".into(),
+            "-c".into(),
+            "echo out; echo err >&2; exit 3".into(),
+        ],
+        vec![],
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(e.to_string(), "err");
+    let f = e.downcast_ref::<super::RunFailed>().unwrap();
+    assert_eq!(
+        (f.status.as_str(), f.output.as_str()),
+        ("exit status 3", "out\nerr")
+    );
+}
+
+/// dao.ReplicaSet.Rollback -> kubectl DeploymentRollbacker: JSON patch of the
+/// template (hash label dropped) and annotations; skip when current.
+#[tokio::test]
+async fn rs_rollback_like_kubectl() {
+    let f = FakeAccessor::new();
+    let owner = json!([{"apiVersion": "apps/v1", "kind": "Deployment", "name": "web", "uid": "dp-1", "controller": true}]);
+    let tpl = |img: &str, hash: &str| {
+        json!({"metadata": {"labels": {"app": "web", "pod-template-hash": hash}},
+        "spec": {"containers": [{"name": "c", "image": img}]}})
+    };
+    f.add("apps/v1/deployments", obj(json!({"apiVersion": "apps/v1", "kind": "Deployment",
+        "metadata": {"name": "web", "namespace": "default", "uid": "dp-1",
+            "annotations": {"deployment.kubernetes.io/revision": "2", "keep": "dp"}},
+        "spec": {"selector": {"matchLabels": {"app": "web"}},
+            "template": {"metadata": {"labels": {"app": "web"}}, "spec": {"containers": [{"name": "c", "image": "v2"}]}}}})));
+    for (n, rev, img, replicas) in [
+        ("web-1", "1", "v1", 0),
+        ("web-2", "2", "v2", 0),
+        ("web-3", "3", "v3", 1),
+    ] {
+        f.add("apps/v1/replicasets", obj(json!({"apiVersion": "apps/v1", "kind": "ReplicaSet",
+            "metadata": {"name": n, "namespace": "default", "labels": {"app": "web"}, "ownerReferences": owner,
+                "annotations": {"deployment.kubernetes.io/revision": rev, "from": n}},
+            "spec": {"template": tpl(img, n)}, "status": {"replicas": replicas}})));
+    }
+    let f = Arc::new(f);
+    let acc = || -> crate::k8s::SharedAccessor { f.clone() };
+    super::actions::rollback_rs(acc(), "default/web-1".into())
+        .await
+        .unwrap();
+    let calls = f.calls();
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    let patch: serde_json::Value = serde_json::from_str(
+        calls[0]
+            .strip_prefix("patch_json apps/v1/deployments default/web ")
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        patch,
+        json!([
+            {"op": "replace", "path": "/spec/template", "value":
+                {"metadata": {"labels": {"app": "web"}}, "spec": {"containers": [{"name": "c", "image": "v1"}]}}},
+            {"op": "replace", "path": "/metadata/annotations", "value":
+                {"deployment.kubernetes.io/revision": "2", "from": "web-1"}},
+        ])
+    );
+    // Revision 2 already matches the deployment template: skipped, no patch.
+    super::actions::rollback_rs(acc(), "default/web-2".into())
+        .await
+        .unwrap();
+    assert_eq!(f.calls().len(), 1);
+    // A replica set with live replicas is the current one.
+    let e = super::actions::rollback_rs(acc(), "default/web-3".into())
+        .await
+        .unwrap_err();
+    assert_eq!(e.to_string(), "can not rollback current replica");
 }

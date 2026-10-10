@@ -21,3 +21,4 @@ pub mod model;
 pub mod render;
 pub mod ui;
 pub mod version;
+pub mod vul;

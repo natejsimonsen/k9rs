@@ -1,6 +1,7 @@
 //! Resolved UI styles (shared contract). `Default` is the k9s built-in skin
-//! (config/styles.go newStyle). tcell's 16 basic color names map to the
-//! terminal palette (ratatui named colors); every other name is exact RGB.
+//! (config/styles.go newStyle). Skin colors are always exact RGB, even the
+//! 16 basic names (config.Color.Color() is GetColor(..).TrueColor()); the
+//! screen fits them to the palette when the terminal lacks 24-bit color.
 
 use ratatui::style::{Color, Style};
 
@@ -109,15 +110,15 @@ const fn rgb(hex: u32) -> Color {
     Color::Rgb((hex >> 16) as u8, (hex >> 8) as u8, hex as u8)
 }
 
-// tcell basic palette names.
-const BLACK: Color = Color::Black;
-const GREEN: Color = Color::Green;
-const GRAY: Color = Color::DarkGray;
-const RED: Color = Color::LightRed;
-const YELLOW: Color = Color::LightYellow;
-const FUCHSIA: Color = Color::LightMagenta;
-const AQUA: Color = Color::LightCyan;
-const WHITE: Color = Color::White;
+// tcell basic names, as TrueColor() values.
+const BLACK: Color = rgb(0x000000);
+const GREEN: Color = rgb(0x008000);
+const GRAY: Color = rgb(0x808080);
+const RED: Color = rgb(0xFF0000);
+const YELLOW: Color = rgb(0xFFFF00);
+const FUCHSIA: Color = rgb(0xFF00FF);
+const AQUA: Color = rgb(0x00FFFF);
+const WHITE: Color = rgb(0xFFFFFF);
 // W3C extended names (exact RGB, as tcell).
 const CADETBLUE: Color = rgb(0x5F9EA0);
 const DARKSLATEBLUE: Color = rgb(0x483D8B);

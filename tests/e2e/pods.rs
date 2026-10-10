@@ -86,18 +86,25 @@ async fn jump_owner_and_show_node() {
 async fn port_forward_flow() {
     let mut h = on_nginx().await;
     h.key(shift('F')).await;
-    let Dialog::PortForward { spec, ports, on_ok } = h.take_dialog() else {
+    let Dialog::PortForward {
+        mut spec,
+        ports,
+        prefill,
+        on_ok,
+    } = h.take_dialog()
+    else {
         panic!("expected the port-forward dialog")
     };
     assert_eq!(spec.namespace, "default");
     assert_eq!(spec.pod, "nginx-7d9c5b8f4-abcde");
     assert_eq!(spec.container, "nginx");
-    assert_eq!(spec.container_port, 80);
+    assert_eq!(prefill, ("nginx::80".to_string(), "80".to_string()));
     assert!(
         ports.iter().any(|p| p.starts_with("nginx::80")),
         "{ports:?}"
     );
-    let cmds = on_ok(&mut h.ctx, spec);
+    (spec.container_port, spec.local_port) = (80, 80);
+    let cmds = on_ok(&mut h.ctx, vec![spec]);
     h.apply(cmds);
     h.settle().await;
     assert_eq!(
@@ -112,7 +119,8 @@ async fn port_forward_flow() {
     let s = h.render();
     let y = s.row_of("nginx-7d9c5b8f4-abcde").unwrap();
     let (x, _) = s.find("Ⓕ").expect("pf indicator");
-    assert_eq!(s.fg_at(x, y), color("orange"));
+    // `[orange::b]` markup: tcell named color, palette 214 (not skin RGB).
+    assert_eq!(s.fg_at(x, y), ratatui::style::Color::Indexed(214));
     h.code(KeyCode::Down).await;
     h.press('f').await;
     assert_eq!(

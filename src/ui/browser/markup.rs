@@ -180,15 +180,17 @@ pub(crate) fn styled_spans(s: &str, base: Style) -> Vec<Span<'static>> {
     spans
 }
 
-/// tcell color names (W3C) → ratatui colors. The 16 basic names follow the
-/// terminal palette mapping used by `config::styles`.
+/// tcell color names → ratatui colors (tview markup): the 16 basic names
+/// are palette colors, W3C names palette fits (palette::named), `#rrggbb`
+/// exact RGB.
 pub(crate) fn color_by_name(name: &str) -> Option<Color> {
     let n = name.to_ascii_lowercase();
     if let Some(hex) = n.strip_prefix('#') {
         let v = u32::from_str_radix(hex, 16).ok()?;
         return Some(Color::Rgb((v >> 16) as u8, (v >> 8) as u8, v as u8));
     }
-    let rgb = |v: u32| Some(Color::Rgb((v >> 16) as u8, (v >> 8) as u8, v as u8));
+    // W3C names are tcell named colors, fitted to the 256 palette.
+    let rgb = |v: u32| Some(crate::ui::shell::palette::named(v));
     match n.as_str() {
         "default" | "transparent" => Some(Color::Reset),
         "black" => Some(Color::Black),

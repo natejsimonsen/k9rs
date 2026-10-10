@@ -69,6 +69,11 @@ impl Prompt {
         }
     }
 
+    /// Blank the shown suggestion, keeping the list (CmdBuff.ClearText).
+    pub fn hide_suggestion(&mut self) {
+        self.suggestion.clear();
+    }
+
     fn next_suggestion(&mut self) -> Option<String> {
         if self.suggestions.is_empty() {
             return None;
@@ -234,7 +239,14 @@ impl Prompt {
                     .bg(styles.prompt_bg),
             ),
         ];
-        draw_segs(buf, x, y, w, &segs, Align::Left, false);
+        // The prompt TextView word-wraps (SetWordWrap) in its one-row box:
+        // only the first wrapped line shows.
+        let plain: String = segs.iter().map(|s| s.text.as_str()).collect();
+        let first = super::text::word_wrap(&plain, w as usize)
+            .first()
+            .map(|l| width(l))
+            .unwrap_or(0);
+        draw_segs(buf, x, y, w.min(first as u16), &segs, Align::Left, false);
         let spacer = if no_icons { 3 } else { 4 };
         let cx = (x as usize + spacer + width(&self.text))
             .min((area.right().saturating_sub(2)) as usize);
@@ -299,6 +311,22 @@ mod tests {
             p.handle_key(key(KeyCode::Char('\u{7}'))),
             PromptAction::None
         );
+    }
+
+    #[test]
+    fn long_input_shows_the_first_wrapped_line() {
+        let st = Styles::default();
+        let draw = |text: &str| {
+            let p = Prompt::new(PromptKind::Filter, text);
+            let mut buf = Buffer::empty(Rect::new(0, 0, 24, 3));
+            let a = buf.area;
+            p.draw(&mut buf, a, &st, false);
+            row(&buf, 1)
+        };
+        // TextView word wrap: a word too long for the line moves down whole.
+        assert_eq!(draw(&"a".repeat(30)), "│ 🐩/                  │");
+        assert_eq!(draw("abc defg hijklmnopqrstu"), "│ 🐩/ abc defg         │");
+        assert_eq!(draw("abc"), "│ 🐩/ abc              │");
     }
 
     #[test]

@@ -44,6 +44,7 @@ pub(crate) enum Kind {
     HelmHistory,
     Workload,
     Reference,
+    ImageScan,
 }
 
 /// Resolve the viewer kind for a GVR.
@@ -86,6 +87,7 @@ pub(crate) fn kind_for(gvr: &Gvr) -> Kind {
         "helm-history" => Kind::HelmHistory,
         "workloads" => Kind::Workload,
         "references" => Kind::Reference,
+        "scans" => Kind::ImageScan,
         _ => Kind::Generic,
     }
 }
@@ -142,8 +144,8 @@ const SCALABLE: &[&str] = &[
     "apps/v1/deployments",
     "apps/v1/statefulsets",
     "apps/v1/replicasets",
+    // k9s RcGVR is apps/v1/replicationcontrollers, so core v1 rc never scales.
     "apps/v1/replicationcontrollers",
-    "v1/replicationcontrollers",
 ];
 
 const CLUSTER_SCOPED: &[&str] = &[
@@ -219,6 +221,7 @@ pub(crate) fn meta_for(kind: Kind, gvr: &Gvr, resources: &[ResourceMeta]) -> Opt
         Kind::Workload => Meta::pseudo("Workload", true, None),
         Kind::Dir => Meta::pseudo("Dir", false, None),
         Kind::Reference => Meta::pseudo("References", false, Some(&[])),
+        Kind::ImageScan => Meta::pseudo("Scans", false, Some(&[])),
         Kind::Alias => Meta::pseudo("Aliases", false, Some(&[])),
         Kind::Context => Meta::pseudo("Contexts", false, Some(&[])),
         Kind::ScreenDump => Meta::pseudo("ScreenDumps", false, Some(&["delete"])),
@@ -245,13 +248,14 @@ pub(crate) fn meta_for(kind: Kind, gvr: &Gvr, resources: &[ResourceMeta]) -> Opt
         _ => {
             let scalable = SCALABLE.contains(&gvr.to_string().as_str());
             if let Some(rm) = resources.iter().find(|m| &m.gvr == gvr) {
+                // dao.IsScalable: the "scale" category (incl. CRDs with /scale).
                 return Some(Meta {
                     kind: rm.kind.clone(),
                     namespaced: rm.namespaced,
                     verbs: Some(rm.verbs.clone()),
                     k9s: false,
                     helm: false,
-                    scalable,
+                    scalable: scalable || rm.categories.iter().any(|c| c == "scale"),
                 });
             }
             if !resources.is_empty() || gvr.is_non_resource() {

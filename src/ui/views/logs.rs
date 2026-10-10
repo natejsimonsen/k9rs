@@ -45,6 +45,8 @@ pub(crate) struct LogItem {
     ts: Option<String>,
     text: String,
     is_error: bool,
+    /// No trailing newline: the next item continues this screen line.
+    partial: bool,
 }
 
 /// dao.LogItems + model.Log state.
@@ -95,7 +97,7 @@ impl LogModel {
         c
     }
 
-    fn render(&mut self, index: usize, show_time: bool, s: &Styles) -> Vec<SLine> {
+    fn render(&mut self, index: usize, show_time: bool, s: &Styles) -> Vec<RLine> {
         let base = log_base(s);
         let items: Vec<LogItem> = self.items.get(index..).unwrap_or_default().to_vec();
         items
@@ -107,7 +109,7 @@ impl LogModel {
                     it.pod.clone()
                 };
                 let paint = self.color_for(&id, base.fg.unwrap_or(Color::Reset));
-                render_item(it, paint, show_time, base)
+                (render_item(it, paint, show_time, base), it.partial)
             })
             .collect()
     }
@@ -118,10 +120,10 @@ impl LogModel {
         index: usize,
         show_time: bool,
         s: &Styles,
-    ) -> anyhow::Result<Vec<SLine>> {
+    ) -> anyhow::Result<Vec<RLine>> {
         let q = self.filter.clone();
         let lines = self.render(index, show_time, s);
-        let texts: Vec<String> = lines.iter().map(|l| util::plain(l)).collect();
+        let texts: Vec<String> = lines.iter().map(|(l, _)| util::plain(l)).collect();
         let mut hits: Vec<(usize, Vec<usize>)> = Vec::new();
         if let Some(f) = util::fuzzy_selector(&q) {
             let f = f.trim().to_string();
@@ -155,7 +157,7 @@ impl LogModel {
         let base = log_base(s);
         Ok(hits
             .into_iter()
-            .map(|(i, ii)| highlight(&lines[i], &ii, base))
+            .map(|(i, ii)| (highlight(&lines[i].0, &ii, base), lines[i].1))
             .collect())
     }
 }
@@ -163,6 +165,9 @@ impl LogModel {
 fn log_base(s: &Styles) -> Style {
     Style::default().fg(s.logs_fg).bg(s.logs_bg)
 }
+
+/// A rendered item and whether it lacks its trailing newline.
+type RLine = (SLine, bool);
 
 /// dao.LogItem.Render.
 fn render_item(it: &LogItem, paint: Color, show_time: bool, base: Style) -> SLine {
@@ -482,6 +487,8 @@ pub(crate) struct LogsView {
     id: ViewId,
     namespace: String,
     pod: String,
+    /// LogOptions.view_path: the workload/service the logs belong to.
+    view_path: Option<String>,
     container: Option<String>,
     default_container: Option<String>,
     has_default: bool,
@@ -539,6 +546,7 @@ impl LogsView {
             id: ctx.new_view_id(),
             namespace: opts.namespace.clone(),
             pod: opts.path.clone(),
+            view_path: opts.view_path.clone(),
             default_container: opts.default_container.clone().or_else(|| container.clone()),
             container,
             has_default,
@@ -551,7 +559,8 @@ impl LogsView {
             show_time: logger.show_time,
             autoscroll: !logger.disable_autoscroll,
             follow: !logger.disable_autoscroll,
-            column_lock: false,
+            // log_indicator.go: logger.columnLock.
+            column_lock: logger.column_lock,
             fullscreen: cfg.ui.defaults_to_full_screen,
             request_one_refresh: false,
             waiting: true,
@@ -578,17 +587,15 @@ impl LogsView {
             .fg(util::color_by_name("orange").unwrap_or(Color::Yellow))
             .add_modifier(Modifier::DIM);
         self.pane.set_lines(vec![vec![Seg::new(LOG_MESSAGE, st)]]);
+        // SetText("[orange::d]" + logMessage): no newline.
+        self.pane.trailing_newline = false;
     }
 
+    /// model.Log.GetPath: the resource path (title, dump file name).
     fn path(&self) -> String {
-        fqn(&self.namespace, &self.pod)
-    }
-
-    /// dao.LogOptions.Info.
-    fn info(&self) -> String {
-        match &self.container {
-            Some(c) => format!("{} ({c})", self.path()),
-            None => self.path(),
+        match &self.view_path {
+            Some(p) => p.clone(),
+            None => fqn(&self.namespace, &self.pod),
         }
     }
 
@@ -610,6 +617,7 @@ impl LogsView {
             previous: self.previous,
             show_timestamp: true,
             follow: !self.head,
+            view_path: self.view_path.clone(),
         }
     }
 
@@ -655,16 +663,17 @@ impl LogsView {
     fn log_cleared(&mut self) {
         self.waiting = false;
         self.pane.clear();
+        self.pane.trailing_newline = true;
     }
 
     /// Log.Flush.
-    fn flush(&mut self, lines: Vec<SLine>) {
+    fn flush(&mut self, lines: Vec<RLine>) {
         if lines.is_empty() || (!self.request_one_refresh && !self.autoscroll) {
             return;
         }
         self.request_one_refresh = false;
-        for l in lines {
-            self.pane.append(l);
+        for (l, partial) in lines {
+            self.write(l, partial);
         }
         if self.follow {
             if self.column_lock {
@@ -676,10 +685,21 @@ impl LogsView {
     }
 
     /// Log.LogChanged.
-    fn log_changed(&mut self, lines: Vec<SLine>) {
+    /// ansiWriter.Write: an item continues the previous screen line when
+    /// that one had no newline.
+    fn write(&mut self, l: SLine, partial: bool) {
+        match self.pane.lines.last_mut() {
+            Some(last) if !self.pane.trailing_newline => last.extend(l),
+            _ => self.pane.append(l),
+        }
+        self.pane.trailing_newline = !partial;
+    }
+
+    fn log_changed(&mut self, lines: Vec<RLine>) {
         if self.waiting {
             self.waiting = false;
             self.pane.clear();
+            self.pane.trailing_newline = true;
         }
         self.flush(lines);
     }
@@ -689,9 +709,11 @@ impl LogsView {
         if self.waiting {
             self.waiting = false;
             self.pane.clear();
+            self.pane.trailing_newline = true;
         }
         let st = log_base(&self.styles).fg(Color::Red);
-        self.pane.append(vec![Seg::new(err.to_string(), st)]);
+        // Written without a newline (LogFailed).
+        self.write(vec![Seg::new(err.to_string(), st)], true);
         vec![util::flash(FlashLevel::Err, err.to_string())]
     }
 
@@ -744,10 +766,12 @@ impl LogsView {
                 String::new()
             },
             container: l.container.clone(),
-            single: self.single,
+            // Multi-pod logs decide per pod (podLogs -> Pod.TailLogs).
+            single: if self.multi { l.single } else { self.single },
             ts: l.timestamp.clone(),
             text: l.text.trim_end_matches(['\n', '\r']).to_string(),
-            is_error: false,
+            is_error: l.is_error,
+            partial: l.partial,
         }
     }
 
@@ -831,9 +855,19 @@ impl LogsView {
         self.request_one_refresh = true;
     }
 
+    /// TextView.GetText(true): readLogs stores lines tview-escaped, and the
+    /// buffer keeps the newline after the last line.
+    fn export_text(&self) -> String {
+        let mut t = super::details::tview_escape(&self.pane.text());
+        if self.pane.trailing_newline && !self.pane.lines.is_empty() {
+            t.push('\n');
+        }
+        t
+    }
+
     fn save(&self, ctx: &Ctx) -> ViewCmd {
         let dir = util::screen_dump_dir(ctx);
-        match util::save_log(&dir, &self.path(), &self.pane.text()) {
+        match util::save_log(&dir, &self.path(), &self.export_text()) {
             Ok(p) => util::flash(
                 FlashLevel::Info,
                 format!("Log {} saved successfully!", p.display()),
@@ -916,7 +950,13 @@ impl View for LogsView {
             "4" => self.since_cmd(15 * 60, ctx),
             "5" => self.since_cmd(30 * 60, ctx),
             "6" => self.since_cmd(60 * 60, ctx),
-            "enter" => self.pane.append(Vec::new()),
+            // Fprintln(ansiWriter): ends an open line, else adds a blank one.
+            "enter" => {
+                if self.pane.trailing_newline {
+                    self.pane.append(Vec::new());
+                }
+                self.pane.trailing_newline = true;
+            }
             "esc" | "q" => {
                 if self.filter.is_empty() {
                     return vec![ViewCmd::Pop];
@@ -931,7 +971,7 @@ impl View for LogsView {
             "m" => {
                 let w = (self.width as usize).saturating_sub(4);
                 let st = log_base(&self.styles).add_modifier(Modifier::BOLD);
-                self.pane.append(vec![Seg::new("-".repeat(w), st)]);
+                self.write(vec![Seg::new("-".repeat(w), st)], false);
                 self.follow = true;
                 if self.column_lock {
                     self.pane.track_end = true;
@@ -951,7 +991,11 @@ impl View for LogsView {
             }
             "w" => self.pane.wrap = !self.pane.wrap,
             "ctrl-s" => return vec![self.save(ctx)],
-            "c" => return vec![util::copy_to_clipboard(&self.pane.text())],
+            // cpCmd: sanitizeEsc(GetText(true)).
+            "c" => {
+                let text = super::details::sanitize_esc(&self.export_text());
+                return vec![util::copy_to_clipboard(&text)];
+            }
             "a" if self.has_default => {
                 self.all_containers = !self.all_containers;
                 if !self.single {
@@ -968,6 +1012,21 @@ impl View for LogsView {
                     self.follow = false;
                 }
             }
+        }
+        Vec::new()
+    }
+
+    /// tview TextView.MouseHandler: the wheel scrolls the text under the
+    /// pointer; a click only focuses (already focused here).
+    fn on_mouse(&mut self, m: crate::ui::Mouse, _area: Rect, _ctx: &mut Ctx) -> Vec<ViewCmd> {
+        match m {
+            crate::ui::Mouse::ScrollUp { x, y } => {
+                self.pane.wheel(x, y, true);
+            }
+            crate::ui::Mouse::ScrollDown { x, y } => {
+                self.pane.wheel(x, y, false);
+            }
+            crate::ui::Mouse::Click { .. } => {}
         }
         Vec::new()
     }
@@ -991,20 +1050,10 @@ impl View for LogsView {
                 self.notify()
             }
             AppEvent::LogEnd { view, error } if *view == self.id && !self.awaiting_start => {
+                // Each tail reports its own EOF as an error item; the
+                // closed channel only flushes what is left (updateLogs).
                 match error {
-                    None => {
-                        let ts =
-                            chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true);
-                        self.model.append(LogItem {
-                            pod: String::new(),
-                            container: String::new(),
-                            single: self.single,
-                            ts: Some(ts),
-                            text: format!("stream closed: EOF for {}", self.info()),
-                            is_error: true,
-                        });
-                        self.notify()
-                    }
+                    None => self.notify(),
                     Some(e) => self.log_failed(e),
                 }
             }
@@ -1088,6 +1137,7 @@ mod tests {
             container: co.into(),
             timestamp: Some(ts.into()),
             text: text.into(),
+            ..Default::default()
         }
     }
 
@@ -1163,6 +1213,10 @@ mod tests {
         assert_eq!(off.style.fg, Some(ctx.styles.log_toggle_off));
         assert!(off.style.add_modifier.contains(Modifier::DIM));
         assert_eq!(v.title(), " Logs(default/nginx)[tail] ");
+        // logger.columnLock seeds the toggle.
+        ctx.config.write().unwrap().k9s.logger.column_lock = true;
+        let v2 = LogsView::new(&mut ctx, opts(None));
+        assert!(util::plain(&v2.indicator()).contains("ColumnLock:On"));
         // A plain container choice has no AllContainers toggle; only the
         // pod's default-container annotation brings it (HasDefaultContainer).
         let v = LogsView::new(&mut ctx, opts(Some("web")));
@@ -1188,6 +1242,120 @@ mod tests {
         assert_eq!(fg_of("default/nginx"), Some(ctx.styles.title_highlight));
         assert_eq!(fg_of("web"), Some(Color::Reset));
         assert_eq!(fg_of("tail"), Some(Color::Green));
+    }
+
+    /// Head mode: the limitBytes cut leaves a line without its newline, and
+    /// readLogs' EOF error item lands on that same screen line; no flash.
+    #[tokio::test]
+    async fn partial_line_joins_eof_item_without_flash() {
+        let mut cut = line("web", "2024-01-01T00:00:00Z", "2026-10-09T0");
+        cut.partial = true;
+        let lines = vec![line("web", "2024-01-01T00:00:00Z", "hello"), cut];
+        let (mut ctx, mut rx) = setup(lines, false);
+        let mut v = LogsView::new(&mut ctx, opts(Some("web")));
+        v.start(&mut ctx);
+        let mut cmds = Vec::new();
+        loop {
+            let ev = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .expect("event")
+                .expect("open");
+            let end = matches!(ev, AppEvent::LogEnd { .. });
+            cmds.extend(v.on_event(&ev, &mut ctx));
+            if end {
+                break;
+            }
+        }
+        assert!(cmds.iter().all(|c| !matches!(c, ViewCmd::Flash(..))));
+        let b = render(&mut v, &ctx, 100, 8);
+        assert!(row(&b, 2).contains("hello"), "{}", row(&b, 2));
+        let r = row(&b, 3);
+        assert!(
+            r.contains("2026-10-09T0stream closed: EOF for default/nginx (web)"),
+            "{r}"
+        );
+        // The EOF item ends with a newline again.
+        assert!(v.pane.trailing_newline);
+    }
+
+    #[test]
+    fn export_text_is_escaped_like_get_text() {
+        let (mut ctx, _rx) = setup(vec![], false);
+        let mut v = LogsView::new(&mut ctx, opts(None));
+        v.log_cleared();
+        v.write(
+            vec![Seg::new("a=\"[x-remote-user]\" [ipv4]", Style::default())],
+            false,
+        );
+        assert_eq!(v.export_text(), "a=\"[x-remote-user[]\" [ipv4[]\n");
+        // Copy then applies the greedy sanitizeEsc.
+        assert_eq!(
+            super::super::details::sanitize_esc(&v.export_text()),
+            "a=\"[x-remote-user[]\" [ipv4]\n"
+        );
+    }
+
+    /// Workload logs: the title and dump name use the workload path, and
+    /// single-container pods get no container prefix (Pod.TailLogs).
+    #[tokio::test]
+    async fn workload_logs_use_view_path_and_per_pod_single() {
+        let f = FakeAccessor::new();
+        let mut l = line("web", "2024-01-01T00:00:00Z", "hello");
+        l.pod = "web-abc".into();
+        l.single = true;
+        f.logs
+            .lock()
+            .unwrap()
+            .insert("default/app=web".into(), vec![l]);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut ctx = Ctx::new(
+            Arc::new(f),
+            Arc::new(RwLock::new(crate::config::Config::default())),
+            Styles::default(),
+            "default".into(),
+            tx,
+        );
+        let mut o = opts(Some("web"));
+        o.path = "app=web".into();
+        o.view_path = Some("default/web".into());
+        let mut v = LogsView::new(&mut ctx, o);
+        v.start(&mut ctx);
+        pump(&mut v, &mut ctx, &mut rx).await;
+        let b = render(&mut v, &ctx, 80, 6);
+        assert!(
+            row(&b, 0).contains(" Logs(default/web:web)[tail] "),
+            "{}",
+            row(&b, 0)
+        );
+        assert!(row(&b, 2).contains("web-abc hello"), "{}", row(&b, 2));
+        assert_eq!(v.path(), "default/web");
+    }
+
+    /// log.go Init / NewLogIndicator: logger.columnLock sets the start state.
+    #[test]
+    fn column_lock_from_config() {
+        let (mut ctx, _rx) = setup(vec![], false);
+        ctx.config.write().unwrap().k9s.logger.column_lock = true;
+        let mut v = LogsView::new(&mut ctx, opts(None));
+        let b = render(&mut v, &ctx, 120, 4);
+        assert!(row(&b, 1).contains("ColumnLock:On"), "{}", row(&b, 1));
+    }
+
+    #[test]
+    fn go_rfc3339_nano_trims_zeros() {
+        use chrono::TimeZone;
+        let t = chrono::Utc
+            .timestamp_opt(1_700_000_000, 120_000_000)
+            .unwrap();
+        assert_eq!(
+            crate::k8s::types::go_rfc3339_nano(t),
+            "2023-11-14T22:13:20.12Z"
+        );
+        let t = chrono::Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+        assert_eq!(
+            crate::k8s::types::go_rfc3339_nano(t),
+            "2023-11-14T22:13:20Z"
+        );
     }
 
     #[tokio::test]

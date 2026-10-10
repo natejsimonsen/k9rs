@@ -39,6 +39,15 @@ pub struct Selection {
 }
 
 /// k8sEnv: CONTEXT, CLUSTER, USER, GROUPS, KUBECONFIG.
+/// k8sEnv GROUPS: the impersonation groups, else n/a.
+pub(crate) fn groups_env(groups: &[String]) -> String {
+    if groups.is_empty() {
+        NA_VALUE.to_string()
+    } else {
+        groups.join(",")
+    }
+}
+
 pub fn k8s_env(ctx: &Ctx) -> BTreeMap<String, String> {
     let na = |s: &str| {
         if s.is_empty() {
@@ -64,7 +73,10 @@ pub fn k8s_env(ctx: &Ctx) -> BTreeMap<String, String> {
         ("CONTEXT".to_string(), na(&context)),
         ("CLUSTER".to_string(), na(&ctx.cluster_info.cluster)),
         ("USER".to_string(), na(&ctx.cluster_info.user)),
-        ("GROUPS".to_string(), NA_VALUE.to_string()),
+        (
+            "GROUPS".to_string(),
+            groups_env(&ctx.accessor.impersonate_groups()),
+        ),
         ("KUBECONFIG".to_string(), kubeconfig),
     ])
 }
@@ -118,7 +130,7 @@ pub fn substitute(env: &BTreeMap<String, String>, arg: &str) -> String {
     let mut out = arg.to_string();
     for (all, key, inverse) in matches {
         let Some(v) = env.get(&key.to_uppercase()) else {
-            tracing::warn!(key, "no k9s environment matching key");
+            tracing::warn!(key, "no k9rs environment matching key");
             continue;
         };
         let v = match parse_go_bool(v) {
@@ -196,7 +208,7 @@ pub fn run_plugin(ctx: &Ctx, plugin: &Plugin, sel: &Selection) -> Vec<ViewCmd> {
 }
 
 /// exec.Cmd.String(): resolved binary path plus args.
-fn cmd_string(bin: &str, args: &[String]) -> String {
+pub(crate) fn cmd_string(bin: &str, args: &[String]) -> String {
     let path = which::which(bin)
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| bin.to_string());
@@ -207,8 +219,13 @@ fn cmd_string(bin: &str, args: &[String]) -> String {
     }
 }
 
+/// Single-quote for `sh` (empty tokens stay as empty args, like Go's split).
+fn sh_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
 /// argv for the plugin, piping through `pipes` via the shell when set.
-fn plugin_argv(p: &Plugin, args: &[String]) -> Vec<String> {
+pub(crate) fn plugin_argv(p: &Plugin, args: &[String]) -> Vec<String> {
     let valid: Vec<&String> = p
         .pipes
         .iter()
@@ -228,9 +245,12 @@ fn plugin_argv(p: &Plugin, args: &[String]) -> Vec<String> {
         })
         .collect::<Vec<_>>()
         .join(" ");
+    // exec.go: each pipe is split on spaces and run directly (no shell
+    // expansion), so every token is quoted for `sh`.
     for pp in valid {
         line.push_str(" | ");
-        line.push_str(pp);
+        let toks: Vec<String> = pp.split(' ').map(sh_quote).collect();
+        line.push_str(&toks.join(" "));
     }
     vec!["sh".into(), "-c".into(), line]
 }
@@ -244,6 +264,7 @@ fn launch(ctx: &Ctx, p: &Plugin, args: Vec<String>) -> Vec<ViewCmd> {
         let cmd_str = cmd_string(&p.command, &args);
         let mut cmd = tokio::process::Command::new(&argv[0]);
         cmd.args(&argv[1..])
+            .envs(crate::k8s::client::editor_env())
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
@@ -268,26 +289,7 @@ fn launch(ctx: &Ctx, p: &Plugin, args: Vec<String>) -> Vec<ViewCmd> {
                         return;
                     }
                     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-                    let mut statuses: Vec<String> = stdout
-                        .split('\n')
-                        .filter(|l| !l.is_empty())
-                        .map(|l| format!("{OUTPUT_PREFIX} {l}"))
-                        .collect();
-                    statuses.push(format!(
-                        "Command completed successfully: {}",
-                        go_quote(&truncate(&cmd_str, 20))
-                    ));
-                    let msg = if overwrite {
-                        statuses
-                            .iter()
-                            .find(|s| s.contains(OUTPUT_PREFIX))
-                            .map(|s| s.trim_start_matches(OUTPUT_PREFIX).trim().to_string())
-                    } else {
-                        statuses.last().map(|s| {
-                            format!("Plugin command launched successfully: {}", go_quote(s))
-                        })
-                    };
-                    if let Some(msg) = msg {
+                    if let Some(msg) = background_flash(&stdout, &cmd_str, overwrite) {
                         let _ = tx.send(AppEvent::Info {
                             view: SHELL_VIEW_ID,
                             msg,
@@ -301,24 +303,76 @@ fn launch(ctx: &Ctx, p: &Plugin, args: Vec<String>) -> Vec<ViewCmd> {
     let cmd_str = cmd_string(&p.command, &args);
     vec![ViewCmd::Suspend {
         argv,
-        env: Vec::new(),
+        banner: String::new(),
+        env: crate::k8s::client::editor_env(),
         on_done: Some(Box::new(move |_ctx: &mut Ctx, status| {
-            if status.success() {
-                let st = format!("Command completed successfully: {}", go_quote(&cmd_str));
-                return vec![ViewCmd::Flash(
-                    crate::ui::FlashLevel::Info,
-                    format!("Plugin command launched successfully: {}", go_quote(&st)),
-                )];
-            }
-            match status.code() {
-                // Killed by a signal: k9s ignores it.
-                None => Vec::new(),
-                Some(code) => vec![ViewCmd::Dialog(Dialog::Error {
-                    msg: format!("command failed. Check k9s logs: exit status {code}"),
-                })],
-            }
+            foreground_done(&cmd_str, status)
         })),
     }]
+}
+
+/// Background plugin flash (exec.go pipe statuses + pluginAction): every
+/// stdout line as `[output] l`, then the completion status; the last one
+/// is flashed, or the first output line alone with overwriteOutput.
+pub(crate) fn background_flash(stdout: &str, cmd_str: &str, overwrite: bool) -> Option<String> {
+    let mut statuses: Vec<String> = stdout
+        .split('\n')
+        .filter(|l| !l.is_empty())
+        .map(|l| format!("{OUTPUT_PREFIX} {l}"))
+        .collect();
+    statuses.push(format!(
+        "Command completed successfully: {}",
+        go_quote(&truncate(cmd_str, 20))
+    ));
+    if overwrite {
+        return statuses
+            .iter()
+            .find(|s| s.contains(OUTPUT_PREFIX))
+            .map(|s| s.trim_start_matches(OUTPUT_PREFIX).trim().to_string());
+    }
+    statuses
+        .last()
+        .map(|s| format!("Plugin command launched successfully: {}", go_quote(s)))
+}
+
+/// Foreground plugin exit (exec.go pipe + pluginAction).
+pub(crate) fn foreground_done(cmd_str: &str, status: std::process::ExitStatus) -> Vec<ViewCmd> {
+    if status.success() {
+        let st = format!("Command completed successfully: {}", go_quote(cmd_str));
+        return vec![ViewCmd::Flash(
+            crate::ui::FlashLevel::Info,
+            format!("Plugin command launched successfully: {}", go_quote(&st)),
+        )];
+    }
+    match status.code() {
+        // Killed by a signal: k9s ignores it.
+        None => Vec::new(),
+        Some(code) => vec![ViewCmd::Dialog(Dialog::Error {
+            msg: format!("command failed. Check k9rs logs: exit status {code}"),
+        })],
+    }
+}
+
+/// The hotkey bound to `key`, if any.
+pub(crate) fn hotkey_for_key(ctx: &Ctx, key: &KeyEvent) -> Option<crate::config::HotKey> {
+    ctx.hotkeys
+        .hot_keys
+        .values()
+        .find(|hk| parse_key(&hk.short_cut).is_some_and(|k| same_key(&k, key)))
+        .cloned()
+}
+
+/// gotoCmd(r, command, "", !keepHistory): a `:` command, keeping the view
+/// stack with keepHistory.
+pub(crate) fn hotkey_goto(command: String, keep_history: bool) -> ViewCmd {
+    if keep_history {
+        ViewCmd::Goto {
+            cmd: command,
+            path: String::new(),
+        }
+    } else {
+        ViewCmd::Command(command)
+    }
 }
 
 /// The `:` command a hotkey runs, with `$VARS` substituted (hotKeyActions).
@@ -477,10 +531,35 @@ mod tests {
         match out.as_slice() {
             [ViewCmd::Suspend { argv, .. }] => {
                 assert_eq!(argv[0], "sh");
-                assert_eq!(argv[2], "echo default nginx '$COL-STATUS' | grep nginx");
+                // Pipe tokens run as-is, like exec.go (was shell-expanded).
+                assert_eq!(argv[2], "echo default nginx '$COL-STATUS' | 'grep' 'nginx'");
             }
             _ => panic!("expected suspend"),
         }
+        p.pipes = vec!["grep it's  $HOME *".into()];
+        let out = run_plugin(&c, &p, &sel);
+        let [ViewCmd::Suspend { argv, .. }] = out.as_slice() else {
+            panic!()
+        };
+        assert!(
+            argv[2].ends_with(r#"| 'grep' 'it'\''s' '' '$HOME' '*'"#),
+            "{}",
+            argv[2]
+        );
+        assert_eq!(groups_env(&[]), "n/a");
+        assert_eq!(groups_env(&["a".into(), "b".into()]), "a,b");
+    }
+
+    #[test]
+    fn background_flash_statuses() {
+        // Last status wins: the completion line, command truncated to 20.
+        assert_eq!(
+            background_flash("a\nb\n", "/usr/bin/printenv HOME", false).unwrap(),
+            "Plugin command launched successfully: \"Command completed successfully: \\\"/usr/bin/printenv H…\\\"\""
+        );
+        // overwriteOutput: the first output line, bare.
+        assert_eq!(background_flash("a\nb\n", "x", true).as_deref(), Some("a"));
+        assert_eq!(background_flash("", "x", true), None);
     }
 
     #[cfg(unix)]

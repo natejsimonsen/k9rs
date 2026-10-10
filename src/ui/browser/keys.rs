@@ -175,9 +175,13 @@ pub(crate) enum Act {
     NodeShell,
     // misc resources
     UseNamespace,
+    RenameContext,
+    DeleteContext,
     Bench,
     Decode,
     UsedBy,
+    /// vul_extender.go showVulCmd.
+    ShowVulns,
     Rules,
     EventFaults,
     // pseudo resources

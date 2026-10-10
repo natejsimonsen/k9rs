@@ -8,7 +8,7 @@ libiconv.systems = ["aarch64-darwin", "x86_64-darwin"]
 
 [build.k9rs]
 description = "A Rust port of k9s, the Kubernetes terminal UI"
-version = "0.50.18"
+version = "0.1.0"
 license = ["Apache-2.0"]
 command = '''
   cargo build --release --locked

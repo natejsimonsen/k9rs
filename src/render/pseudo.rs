@@ -50,7 +50,22 @@ fn mk(kind: &str, name: &str, ns: Option<&str>, data: Value) -> DynamicObject {
             m.insert(k, val);
         }
     }
-    serde_json::from_value(v).expect("pseudo object")
+    // Fields come from outside data (file names, helm output): never panic.
+    serde_json::from_value(v).unwrap_or_else(|e| {
+        tracing::warn!(kind, name, error = %e, "bad pseudo object");
+        let mut o = DynamicObject::new(
+            name,
+            &kube::api::ApiResource {
+                group: String::new(),
+                version: String::new(),
+                api_version: API_VERSION.into(),
+                kind: kind.into(),
+                plural: String::new(),
+            },
+        );
+        o.metadata.namespace = ns.map(str::to_string);
+        o
+    })
 }
 
 /// Read a string field from a pseudo object.
@@ -266,6 +281,16 @@ pub fn subject(name: &str, kind: &str, first_location: &str, binding_kind: &str)
         name,
         None,
         json!({"subjectKind": kind, "firstLocation": first_location, "bindingKind": binding_kind}),
+    )
+}
+
+/// render.ImageScanRes: one finding for an image.
+pub fn image_scan(image: &str, row: &[String; 6]) -> DynamicObject {
+    mk(
+        "ImageScan",
+        &format!("{image}|{}", row.join("|")),
+        None,
+        json!({"image": image, "row": row}),
     )
 }
 

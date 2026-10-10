@@ -215,13 +215,19 @@ fn aggregate(errs: Vec<String>) -> Option<String> {
     }
 }
 
-/// Shared drain progress log (Helper.Out / ErrOut).
+/// Shared drain progress log (Helper.Out / ErrOut), mirrored to a live sink.
 #[derive(Clone, Default)]
-pub(crate) struct Out(Arc<Mutex<String>>);
+pub(crate) struct Out(Arc<Mutex<String>>, Option<crate::k8s::DrainProgress>);
 
 impl Out {
+    pub(crate) fn with_sink(sink: crate::k8s::DrainProgress) -> Self {
+        Out(Default::default(), Some(sink))
+    }
     pub(crate) fn write(&self, s: &str) {
         self.0.lock().unwrap().push_str(s);
+        if let Some(f) = &self.1 {
+            f(s);
+        }
     }
     pub(crate) fn take(&self) -> String {
         std::mem::take(&mut *self.0.lock().unwrap())
@@ -409,7 +415,7 @@ impl Drainer {
                                 break;
                             }
                             self.out.write(&format!(
-                                "error when evicting pod {name:?} (will retry after 5s): {msg}\n"
+                                "error when evicting pod {name:?} from terminating namespace {ns:?} (will retry after 5s): {msg}\n"
                             ));
                             tokio::time::sleep(EVICT_RETRY).await;
                         }
@@ -422,23 +428,21 @@ impl Drainer {
                 }
             }
         }
-        // waitForDelete with an infinite poll timeout bounded by the global context.
+        // waitForDelete with an infinite poll timeout bounded by the global
+        // context (kubectl v0.35: the context error surfaces).
         loop {
-            match self.gone(&pod).await {
+            let e = match self.gone(&pod).await {
                 Ok(true) => return Ok(()),
-                Ok(false) => {}
-                Err(e) => {
-                    return Err(format!(
-                        "error when waiting for pod {name:?} terminating: {e}"
-                    ))
+                Ok(false) if expired() => CONTEXT_DEADLINE.to_string(),
+                Ok(false) => {
+                    tokio::time::sleep(POLL_INTERVAL).await;
+                    continue;
                 }
-            }
-            if expired() {
-                return Err(format!(
-                    "error when waiting for pod {name:?} terminating: global timeout reached: {timeout_str}"
-                ));
-            }
-            tokio::time::sleep(POLL_INTERVAL).await;
+                Err(e) => e.to_string(),
+            };
+            return Err(format!(
+                "error when waiting for pod {name:?} in namespace {ns:?} to terminate: {e}"
+            ));
         }
     }
 
@@ -487,12 +491,15 @@ impl Drainer {
                 return Ok(());
             }
             if deadline.map(|d| Instant::now() >= d).unwrap_or(false) {
-                return Err(anyhow!("timed out waiting for the condition"));
+                return Err(anyhow!(CONTEXT_DEADLINE));
             }
             tokio::time::sleep(POLL_INTERVAL).await;
         }
     }
 }
+
+/// context.DeadlineExceeded.Error().
+const CONTEXT_DEADLINE: &str = "context deadline exceeded";
 
 fn has_cause(s: &kube::core::Status, cause: &str) -> bool {
     s.details

@@ -58,7 +58,8 @@ pub(crate) async fn start(
     api: kube::Api<Pod>,
     spec: PortForwardSpec,
     cancel: CancellationToken,
-) -> Result<()> {
+) -> Result<tokio::sync::oneshot::Receiver<String>> {
+    let (died_tx, died) = tokio::sync::oneshot::channel();
     let listener = bind(&spec).await?;
     let pod = spec.pod.clone();
     let port = spec.container_port;
@@ -82,8 +83,11 @@ pub(crate) async fn start(
                 None => match connect(&api, &pod, port).await {
                     Ok(pf) => pf,
                     Err(e) => {
+                        // client-go's ForwardPorts ends with
+                        // ErrLostConnectionToPod once the pod is unreachable.
                         tracing::error!("port-forward {} failed: {e}", spec.id());
-                        continue;
+                        let _ = died_tx.send("lost connection to pod".to_string());
+                        break;
                     }
                 },
             };
@@ -104,7 +108,7 @@ pub(crate) async fn start(
             pf.abort();
         }
     });
-    Ok(())
+    Ok(died)
 }
 
 #[cfg(test)]

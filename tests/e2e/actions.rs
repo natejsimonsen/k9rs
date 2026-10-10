@@ -138,15 +138,25 @@ async fn restart_deployment() {
     let mut h = Harness::new().await;
     h.goto("deploy").await.unwrap();
     h.press('r').await;
-    let Dialog::Confirm { title, msg, on_ok } = h.take_dialog() else {
-        panic!("expected the confirm dialog")
+    // dialog.ShowRestart: a confirm with an editable FieldManager.
+    let Dialog::Restart {
+        title,
+        msg,
+        field_manager,
+        on_ok,
+    } = h.take_dialog()
+    else {
+        panic!("expected the restart dialog")
     };
     assert_eq!(title, "Confirm Restart");
     assert_eq!(msg, "Restart deployment default/api?");
-    let cmds = on_ok(&mut h.ctx);
+    let cmds = on_ok(&mut h.ctx, field_manager);
     h.apply(cmds);
     h.settle().await;
-    assert_eq!(h.acc.calls(), ["restart apps/v1/deployments default/api"]);
+    assert_eq!(
+        h.acc.calls(),
+        ["restart apps/v1/deployments default/api kubectl-rollout"]
+    );
     assert!(info(&h, "Restart in progress for `default/api..."));
 }
 

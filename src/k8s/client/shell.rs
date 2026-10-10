@@ -200,14 +200,24 @@ pub(crate) fn shell_env(
     if !parts.is_empty() {
         env.push(("KUBECONFIG".to_string(), parts.join(":")));
     }
-    if let Some(ed) = lookup("K9S_EDITOR").filter(|e| !e.is_empty()) {
-        let mut tokens: Vec<String> = ed.split(' ').map(str::to_string).collect();
-        if let Ok(bin) = which::which(&tokens[0]) {
-            tokens[0] = bin.display().to_string();
-            env.push(("KUBE_EDITOR".to_string(), tokens.join(" ")));
-        }
-    }
+    env.extend(editor_env(lookup));
     env
+}
+
+/// exec.go execute: KUBE_EDITOR from K9S_EDITOR (resolved binary + args),
+/// for every command k9s runs, plugins included.
+pub fn editor_env(lookup: impl Fn(&str) -> Option<String>) -> Vec<(String, String)> {
+    let Some(ed) = lookup("K9S_EDITOR").filter(|e| !e.is_empty()) else {
+        return Vec::new();
+    };
+    let mut tokens: Vec<String> = ed.split(' ').map(str::to_string).collect();
+    match which::which(&tokens[0]) {
+        Ok(bin) => {
+            tokens[0] = bin.display().to_string();
+            vec![("KUBE_EDITOR".to_string(), tokens.join(" "))]
+        }
+        Err(_) => Vec::new(),
+    }
 }
 
 #[cfg(test)]

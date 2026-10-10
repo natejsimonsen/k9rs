@@ -18,15 +18,16 @@ pub(crate) const HEADER_HEIGHT: u16 = 7;
 const CLUSTER_INFO_WIDTH: usize = 50;
 const CLUSTER_INFO_PAD: usize = 15;
 /// Logo column width.
-pub(crate) const LOGO_WIDTH: u16 = 26;
+pub(crate) const LOGO_WIDTH: u16 = 35;
 /// ui/menu.go maxRows.
 const MAX_ROWS: usize = 6;
 
 const NA: &str = "n/a";
-const ORANGE_RED: Color = Color::Rgb(0xFF, 0x45, 0x00);
-const MEDIUM_VIOLET_RED: Color = Color::Rgb(0xC7, 0x15, 0x85);
-const LAWN_GREEN: Color = Color::Rgb(0x7C, 0xFC, 0x00);
-const CADET_BLUE: Color = Color::Rgb(0x5F, 0x9E, 0xA0);
+/// Markup names (orangered, ..): tcell fits them to the 256 palette.
+const ORANGE_RED: Color = Color::Indexed(202);
+const MEDIUM_VIOLET_RED: Color = Color::Indexed(162);
+const LAWN_GREEN: Color = Color::Indexed(118);
+const CADET_BLUE: Color = Color::Indexed(73);
 
 /// What the header needs to render.
 pub(crate) struct HeaderModel<'a> {
@@ -38,6 +39,8 @@ pub(crate) struct HeaderModel<'a> {
     pub hints: &'a [Hint],
     pub show_logo: bool,
     pub status: Option<&'a (FlashLevel, String)>,
+    /// Cluster info border padding (0, 0, 1, 0).
+    pub padded: bool,
 }
 
 /// Width of the cluster info column.
@@ -116,7 +119,8 @@ pub(crate) fn cluster_info_rows(m: &HeaderModel<'_>, styles: &Styles) -> Vec<(St
         .fg(styles.info_section)
         .bg(styles.bg)
         .add_modifier(Modifier::BOLD);
-    let mut context = m.info.context.clone();
+    // model.NewClusterMeta: n/a until the cluster is known.
+    let mut context = or_na(&m.info.context);
     let ic = ro_indicator(m.readonly, m.no_icons);
     if !ic.is_empty() {
         context = format!("{context} {ic}");
@@ -131,7 +135,7 @@ pub(crate) fn cluster_info_rows(m: &HeaderModel<'_>, styles: &Styles) -> Vec<(St
         ("Cluster".into(), vec![seg(or_na(&m.info.cluster), val)]),
         ("User".into(), vec![seg(or_na(&m.info.user), val)]),
         (
-            "K9s Rev".into(),
+            "K9rs Rev".into(),
             k9s_rev_segs(&k9s, &m.info.k9s_latest, val),
         ),
         ("K8s Rev".into(), vec![seg(or_na(&m.info.k8s_version), val)]),
@@ -160,8 +164,9 @@ fn draw_cluster_info(buf: &mut Buffer, area: Rect, m: &HeaderModel<'_>, styles: 
     let labels: Vec<String> = rows.iter().map(|(l, _)| format!("{l}:")).collect();
     let lw = labels.iter().map(|l| l.len()).max().unwrap_or(0) as u16;
     // Border padding (0, 0, 1, 0).
-    let x0 = area.x + 1;
-    let avail = area.width.saturating_sub(1);
+    let pad = u16::from(m.padded);
+    let x0 = area.x + pad;
+    let avail = area.width.saturating_sub(pad);
     for (i, ((_, val), label)) in rows.iter().zip(labels.iter()).enumerate() {
         let y = area.y + i as u16;
         if y >= area.bottom() {
@@ -180,16 +185,22 @@ fn draw_cluster_info(buf: &mut Buffer, area: Rect, m: &HeaderModel<'_>, styles: 
         if vx < area.x + area.width {
             // tview tables never draw their overflow ellipsis (derailed/tview
             // table.go passes it a bogus position).
-            draw_segs(
-                buf,
-                vx,
-                y,
-                area.x + area.width - vx,
-                val,
-                Align::Left,
-                false,
-            );
+            let w = area.x + area.width - vx;
+            draw_segs(buf, vx, y, w, val, Align::Left, false);
+            table_ellipsis(buf, vx, y, w, val);
         }
+    }
+}
+
+/// derailed/tview table.go draws a truncated cell's ellipsis with
+/// printWithStyle(x+w, 0, skipWidth=y): it only lands on screen row 0, in the
+/// cell's last column.
+fn table_ellipsis(buf: &mut Buffer, x: u16, y: u16, w: u16, segs: &[Seg]) {
+    if y != 0 || w == 0 || super::text::segs_width(segs) <= w as usize {
+        return;
+    }
+    if let Some(cell) = buf.cell_mut((x + w - 1, y)) {
+        cell.set_symbol(super::text::ELLIPSIS);
     }
 }
 
@@ -287,14 +298,16 @@ fn format_menu(h: &Hint, size: usize, styles: &Styles) -> Vec<Seg> {
     if h.mnemonic.is_empty() || h.description.is_empty() {
         return Vec::new();
     }
+    // ui/menu.go: a `default` skin color is `-`, the cell's color (body fg).
+    let fg = |c: Color| if c == Color::Reset { styles.fg } else { c };
     let plain = Style::default().bg(styles.bg);
     let desc = Style::default()
-        .fg(styles.menu_fg)
+        .fg(fg(styles.menu_fg))
         .bg(styles.bg)
         .add_modifier(styles.menu_fg_style);
     if let Ok(i) = h.mnemonic.parse::<i64>() {
         let key = Style::default()
-            .fg(styles.menu_num_key)
+            .fg(fg(styles.menu_num_key))
             .bg(styles.bg)
             .add_modifier(Modifier::BOLD);
         return vec![
@@ -304,7 +317,7 @@ fn format_menu(h: &Hint, size: usize, styles: &Styles) -> Vec<Seg> {
         ];
     }
     let key = Style::default()
-        .fg(styles.menu_key)
+        .fg(fg(styles.menu_key))
         .bg(styles.bg)
         .add_modifier(Modifier::BOLD);
     let m = to_mnemonic(&h.mnemonic);
@@ -340,6 +353,7 @@ pub(crate) fn draw_menu(buf: &mut Buffer, area: Rect, hints: &[Hint], styles: &S
                 break;
             }
             draw_segs(buf, x, y, cw, &row[c], Align::Left, false);
+            table_ellipsis(buf, x, y, cw, &row[c]);
         }
         x = x.saturating_add(w + 1);
     }
@@ -357,11 +371,14 @@ pub(crate) fn level_color(styles: &Styles, l: FlashLevel) -> Color {
 }
 
 fn draw_logo(buf: &mut Buffer, area: Rect, status: Option<&(FlashLevel, String)>, styles: &Styles) {
+    // logo.go "[%s::b]": a `default` color is `-`, the logo text views'
+    // own color, white (they are built before the skin loads).
+    let white = |c: Color| if c == Color::Reset { Color::White } else { c };
     let color = status
         .map(|(l, _)| level_color(styles, *l))
         .unwrap_or(styles.logo);
     let style = Style::default()
-        .fg(color)
+        .fg(white(color))
         .bg(styles.bg)
         .add_modifier(Modifier::BOLD);
     for (i, l) in LOGO_SMALL.iter().enumerate() {
@@ -395,7 +412,7 @@ fn draw_logo(buf: &mut Buffer, area: Rect, status: Option<&(FlashLevel, String)>
             &[seg(
                 msg.clone(),
                 Style::default()
-                    .fg(styles.logo_msg)
+                    .fg(white(styles.logo_msg))
                     .bg(bg)
                     .add_modifier(Modifier::BOLD),
             )],
@@ -438,8 +455,11 @@ pub(crate) fn draw_indicator(
             // ClusterInfoChanged shows deltas (k9s compares MEM against the
             // previous CPU there); ClusterInfoUpdated plain percentages.
             let changed = m.prev != m.info;
-            let cpu_style = b.fg(styles.info_cpu).add_modifier(Modifier::BOLD);
-            let mem_style = b.fg(styles.info_mem).add_modifier(Modifier::BOLD);
+            // `[color::]` tags: not bold; an unset skin color ("-") falls
+            // back to the text (body) color.
+            let col = |c: Color| b.fg(if c == Color::Reset { styles.fg } else { c });
+            let cpu_style = col(styles.info_cpu);
+            let mem_style = col(styles.info_mem);
             let perc = |prev: Option<i64>, cur: Option<i64>, st: Style| -> Vec<Seg> {
                 if changed {
                     perc_delta(Some(prev.unwrap_or(0)), cur)
@@ -451,21 +471,18 @@ pub(crate) fn draw_indicator(
                 }
             };
             let mut segs = vec![
-                seg("K9s ", b.fg(styles.logo).add_modifier(Modifier::BOLD)),
-                seg(
-                    format!("{k9s} "),
-                    b.fg(styles.info_k9s_rev).add_modifier(Modifier::BOLD),
-                ),
+                seg("K9rs ", b.fg(styles.logo).add_modifier(Modifier::BOLD)),
+                seg(format!("{k9s} "), col(styles.info_k9s_rev)),
                 seg(
                     format!(
                         "{}:{}:{} ",
                         m.info.context, m.info.cluster, m.info.k8s_version
                     ),
-                    b.fg(styles.info_fg).add_modifier(Modifier::BOLD),
+                    col(styles.info_fg),
                 ),
             ];
             segs.extend(perc(m.prev.cpu_pct, m.info.cpu_pct, cpu_style));
-            segs.push(seg("::", b.fg(styles.fg).add_modifier(Modifier::BOLD)));
+            segs.push(seg("::", col(styles.fg)));
             segs.extend(perc(m.prev.cpu_pct, m.info.mem_pct, mem_style));
             segs
         }
@@ -501,7 +518,54 @@ mod tests {
             hints,
             show_logo: true,
             status: None,
+            padded: true,
         }
+    }
+
+    /// Started disconnected: view/cluster_info.go Init never ran (no
+    /// padding) and the meta is model.NewClusterMeta (n/a).
+    /// ui/indicator.go: `[color::]` tags are not bold and the stock skin's
+    /// unset cpu/mem/rev colors fall back to the body color.
+    #[test]
+    fn indicator_stock_colors() {
+        let styles = Styles::from_skin(crate::config::Skin::stock());
+        let i = info();
+        let m = model(&i, &i, &[]);
+        let mut buf = Buffer::empty(Rect::new(0, 0, 100, 1));
+        draw_indicator(&mut buf, Rect::new(0, 0, 100, 1), &m, None, &styles);
+        let row = all_rows(&buf)[0].clone();
+        let x = row.find("v0.50.18").unwrap() as u16;
+        assert_eq!(fg(&buf, x, 0), styles.fg);
+        assert!(!buf[(x, 0)].modifier.contains(Modifier::BOLD));
+        let k = row.find("K9rs").unwrap() as u16;
+        assert!(buf[(k, 0)].modifier.contains(Modifier::BOLD));
+        let c = row.find("12%").unwrap() as u16;
+        assert_eq!(fg(&buf, c, 0), styles.fg);
+        let ctx = row.find("kind-dev").unwrap() as u16;
+        assert_eq!(fg(&buf, ctx, 0), styles.info_fg);
+        assert!(!buf[(ctx, 0)].modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn cluster_info_disconnected() {
+        let styles = Styles::default();
+        let i = ClusterInfo {
+            k9s_version: "v0.50.18".into(),
+            ..Default::default()
+        };
+        let mut m = model(&i, &i, &[]);
+        m.readonly = true;
+        m.padded = false;
+        let mut buf = Buffer::empty(Rect::new(0, 0, 120, 7));
+        {
+            let a = buf.area;
+            draw_header(&mut buf, a, &m, &styles)
+        };
+        let rows = all_rows(&buf);
+        assert!(rows[0].starts_with("Context:  n/a [R] "), "{}", rows[0]);
+        assert!(rows[1].starts_with("Cluster:  n/a "));
+        assert!(rows[3].starts_with("K9rs Rev: v0.50.18 "));
+        assert!(rows[6].starts_with("MEM:      n/a "));
     }
 
     #[test]
@@ -519,19 +583,19 @@ mod tests {
         };
         let rows = all_rows(&buf);
         assert!(
-            rows[0].starts_with(" Context: kind-dev [RW]"),
+            rows[0].starts_with(" Context:  kind-dev [RW]"),
             "{}",
             rows[0]
         );
-        assert!(rows[1].starts_with(" Cluster: kind "));
-        assert!(rows[2].starts_with(" User:    admin "));
-        assert!(rows[3].starts_with(" K9s Rev: v0.50.18 "));
-        assert!(rows[4].starts_with(" K8s Rev: v1.34.0 "));
-        assert!(rows[5].starts_with(" CPU:     12%↑ "), "{}", rows[5]);
-        assert!(rows[6].starts_with(" MEM:     40%↓ "), "{}", rows[6]);
+        assert!(rows[1].starts_with(" Cluster:  kind "));
+        assert!(rows[2].starts_with(" User:     admin "));
+        assert!(rows[3].starts_with(" K9rs Rev: v0.50.18 "));
+        assert!(rows[4].starts_with(" K8s Rev:  v1.34.0 "));
+        assert!(rows[5].starts_with(" CPU:      12%↑ "), "{}", rows[5]);
+        assert!(rows[6].starts_with(" MEM:      40%↓ "), "{}", rows[6]);
         assert_eq!(fg(&buf, 1, 0), styles.info_fg);
-        assert_eq!(fg(&buf, 10, 0), styles.info_section);
-        assert!(buf[(10, 0)].modifier.contains(Modifier::BOLD));
+        assert_eq!(fg(&buf, 11, 0), styles.info_section);
+        assert!(buf[(11, 0)].modifier.contains(Modifier::BOLD));
         let (x, y) = find(&buf, "↑").unwrap();
         assert_eq!(fg(&buf, x, y), Color::LightRed);
         let (x, y) = find(&buf, "↓").unwrap();
@@ -558,9 +622,9 @@ mod tests {
             let a = buf.area;
             draw_header(&mut buf, a, &m, &styles)
         };
-        assert!(row(&buf, 0).starts_with(" Context: kind-dev [R] "));
-        assert!(row(&buf, 5).starts_with(" CPU:     n/a "));
-        assert_eq!(fg(&buf, 10, 5), ORANGE_RED);
+        assert!(row(&buf, 0).starts_with(" Context:  kind-dev [R] "));
+        assert!(row(&buf, 5).starts_with(" CPU:      n/a "));
+        assert_eq!(fg(&buf, 11, 5), ORANGE_RED);
     }
 
     #[test]
@@ -633,8 +697,29 @@ mod tests {
             let a = buf.area;
             draw_menu(&mut buf, a, &hints, &styles)
         };
-        // derailed/tview tables never draw the overflow ellipsis.
-        assert_eq!(row(&buf, 0), " <a> A very ");
+        // derailed/tview only lands the overflow ellipsis on screen row 0.
+        assert_eq!(row(&buf, 0), " <a> A very…");
+        let mut buf = Buffer::empty(Rect::new(0, 0, 12, 7));
+        draw_menu(&mut buf, Rect::new(0, 1, 12, 6), &hints, &styles);
+        assert_eq!(row(&buf, 1), " <a> A very ");
+    }
+
+    #[test]
+    fn default_skin_colors_fall_back_like_k9s() {
+        // kiss skin: logo/menu colors `default` render as `-` in k9s markup.
+        let styles = Styles {
+            logo: Color::Reset,
+            menu_key: Color::Reset,
+            fg: Color::Rgb(1, 2, 3),
+            ..Default::default()
+        };
+        let mut buf = Buffer::empty(Rect::new(0, 0, 40, 7));
+        let a = buf.area;
+        draw_logo(&mut buf, a, None, &styles);
+        assert_eq!(buf[(1, 0)].fg, Color::White);
+        let h = Hint::new("d", "Describe");
+        let segs = format_menu(&h, 1, &styles);
+        assert_eq!(segs[1].style.fg, Some(Color::Rgb(1, 2, 3)));
     }
 
     #[test]
@@ -663,10 +748,10 @@ mod tests {
         };
         let r = row(&buf, 0);
         assert!(
-            r.contains("K9s v0.50.18 kind-dev:kind:v1.34.0 12%::40%"),
+            r.contains("K9rs v0.50.18 kind-dev:kind:v1.34.0 12%::40%"),
             "{r}"
         );
-        let (x, y) = find(&buf, "K9s").unwrap();
+        let (x, y) = find(&buf, "K9rs").unwrap();
         assert_eq!(fg(&buf, x, y), styles.logo);
         let mut buf = Buffer::empty(Rect::new(0, 0, 80, 1));
         {
@@ -704,14 +789,14 @@ mod tests {
         };
         let rows = all_rows(&buf);
         assert!(
-            rows[3].starts_with(" K9s Rev: v0.50.18 \u{26a1}\u{fe0f}v0.51.0 "),
+            rows[3].starts_with(" K9rs Rev: v0.50.18 \u{26a1}\u{fe0f}v0.51.0 "),
             "{}",
             rows[3]
         );
         let (x, y) = find(&buf, "v0.51.0").unwrap();
         assert_eq!(fg(&buf, x, y), CADET_BLUE);
         assert!(buf[(x, y)].modifier.contains(Modifier::BOLD));
-        assert_eq!(fg(&buf, 10, 3), styles.info_section);
+        assert_eq!(fg(&buf, 11, 3), styles.info_section);
     }
 
     #[test]

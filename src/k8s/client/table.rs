@@ -76,6 +76,7 @@ pub(crate) fn parse_table(v: &Value) -> Option<ServerTable> {
                             .and_then(Value::as_str)
                             .map(str::to_string),
                         labels,
+                        object: r.get("object").cloned(),
                     }
                 })
                 .collect()

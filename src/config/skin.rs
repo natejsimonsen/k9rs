@@ -470,8 +470,41 @@ impl Styles {
     }
 }
 
+impl Styles {
+    /// RefreshStyles on a live app: like [`Styles::load_active`], but the
+    /// skin file is unmarshaled over the current styles (keys it omits keep
+    /// their current values) and a broken file keeps the current styles.
+    pub fn reload_active(
+        current: &Styles,
+        locs: &Locations,
+        env: &dyn Env,
+        ui_skin: &str,
+        ctx_skin: Option<&str>,
+        invert: bool,
+    ) -> Styles {
+        let Some(name) = active_skin(locs, env, ui_skin, ctx_skin) else {
+            return stock(invert);
+        };
+        let file = locs.skin_file_from_name(&name);
+        match Skin::load_over(&current.skin, &file) {
+            Ok(sk) => Styles::from_skin(if invert { sk.inverted() } else { sk }),
+            Err(e) => {
+                let missing = e
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound);
+                if missing {
+                    stock(invert)
+                } else {
+                    tracing::error!(path = %name, error = %e, "Failed to parse skin file");
+                    current.clone()
+                }
+            }
+        }
+    }
+}
+
 fn stock(invert: bool) -> Styles {
-    let sk = Skin::default_skin();
+    let sk = Skin::stock();
     Styles::from_skin(if invert { sk.inverted() } else { sk })
 }
 
@@ -646,7 +679,18 @@ impl Skin {
     /// Load a skin file over the default skin (Styles.Load): the file must
     /// pass the skin schema; missing values keep their defaults.
     pub fn load_from(path: &Path) -> Result<Skin> {
-        Skin::load_over(&Skin::default_skin(), path)
+        Skin::load_over(&Skin::stock(), path)
+    }
+
+    /// The stock skin template (config.NewStyles / Styles.Reset): the
+    /// defaults without info cpu/mem/rev colors, which the headless
+    /// indicator then draws in the body color.
+    pub fn stock() -> Skin {
+        let mut s = Skin::default_skin();
+        s.k9s.info.cpu_color.clear();
+        s.k9s.info.mem_color.clear();
+        s.k9s.info.k9s_rev_color.clear();
+        s
     }
 
     /// Load a skin file over `base`.
@@ -782,25 +826,25 @@ impl Skin {
 
 // ---- colors -----------------------------------------------------------------
 
-/// tcell's 16 basic colors: (name, palette color, rgb).
-const BASIC: &[(&str, Color, u32)] = &[
-    ("black", Color::Black, 0x000000),
-    ("maroon", Color::Red, 0x800000),
-    ("green", Color::Green, 0x008000),
-    ("olive", Color::Yellow, 0x808000),
-    ("navy", Color::Blue, 0x000080),
-    ("purple", Color::Magenta, 0x800080),
-    ("teal", Color::Cyan, 0x008080),
-    ("silver", Color::Gray, 0xc0c0c0),
-    ("gray", Color::DarkGray, 0x808080),
-    ("grey", Color::DarkGray, 0x808080),
-    ("red", Color::LightRed, 0xff0000),
-    ("lime", Color::LightGreen, 0x00ff00),
-    ("yellow", Color::LightYellow, 0xffff00),
-    ("blue", Color::LightBlue, 0x0000ff),
-    ("fuchsia", Color::LightMagenta, 0xff00ff),
-    ("aqua", Color::LightCyan, 0x00ffff),
-    ("white", Color::White, 0xffffff),
+/// tcell's 16 basic colors: (name, rgb).
+const BASIC: &[(&str, u32)] = &[
+    ("black", 0x000000),
+    ("maroon", 0x800000),
+    ("green", 0x008000),
+    ("olive", 0x808000),
+    ("navy", 0x000080),
+    ("purple", 0x800080),
+    ("teal", 0x008080),
+    ("silver", 0xc0c0c0),
+    ("gray", 0x808080),
+    ("grey", 0x808080),
+    ("red", 0xff0000),
+    ("lime", 0x00ff00),
+    ("yellow", 0xffff00),
+    ("blue", 0x0000ff),
+    ("fuchsia", 0xff00ff),
+    ("aqua", 0x00ffff),
+    ("white", 0xffffff),
 ];
 
 /// tcell's W3C extended color names.
@@ -952,8 +996,9 @@ fn parse_hex(s: &str) -> Option<u32> {
 /// `#rrggbb`; `default`, `-`, `transparent` and anything unknown are the
 /// terminal default.
 pub fn parse_color(s: &str) -> Color {
-    if let Some((_, c, _)) = BASIC.iter().find(|(n, _, _)| *n == s) {
-        return *c;
+    // config.Color.Color: GetColor(..).TrueColor(), so basic names are RGB too.
+    if let Some((_, v)) = BASIC.iter().find(|(n, _)| *n == s) {
+        return rgb(*v);
     }
     if let Some((_, v)) = W3C.iter().find(|(n, _)| *n == s) {
         return rgb(*v);
@@ -970,7 +1015,7 @@ pub fn color_rgb(s: &str) -> Option<u32> {
     if s == "default" {
         return None;
     }
-    if let Some((_, _, v)) = BASIC.iter().find(|(n, _, _)| *n == s) {
+    if let Some((_, v)) = BASIC.iter().find(|(n, _)| *n == s) {
         return Some(*v);
     }
     if let Some((_, v)) = W3C.iter().find(|(n, _)| *n == s) {
@@ -1179,12 +1224,9 @@ mod tests {
     fn stock_template_matches_default_skin() {
         let stock =
             Skin::parse_over(&Skin::default(), crate::config::paths::STOCK_SKIN_TPL).unwrap();
-        let mut d = Skin::default_skin();
         // The stock template has no info cpu/mem/rev colors.
-        d.k9s.info.cpu_color.clear();
-        d.k9s.info.mem_color.clear();
-        d.k9s.info.k9s_rev_color.clear();
-        assert_eq!(stock, d);
+        assert_eq!(stock, Skin::stock());
+        assert!(!Skin::default_skin().k9s.info.cpu_color.is_empty());
     }
 
     #[test]
@@ -1194,11 +1236,12 @@ mod tests {
         assert_eq!(parse_color("-"), Color::Reset);
         assert_eq!(parse_color("transparent"), Color::Reset);
         assert_eq!(parse_color(""), Color::Reset);
-        assert_eq!(parse_color("blue"), Color::LightBlue);
-        assert_eq!(parse_color("green"), Color::Green);
-        assert_eq!(parse_color("gray"), Color::DarkGray);
-        assert_eq!(parse_color("aqua"), Color::LightCyan);
-        assert_eq!(parse_color("fuchsia"), Color::LightMagenta);
+        // Basic names are RGB too (k9s TrueColor()); was palette colors.
+        assert_eq!(parse_color("blue"), Color::Rgb(0, 0, 0xff));
+        assert_eq!(parse_color("green"), Color::Rgb(0, 0x80, 0));
+        assert_eq!(parse_color("gray"), Color::Rgb(0x80, 0x80, 0x80));
+        assert_eq!(parse_color("aqua"), Color::Rgb(0, 0xff, 0xff));
+        assert_eq!(parse_color("fuchsia"), Color::Rgb(0xff, 0, 0xff));
         assert_eq!(parse_color("dodgerblue"), Color::Rgb(0x1e, 0x90, 0xff));
         assert_eq!(parse_color("lightslategrey"), Color::Rgb(0x77, 0x88, 0x99));
         assert_eq!(parse_color("#ffffff"), Color::Rgb(255, 255, 255));
@@ -1210,7 +1253,7 @@ mod tests {
         let mut names: Vec<&str> = W3C
             .iter()
             .map(|(n, _)| *n)
-            .chain(BASIC.iter().map(|(n, _, _)| *n))
+            .chain(BASIC.iter().map(|(n, _)| *n))
             .collect();
         let n = names.len();
         names.sort();
@@ -1294,8 +1337,8 @@ mod tests {
         assert_eq!(color_string(&sk.k9s.body.fg_color), "#ffffff");
         assert_eq!(color_string(&sk.k9s.body.bg_color), "#000000");
         assert_eq!(color_string(&sk.k9s.views.table.bg_color), "#000000");
-        assert_eq!(st.fg, Color::White);
-        assert_eq!(st.bg, Color::Black);
+        assert_eq!(st.fg, Color::Rgb(0xff, 0xff, 0xff));
+        assert_eq!(st.bg, Color::Rgb(0, 0, 0));
     }
 
     #[test]
@@ -1342,6 +1385,39 @@ mod tests {
         assert!(Skin::bundled("nope").is_none());
     }
 
+    /// Styles.Load unmarshals over the live styles: keys a new skin omits
+    /// keep the previous skin's values; a broken file changes nothing.
+    #[test]
+    fn reload_overlays_current_styles() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = tmp.path().to_str().unwrap();
+        let env = MapEnv::new(&[(K9S_ENV_CONFIG_DIR, cfg)]);
+        let locs = Locations::resolve(&env, &Xdg::resolve(&env, Path::new("/h"), false));
+        std::fs::create_dir_all(&locs.skins_dir).unwrap();
+        std::fs::write(
+            locs.skins_dir.join("a.yaml"),
+            "k9s:\n  body:\n    fgColor: red\n    bgColor: blue\n",
+        )
+        .unwrap();
+        std::fs::write(
+            locs.skins_dir.join("b.yaml"),
+            "k9s:\n  body:\n    fgColor: green\n",
+        )
+        .unwrap();
+        std::fs::write(locs.skins_dir.join("bad.yaml"), "k9s:\n  bodys: {}\n").unwrap();
+        let a = Styles::load_active(&locs, &env, "a", None, false);
+        let b = Styles::reload_active(&a, &locs, &env, "b", None, false);
+        assert_eq!(b.skin.k9s.body.fg_color, "green");
+        assert_eq!(b.skin.k9s.body.bg_color, "blue");
+        assert_eq!(
+            Styles::reload_active(&b, &locs, &env, "bad", None, false),
+            b
+        );
+        // No skin: Styles.Reset to stock.
+        let none = Styles::reload_active(&b, &locs, &env, "", None, false);
+        assert_eq!(none, Styles::load_active(&locs, &env, "", None, false));
+    }
+
     #[test]
     fn active_skin_resolution() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1380,15 +1456,18 @@ mod tests {
             Some("nord")
         );
 
+        // No skin: the stock template (was Styles::default(), which has the
+        // info cpu/mem/rev colors the template lacks).
         let st = Styles::load_active(&locs, &env, "", None, false);
-        assert_eq!(st, Styles::default());
+        assert_eq!(st, Styles::from_skin(Skin::stock()));
+        assert_eq!(st.info_cpu, Color::Reset);
         let st = Styles::load_active(&locs, &env2, "", None, false);
         assert_eq!(st.bg, Color::Rgb(0x28, 0x2a, 0x36));
         let inv = Styles::load_active(&locs, &env, "", None, true);
         assert_eq!(inv.bg, Color::Rgb(255, 255, 255));
         // A broken skin falls back to stock, not inverted.
         let bad = Styles::load_active(&locs, &env, "bad", None, true);
-        assert_eq!(bad.bg, Color::Black);
+        assert_eq!(bad.bg, Color::Rgb(0, 0, 0));
     }
 
     #[test]

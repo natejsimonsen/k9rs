@@ -1,5 +1,5 @@
 //! `kubectl describe` text generation. k9s (dao/describe.go) calls kubectl's
-//! describers; this module ports them (kubectl v0.34) so the output matches
+//! describers; this module ports them (kubectl v0.35) so the output matches
 //! byte for byte: same sections, tabwriter alignment, `<none>`/`<unset>`
 //! markers, quantity formatting and event ages.
 //!
@@ -8,6 +8,7 @@
 //! Callers that have them pass them in [`Related`]; without them the
 //! describers fall back as documented on each [`Related`] field.
 
+mod certificates;
 mod cluster;
 mod config;
 mod events;
@@ -64,9 +65,6 @@ pub struct Related {
     pub resource_quotas: Option<Vec<DynamicObject>>,
     /// LimitRanges for a Namespace (section omitted when absent).
     pub limit_ranges: Option<Vec<DynamicObject>>,
-    /// Secrets of a ServiceAccount's namespace, for `Tokens:` and the
-    /// `(not found)` markers (no tokens and no markers when absent).
-    pub secrets: Option<Vec<DynamicObject>>,
 }
 
 /// JSON form of [`Related`] used by the describers.
@@ -79,7 +77,6 @@ pub(crate) struct Rel {
     pub(crate) lease: Option<Value>,
     pub(crate) resource_quotas: Option<Vec<Value>>,
     pub(crate) limit_ranges: Option<Vec<Value>>,
-    pub(crate) secrets: Option<Vec<Value>>,
 }
 
 fn to_value(o: &DynamicObject) -> Result<Value> {
@@ -102,7 +99,6 @@ impl Rel {
             lease: r.lease.as_ref().map(to_value).transpose()?,
             resource_quotas: to_values(&r.resource_quotas)?,
             limit_ranges: to_values(&r.limit_ranges)?,
-            secrets: to_values(&r.secrets)?,
         })
     }
 }
@@ -184,6 +180,7 @@ fn describer_for(gvr: &Gvr) -> DescribeFn {
         ("rbac.authorization.k8s.io", "rolebindings") => rbac::describe_binding,
         ("rbac.authorization.k8s.io", "clusterrolebindings") => rbac::describe_binding,
         ("scheduling.k8s.io", "priorityclasses") => cluster::describe_priority_class,
+        ("certificates.k8s.io", "certificatesigningrequests") => certificates::describe_csr,
         _ => generic::describe_generic,
     }
 }

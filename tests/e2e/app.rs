@@ -22,17 +22,18 @@ async fn header_logo_menu_and_crumbs() {
     let sc = s.render();
     dump(&sc);
     assert!(
-        sc.line(0).starts_with(" Context: fake [RW]"),
+        sc.line(0).starts_with(" Context:  fake [RW]"),
         "{}",
         sc.line(0)
     );
-    assert!(sc.line(1).starts_with(" Cluster: "));
+    assert!(sc.line(1).starts_with(" Cluster:  "));
     assert!(
-        sc.line(3).starts_with(" K9s Rev: v0.50.18 "),
+        sc.line(3)
+            .starts_with(&format!(" K9rs Rev: {} ", k9rs::version::VERSION)),
         "{}",
         sc.line(3)
     );
-    assert!(sc.line(5).starts_with(" CPU:     10%"), "{}", sc.line(5));
+    assert!(sc.line(5).starts_with(" CPU:      10%"), "{}", sc.line(5));
     // Namespace favorites then the pod actions (ui/menu.go).
     assert!(sc.line(0).contains("<0> all"), "{}", sc.line(0));
     assert!(sc.line(1).contains("<1> default"), "{}", sc.line(1));
@@ -236,12 +237,12 @@ async fn list_denied_keeps_current_view() {
     s.boot().await;
     s.command("secrets").await;
     let sc = s.render();
-    // The cow wraps the message like k9s' error dialog.
+    // The cow wraps the message like tview's WordWrap: after punctuation.
     let row = sc
-        .row_of("< Ruroh? [list] access denied on resource")
+        .row_of("< Ruroh? [list] access denied on resource \"default\":")
         .expect("error dialog");
     assert!(
-        sc.line(row + 1).contains("\"default\":\"v1/secrets\" >"),
+        sc.line(row + 1).contains(" \"v1/secrets\" >"),
         "{}",
         sc.text()
     );
@@ -276,4 +277,108 @@ async fn watch_denied_flashes() {
         "{}",
         sc.line(H - 1)
     );
+}
+
+/// browser.go TableNoData: the boot view drops its empty refresh while the
+/// app is not running, then the first-view skip; the next one warns. Later
+/// views skip their first empty result too (Start resets the counter).
+#[tokio::test]
+async fn boot_view_skips_first_empty_result() {
+    let mut s = shell("ingresses").await;
+    let sc = s.render();
+    assert!(!sc.contains("No resources found"), "{}", sc.text());
+    assert!(!sc.contains("ingresses(default)"), "{}", sc.text());
+    // The first refresh after boot is the first-view skip.
+    s.tick().await;
+    let sc = s.render();
+    assert!(!sc.contains("No resources found"), "{}", sc.text());
+    s.tick().await;
+    let sc = s.render();
+    assert!(sc.contains(" ingresses(default)[0] "), "{}", sc.text());
+    assert!(
+        sc.line(H - 1).contains(
+            "No resources found for networking.k8s.io/v1/ingresses in \"default\" namespace"
+        ),
+        "{}",
+        sc.line(H - 1)
+    );
+    s.command("pods").await;
+    // Browser.Start resets the first-view counter: skip once more, then warn.
+    s.command("ingresses").await;
+    assert!(!s.render().contains("No resources found"));
+    s.tick().await;
+    assert!(s
+        .render()
+        .line(H - 1)
+        .contains("No resources found for networking.k8s.io/v1/ingresses"));
+}
+
+/// ui/app.go activateCmd: `:` shows no history suggestion, but Tab still
+/// completes the first one.
+#[tokio::test]
+async fn command_prompt_opens_without_suggestion() {
+    let mut s = shell("pods").await;
+    s.press(':').await;
+    let sc = s.render();
+    let row = sc
+        .lines()
+        .iter()
+        .position(|l| l.contains('🐶'))
+        .expect("prompt row") as u16;
+    assert!(!sc.line(row).contains("pods"), "{}", sc.line(row));
+    s.code(KeyCode::Tab).await;
+    let sc = s.render();
+    assert!(sc.line(row).contains("> v1/pods"), "{}", sc.line(row));
+}
+
+/// The first frame does not wait on the API: with cluster info still
+/// pending, the header shows the kubeconfig names and the k9s version and
+/// the view loads.
+#[tokio::test]
+async fn header_before_cluster_info_resolves() {
+    use k9rs::k8s::accessor::Accessor;
+    let mut h = Harness::new().await;
+    h.acc
+        .cluster_info_hangs
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let c = h
+        .acc
+        .contexts()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|c| c.name == "fake")
+        .unwrap();
+    h.ctx.cluster_info = k9rs::k8s::ClusterInfo::from_context(&c);
+    let mut s = h.into_shell("pods");
+    s.boot().await;
+    let sc = s.render();
+    assert!(sc.line(0).starts_with(" Context:  fake "), "{}", sc.line(0));
+    assert!(
+        sc.line(1).contains(&format!("Cluster:  {}", c.cluster)),
+        "{}",
+        sc.line(1)
+    );
+    assert!(
+        sc.line(3)
+            .starts_with(&format!(" K9rs Rev: {} ", k9rs::version::VERSION)),
+        "{}",
+        sc.line(3)
+    );
+    assert!(sc.contains(" pods(default)[7] "), "{}", sc.text());
+}
+
+/// dao/registry.go: workloads is a namespaced pseudo resource, so
+/// `:workloads kube-system` switches namespace even when started on all.
+#[tokio::test]
+async fn workloads_takes_namespace_arg() {
+    let setup = Setup {
+        namespace: Some("all".into()),
+        ..Default::default()
+    };
+    let mut s = shell_with(setup, "pods").await;
+    s.command("workloads kube-system").await;
+    let sc = s.render();
+    assert!(sc.contains(" workloads(kube-system)["), "{}", sc.text());
+    assert!(!sc.contains("NAMESPACE"), "{}", sc.text());
 }

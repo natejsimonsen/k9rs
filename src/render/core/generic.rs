@@ -138,12 +138,17 @@ pub fn render_server_table_with(
                 .unwrap_or_default();
         }
         let mut row = Row::with(crate::k8s::fqn(&rns, &name), fields);
-        let meta = json!({"metadata": {
-            "name": r.name,
-            "namespace": r.namespace,
-            "labels": r.labels,
-            "creationTimestamp": r.creation_timestamp,
-        }});
+        // JSONPath columns see the row object: the full object when the
+        // table was fetched with includeObject=Object (views.yaml columns).
+        let meta = match &r.object {
+            Some(o) if o.is_object() => o.clone(),
+            _ => json!({"metadata": {
+                "name": r.name,
+                "namespace": r.namespace,
+                "labels": r.labels,
+                "creationTimestamp": r.creation_timestamp,
+            }}),
+        };
         match base.finish(Some(&meta), &default, ns, &mut row) {
             Ok(()) => rows.push(row),
             Err(e) => tracing::warn!(error = %e, "server table row render failed"),

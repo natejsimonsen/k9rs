@@ -20,7 +20,12 @@ jobs:
         with:
           toolchain: stable
           targets: ${{ matrix.target }}
-      - run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Build
+        # `k9rs version`: the tagged commit and its commit time (build.rs).
+        run: |
+          export K9RS_COMMIT="$GITHUB_SHA"
+          export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct "$GITHUB_SHA")"
+          cargo build --release --locked --target ${{ matrix.target }}
       - name: Package
         run: |
           name=k9rs-${GITHUB_REF_NAME}-${{ matrix.target }}

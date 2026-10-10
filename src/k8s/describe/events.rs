@@ -55,6 +55,12 @@ pub(crate) fn describe_events(ctx: &Ctx, w: &mut PrefixWriter, events: &[Value])
         if source.is_empty() {
             source = e.s("reportingComponent");
         }
+        // kubectl v0.35 prefixes the involved object's field path.
+        let mut message = e.s("message").trim().to_string();
+        let fp = e.s("involvedObject.fieldPath");
+        if !fp.is_empty() {
+            message = format!("{fp}: {message}");
+        }
         w.write(
             L1,
             &format!(
@@ -63,7 +69,7 @@ pub(crate) fn describe_events(ctx: &Ctx, w: &mut PrefixWriter, events: &[Value])
                 e.s("reason"),
                 interval,
                 source,
-                e.s("message").trim()
+                message
             ),
         );
     }

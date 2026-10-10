@@ -178,6 +178,7 @@ pub(crate) fn describe_pod(ctx: &Ctx, pod: J, events: &[Value]) -> Result<String
     print_labels_multiline(&mut w, "Node-Selectors", &spec.smap("nodeSelector"));
     print_tolerations_multiline(&mut w, "", "Tolerations", spec.arr("tolerations"));
     describe_topology_spread_constraints(spec.arr("topologySpreadConstraints"), &mut w, "");
+    describe_workload_reference(spec, &mut w, "");
     describe_events(ctx, &mut w, events);
     Ok(w.finish())
 }
@@ -777,6 +778,24 @@ pub(crate) fn describe_pod_template(ctx: &Ctx, template: J, w: &mut PrefixWriter
     }
     print_labels_multiline(w, "  Node-Selectors", &spec.smap("nodeSelector"));
     print_tolerations_multiline(w, "  ", "Tolerations", spec.arr("tolerations"));
+    describe_workload_reference(spec, w, "  ");
+}
+
+/// describeWorkloadReference (kubectl v0.35).
+fn describe_workload_reference(spec: J, w: &mut PrefixWriter, space: &str) {
+    if !spec.exists("workloadRef") {
+        return;
+    }
+    let r = spec.get("workloadRef");
+    w.write(L0, &format!("{space}WorkloadRef:\n"));
+    w.write(L1, &format!("Name:\t{}\n", r.s("name")));
+    w.write(L1, &format!("PodGroup:\t{}\n", r.s("podGroup")));
+    if !r.s("podGroupReplicaKey").is_empty() {
+        w.write(
+            L1,
+            &format!("PodGroupReplicaKey:\t{}\n", r.s("podGroupReplicaKey")),
+        );
+    }
 }
 
 /// qos.GetPodQOS.

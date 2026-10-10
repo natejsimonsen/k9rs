@@ -8,7 +8,7 @@ use anyhow::{anyhow, bail, Result};
 use kube::api::DynamicObject;
 use serde_json::{json, Value};
 
-use crate::k8s::{fqn, namespaced, DeleteOptions, ImageSpec, PortForwardSpec, SharedAccessor};
+use crate::k8s::{fqn, namespaced, DeleteOptions, PortForwardSpec, SharedAccessor};
 
 use super::helpers::*;
 use super::picker::Picker;
@@ -22,7 +22,7 @@ const MAGIC_PROMPT: &str = "Yes Please!";
 /// k9s event.go faultsFilter.
 const FAULTS_FILTER: &str = "Warning|Error";
 /// k9s node shell container.
-const K9S_SHELL: &str = "k9s-shell";
+const K9S_SHELL: &str = "k9rs-shell";
 const TOAST_PHASES: &[&str] = &[
     "Completed",
     "Pending",
@@ -62,6 +62,49 @@ where
     });
 }
 
+/// The CVE page for a scan row id (`image|name|ver|fix|type|vul|sev`).
+pub(crate) fn cve_url(path: &str) -> Option<String> {
+    let tt: Vec<&str> = path.split('|').collect();
+    let cve = tt.get(crate::render::core::CVE_PARSE_IDX)?;
+    let site = if cve.starts_with("GHSA") {
+        "https://github.com/advisories/"
+    } else {
+        "https://nvd.nist.gov/vuln/detail/"
+    };
+    Some(format!("{site}{cve}"))
+}
+
+/// img_scan.go viewCVE: open the CVE page in the browser, in the background.
+fn view_cve(path: &str) -> Vec<ViewCmd> {
+    let mut out = Vec::new();
+    if path.split('|').count() < 7 {
+        out.push(err(format!("parse path failed: {path}")));
+    }
+    let Some(site) = cve_url(path) else {
+        return out;
+    };
+    let bin = if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "sensible-browser"
+    };
+    let spawned = std::process::Command::new(bin)
+        .arg(&site)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+    match spawned {
+        Ok(mut c) => {
+            std::thread::spawn(move || {
+                let _ = c.wait();
+            });
+        }
+        Err(_) => out.push(err("unable to run browser command".to_string())),
+    }
+    out
+}
+
 /// Selector of a workload object (spec.selector).
 fn workload_selector(o: &DynamicObject) -> Result<String> {
     o.data
@@ -69,6 +112,55 @@ fn workload_selector(o: &DynamicObject) -> Result<String> {
         .and_then(label_selector_string)
         .ok_or_else(|| anyhow!("no selector found on {}", obj_fqn(o)))
 }
+
+/// view/exec.go bannerFmt, colored like fatih/color BgGreen+FgBlack+Bold.
+pub(crate) fn shell_banner(fqn: &str, co: &str) -> String {
+    let text = format!("<<K9rs-Shell>> Pod: {fqn} | Container: {co} \n");
+    // fatih/color.NoColor: NO_COLOR set or TERM=dumb.
+    if std::env::var_os("NO_COLOR").is_some() || std::env::var("TERM").as_deref() == Ok("dumb") {
+        return text;
+    }
+    format!("\x1b[42;30;1m{text}\x1b[0m")
+}
+
+/// data.WriteYAML of `helm get values -o json` output (nil maps print `{}`).
+fn values_yaml(json: &str) -> Result<String> {
+    let v: Value = serde_json::from_str(json.trim())?;
+    Ok(crate::k8s::goyaml::to_yaml(&null_map(v)))
+}
+
+fn null_map(v: Value) -> Value {
+    if v.is_null() {
+        Value::Object(Default::default())
+    } else {
+        v
+    }
+}
+
+/// Chart default values from a helm release secret
+/// (base64 of the gzipped release JSON, like helm's storage driver).
+fn helm_chart_values(sec: &DynamicObject) -> Result<Value> {
+    use base64::Engine as _;
+    use std::io::Read as _;
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let raw = sec
+        .data
+        .pointer("/data/release")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("no release data in {}", obj_fqn(sec)))?;
+    let bytes = b64.decode(b64.decode(raw)?)?;
+    let mut json = Vec::new();
+    if bytes.starts_with(&[0x1f, 0x8b, 0x08]) {
+        flate2::read::GzDecoder::new(&bytes[..]).read_to_end(&mut json)?;
+    } else {
+        json = bytes;
+    }
+    let rel: Value = serde_json::from_slice(&json)?;
+    Ok(rel.pointer("/chart/values").cloned().unwrap_or(Value::Null))
+}
+
+/// view/pod.go defaultTxRetries.
+const DEFAULT_TX_RETRIES: i64 = 999;
 
 /// kubectl exec/attach argv built from the accessor's exec command.
 pub(crate) fn exec_cmd(ctx: &Ctx, path: &str, co: &str, attach: bool, os: &str) -> ViewCmd {
@@ -92,14 +184,21 @@ pub(crate) fn exec_cmd(ctx: &Ctx, path: &str, co: &str, attach: bool, os: &str) 
     let what = if attach { "Attach" } else { "Shell" };
     ViewCmd::Suspend {
         argv,
+        banner: shell_banner(path, co),
         env: ctx.accessor.shell_env(),
-        on_done: Some(Box::new(move |_ctx, st| {
-            if st.success() {
-                Vec::new()
-            } else {
-                vec![err(format!("{what} exec failed: {st}"))]
-            }
+        on_done: Some(Box::new(move |_ctx, st| match exec_failure(&st) {
+            Some(e) => vec![err(format!("{what} exec failed: {e}"))],
+            None => Vec::new(),
         })),
+    }
+}
+
+/// exec.go pipe error for a finished foreground command: a non-zero exit
+/// is "command failed. Check k9s logs: exit status N"; a signal is ignored.
+pub(crate) fn exec_failure(st: &std::process::ExitStatus) -> Option<String> {
+    match st.code() {
+        Some(0) | None => None,
+        Some(c) => Some(format!("command failed. Check k9rs logs: exit status {c}")),
     }
 }
 
@@ -130,6 +229,7 @@ fn edit_file(file: &str) -> Vec<ViewCmd> {
     match editor_argv(file) {
         Some(argv) => vec![ViewCmd::Suspend {
             argv,
+            banner: String::new(),
             env: Vec::new(),
             on_done: Some(Box::new(|_ctx, st| {
                 if st.success() {
@@ -295,12 +395,13 @@ fn jump_owner(
     vec![ViewCmd::Push(Box::new(b))]
 }
 
-/// Port-forward ports + default spec for a pod.
+/// Port-forward ports, the default spec and the dialog prefill for a pod
+/// (Annotations.PreferredPorts + PFAnns.ToPortSpec).
 fn pf_choices(
     pod: &DynamicObject,
     only: Option<&str>,
     address: &str,
-) -> (Vec<String>, PortForwardSpec) {
+) -> (Vec<String>, PortForwardSpec, (String, String)) {
     let spec = pod.data.get("spec").cloned().unwrap_or(Value::Null);
     let ports = container_ports(&spec, only);
     let ns = pod.metadata.namespace.clone().unwrap_or_default();
@@ -311,10 +412,8 @@ fn pf_choices(
         address: address.to_string(),
         ..Default::default()
     };
-    if let Some((co, _, num)) = ports.first() {
+    if let Some((co, _, _)) = ports.first() {
         def.container = co.clone();
-        def.container_port = *num;
-        def.local_port = *num;
     } else if let Some(co) = only {
         def.container = co.to_string();
     }
@@ -322,23 +421,36 @@ fn pf_choices(
         .metadata
         .annotations
         .as_ref()
-        .and_then(|a| a.get("k9scli.io/port-forwards").cloned())
-        .unwrap_or_default();
-    if let Some(pref) = parse_pf_annotation(&ann).into_iter().next() {
-        if let Some((co, _, num)) = ports.iter().find(|(co, name, num)| {
-            (pref.container.is_empty() || *co == pref.container)
-                && (*name == pref.remote || num.to_string() == pref.remote)
-        }) {
-            def.container = co.clone();
-            def.container_port = *num;
-            def.local_port = pref.local.parse().unwrap_or(*num);
-        }
-    }
+        .and_then(|a| a.get("k9scli.io/port-forwards").cloned());
+    // (container::port, local port) pairs.
+    let prefs: Vec<(String, String)> = match (&ann, ports.first()) {
+        (_, None) => Vec::new(),
+        (None, Some((co, _, num))) => vec![(format!("{co}::{num}"), num.to_string())],
+        // MatchAnnotations: the container must match and the port by name or number.
+        (Some(ann), Some(_)) => parse_pf_annotation(ann)
+            .into_iter()
+            .filter_map(|a| {
+                let (co, _, num) = ports.iter().find(|(co, name, num)| {
+                    *co == a.container && (*name == a.remote || num.to_string() == a.remote)
+                })?;
+                let local = if a.local.is_empty() {
+                    num.to_string()
+                } else {
+                    a.local
+                };
+                Some((format!("{co}::{num}"), local))
+            })
+            .collect(),
+    };
+    let join = |f: fn(&(String, String)) -> &String| {
+        prefs.iter().map(f).cloned().collect::<Vec<_>>().join(",")
+    };
+    let prefill = (join(|p| &p.0), join(|p| &p.1));
     let strs = ports
         .iter()
         .map(|(co, n, num)| port_spec_string(co, n, *num))
         .collect();
-    (strs, def)
+    (strs, def, prefill)
 }
 
 /// Auto port-forwards from `k9scli.io/auto-port-forwards`.
@@ -379,28 +491,65 @@ fn auto_forwards(pod: &DynamicObject, address: &str) -> Option<Vec<PortForwardSp
     Some(out)
 }
 
-fn pf_dialog(id: ViewId, path: String, spec: PortForwardSpec, ports: Vec<String>) -> ViewCmd {
+fn pf_dialog(
+    id: ViewId,
+    spec: PortForwardSpec,
+    ports: Vec<String>,
+    prefill: (String, String),
+) -> ViewCmd {
     ViewCmd::Dialog(Dialog::PortForward {
         spec,
         ports,
-        on_ok: Box::new(move |ctx, spec| {
-            if spec.container_port == 0 || spec.local_port == 0 {
-                return vec![err("container to local port mismatch")];
-            }
-            if ctx.port_forwards.contains_key(&spec.id()) {
-                return vec![err(format!("port-forward is already active on pod {path}"))];
-            }
+        prefill,
+        // The dialog already checked the ports (startFwdCB).
+        on_ok: Box::new(move |ctx, tunnels| {
             let acc = ctx.accessor.clone();
             spawn_msg(ctx, id, async move {
-                Ok(Msg::PfStarted(vec![acc.port_forward(spec).await?]))
+                let mut hh = Vec::new();
+                for t in tunnels {
+                    hh.push(acc.port_forward(t).await?);
+                }
+                Ok(Msg::PfStarted(hh))
             });
             Vec::new()
         }),
     })
 }
 
+/// exec.go nukeK9sShell: delete the shell pod; a missing pod is fine.
+async fn nuke_shell(acc: &SharedAccessor, pod_path: &str) -> Result<()> {
+    let pods = pods_gvr();
+    let del = acc.delete(&pods, pod_path, DeleteOptions::default());
+    match tokio::time::timeout(std::time::Duration::from_millis(500), del).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) if format!("{e:#}").contains("not found") => Ok(()),
+        Ok(Err(e)) => Err(e),
+        Err(_) => Err(anyhow!("context deadline exceeded")),
+    }
+}
+
+/// exec.go launchShellPod: create the pod, then poll (50 x 2s) for Running.
+async fn launch_shell_pod(
+    acc: &SharedAccessor,
+    pod_path: &str,
+    manifest: &Value,
+    node: &str,
+) -> Result<()> {
+    let pods = pods_gvr();
+    acc.create(&pods, pod_path, manifest).await?;
+    for _ in 0..50 {
+        if let Ok(p) = acc.get(&pods, pod_path).await {
+            if p.data.pointer("/status/phase").and_then(|v| v.as_str()) == Some("Running") {
+                return Ok(());
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+    bail!("unable to launch shell pod on node {node}")
+}
+
 /// k9s shell pod manifest (exec.go k9sShellPod).
-fn shell_pod_manifest(node: &str, name: &str, cfg: &crate::config::ShellPod) -> Value {
+pub(super) fn shell_pod_manifest(node: &str, name: &str, cfg: &crate::config::ShellPod) -> Value {
     let mut container = json!({
         "name": K9S_SHELL,
         "image": cfg.image,
@@ -413,6 +562,9 @@ fn shell_pod_manifest(node: &str, name: &str, cfg: &crate::config::ShellPod) -> 
         "securityContext": {"privileged": true},
     });
     let mut volumes = vec![json!({"name": "root-vol", "hostPath": {"path": "/"}})];
+    if !cfg.image_pull_policy.is_empty() {
+        container["imagePullPolicy"] = json!(cfg.image_pull_policy);
+    }
     if !cfg.command.is_empty() {
         container["command"] = json!(cfg.command);
     }
@@ -425,7 +577,7 @@ fn shell_pod_manifest(node: &str, name: &str, cfg: &crate::config::ShellPod) -> 
         }
         volumes.push(json!({"name": h.name, "hostPath": {"path": h.host_path}}));
     }
-    json!({
+    let mut pod = json!({
         "apiVersion": "v1",
         "kind": "Pod",
         "metadata": {"name": name, "namespace": cfg.namespace, "labels": cfg.labels},
@@ -439,46 +591,124 @@ fn shell_pod_manifest(node: &str, name: &str, cfg: &crate::config::ShellPod) -> 
             "containers": [container],
             "tolerations": [{"operator": "Exists"}],
         }
-    })
+    });
+    if !cfg.image_pull_secrets.is_empty() {
+        pod["spec"]["imagePullSecrets"] = json!(cfg.image_pull_secrets);
+    }
+    pod
 }
 
 /// Rollback a replicaset's deployment to its pod template (kubectl rollout undo).
-async fn rollback_rs(acc: SharedAccessor, path: String) -> Result<()> {
-    let rs = acc.get(&Gvr::parse("apps/v1/replicasets"), &path).await?;
+/// dao.ReplicaSet.Rollback -> kubectl DeploymentRollbacker.Rollback.
+pub(super) async fn rollback_rs(acc: SharedAccessor, path: String) -> Result<()> {
+    let rs_gvr = Gvr::parse("apps/v1/replicasets");
+    let rs = acc.get(&rs_gvr, &path).await?;
+    // getRSRevision
+    if rs
+        .data
+        .pointer("/status/replicas")
+        .and_then(Value::as_i64)
+        .unwrap_or(0)
+        != 0
+    {
+        bail!("can not rollback current replica");
+    }
+    let revision = |o: &DynamicObject| {
+        o.metadata
+            .annotations
+            .as_ref()
+            .and_then(|a| a.get(RS_REVISION))
+            .and_then(|r| r.parse::<i64>().ok())
+    };
+    let version = revision(&rs).ok_or_else(|| anyhow!("revision conversion failed"))?;
+    // controllerInfo
     let owner = rs
         .metadata
         .owner_references
         .as_ref()
-        .and_then(|oo| {
-            oo.iter()
-                .find(|o| o.controller == Some(true))
-                .or_else(|| oo.first())
-        })
-        .ok_or_else(|| anyhow!("no controller found for replicaset {path}"))?;
+        .and_then(|oo| oo.iter().find(|o| o.controller.is_some()))
+        .ok_or_else(|| {
+            anyhow!(
+                "unable to find controller for replicaset: {}",
+                rs.metadata.name.clone().unwrap_or_default()
+            )
+        })?;
     if owner.kind != "Deployment" {
-        bail!("unsupported controller kind {:?}", owner.kind);
+        bail!("no rollbacker has been implemented for {:?}", owner.kind);
     }
     let ns = rs.metadata.namespace.clone().unwrap_or_default();
     let dp_gvr = Gvr::parse("apps/v1/deployments");
     let dp_path = fqn(&ns, &owner.name);
-    let mut dp = acc.get(&dp_gvr, &dp_path).await?;
-    let mut tpl = rs
-        .data
-        .pointer("/spec/template")
-        .cloned()
-        .ok_or_else(|| anyhow!("replicaset {path} has no pod template"))?;
-    if let Some(labels) = tpl
-        .pointer_mut("/metadata/labels")
-        .and_then(|v| v.as_object_mut())
-    {
-        labels.remove("pod-template-hash");
+    let dp = acc
+        .get(&dp_gvr, &dp_path)
+        .await
+        .map_err(|e| anyhow!("failed to retrieve Deployment {}: {e}", owner.name))?;
+    // deploymentRevision over the deployment's replica sets.
+    let uid = dp.metadata.uid.clone().unwrap_or_default();
+    let sel = workload_selector(&dp)?;
+    let target = acc
+        .list(&rs_gvr, &ns, Some(&sel))
+        .await?
+        .into_iter()
+        .filter(|r| {
+            r.metadata
+                .owner_references
+                .iter()
+                .flatten()
+                .any(|o| o.controller == Some(true) && o.uid == uid)
+        })
+        .find(|r| revision(r) == Some(version))
+        .ok_or_else(|| anyhow!("unable to find specified revision {version} in history"))?;
+    if dp.data.pointer("/spec/paused").and_then(Value::as_bool) == Some(true) {
+        bail!("you cannot rollback a paused deployment; resume it first with 'kubectl rollout resume' and try again");
     }
-    if let Some(spec) = dp.data.get_mut("spec").and_then(|v| v.as_object_mut()) {
-        spec.insert("template".into(), tpl);
+    let hashless = |t: Option<&Value>| {
+        let mut t = t.cloned().unwrap_or(Value::Null);
+        if let Some(l) = t
+            .pointer_mut("/metadata/labels")
+            .and_then(Value::as_object_mut)
+        {
+            l.remove(POD_TEMPLATE_HASH);
+        }
+        t
+    };
+    let tpl = hashless(target.data.pointer("/spec/template"));
+    // "skipped rollback": the template already matches (k9s still reports success).
+    if tpl == hashless(dp.data.pointer("/spec/template")) {
+        return Ok(());
     }
-    let yaml = serde_yaml::to_string(&dp)?;
-    acc.apply_yaml(&dp_gvr, &dp_path, &yaml).await
+    // Deployment keeps the skipped annotations; the rest come from the revision.
+    let mut annotations = serde_json::Map::new();
+    for k in ROLLBACK_SKIP_ANNOTATIONS {
+        if let Some(v) = dp.metadata.annotations.as_ref().and_then(|a| a.get(k)) {
+            annotations.insert(k.to_string(), json!(v));
+        }
+    }
+    for (k, v) in target.metadata.annotations.iter().flatten() {
+        if !ROLLBACK_SKIP_ANNOTATIONS.contains(&k.as_str()) {
+            annotations.insert(k.clone(), json!(v));
+        }
+    }
+    let patch = json!([
+        {"op": "replace", "path": "/spec/template", "value": tpl},
+        {"op": "replace", "path": "/metadata/annotations", "value": annotations},
+    ]);
+    acc.patch_json(&dp_gvr, &dp_path, &patch)
+        .await
+        .map_err(|e| anyhow!("failed restoring revision {version}: {e}"))
 }
+
+const RS_REVISION: &str = "deployment.kubernetes.io/revision";
+const POD_TEMPLATE_HASH: &str = "pod-template-hash";
+/// kubectl polymorphichelpers annotationsToSkip.
+const ROLLBACK_SKIP_ANNOTATIONS: [&str; 6] = [
+    "kubectl.kubernetes.io/last-applied-configuration",
+    "deployment.kubernetes.io/revision",
+    "deployment.kubernetes.io/revision-history",
+    "deployment.kubernetes.io/desired-replicas",
+    "deployment.kubernetes.io/max-replicas",
+    "deprecated.deployment.rollback.to",
+];
 
 impl Browser {
     fn spawn(&self, ctx: &Ctx, fut: impl Future<Output = Result<Msg>> + Send + 'static) {
@@ -534,6 +764,10 @@ impl Browser {
             &path,
             &self.table.data.header,
             row,
+        );
+        env.set(
+            "GROUPS",
+            crate::ui::shell::plugins::groups_env(&ctx.accessor.impersonate_groups()),
         );
         env.set("FILTER", self.filter.clone());
         if self.filter.is_empty() {
@@ -619,7 +853,7 @@ impl Browser {
                     })
                     .collect();
                 if let Err(e) = (self.deps.clipboard)(&parts.join("\n")) {
-                    tracing::warn!(error = %e, "clipboard write failed");
+                    return vec![err(e.to_string())];
                 }
                 let what = if ns { "namespace" } else { "name" };
                 if parts.len() > 1 {
@@ -686,7 +920,7 @@ impl Browser {
             Act::Restart => self.restart(),
             Act::Kill => self.kill(ctx),
             Act::Shell | Act::Attach => self.shell(sel, act == Act::Attach, ctx),
-            Act::Transfer => self.transfer(sel),
+            Act::Transfer => self.transfer(sel, ctx),
             Act::Sanitize => self.sanitize(),
             Act::ShowNode => {
                 let Some(path) = sel else {
@@ -749,6 +983,49 @@ impl Browser {
             Act::Cordon(on) => self.cordon(on),
             Act::Drain => self.drain(),
             Act::NodeShell => self.node_shell(sel, ctx),
+            Act::RenameContext => {
+                let Some(name) = sel else {
+                    return Vec::new();
+                };
+                let id = self.id;
+                vec![ViewCmd::Dialog(Dialog::Rename {
+                    name: name.clone(),
+                    on_ok: Box::new(move |ctx, new| {
+                        // renameDialogCallback: flash the error, refresh on success.
+                        let acc = ctx.accessor.clone();
+                        spawn_msg(ctx, id, async move {
+                            acc.rename_context(&name, &new).await?;
+                            // c.Refresh repaints the model's last data; the next
+                            // refresh tick shows the change.
+                            Ok(Msg::Cmds(Vec::new()))
+                        });
+                        Vec::new()
+                    }),
+                })]
+            }
+            Act::DeleteContext => {
+                let Some(name) = sel else {
+                    return Vec::new();
+                };
+                let id = self.id;
+                vec![ViewCmd::Dialog(Dialog::Confirm {
+                    title: "Delete".into(),
+                    msg: format!(
+                        "Delete context {}?",
+                        crate::ui::shell::text::go_quote(&name)
+                    ),
+                    on_ok: Box::new(move |ctx| {
+                        let acc = ctx.accessor.clone();
+                        spawn_msg(ctx, id, async move {
+                            acc.delete_context(&name).await?;
+                            // c.Refresh repaints the model's last data; the next
+                            // refresh tick shows the change.
+                            Ok(Msg::Cmds(Vec::new()))
+                        });
+                        Vec::new()
+                    }),
+                })]
+            }
             Act::UseNamespace => {
                 let Some(path) = sel else {
                     return Vec::new();
@@ -757,6 +1034,9 @@ impl Browser {
                 if print_namespace(&cleanse_namespace(&ctx.namespace)) == ns {
                     return Vec::new();
                 }
+                // Config.SetActiveNamespace adds the favorite the ns view decorates.
+                self.cc.set_active_namespace(&ns);
+                self.dirty = true;
                 vec![ViewCmd::SetNamespace(ns)]
             }
             Act::Bench => self.bench(sel, ctx),
@@ -787,6 +1067,14 @@ impl Browser {
                 });
                 Vec::new()
             }
+            Act::ShowVulns => self.push_child(
+                ctx,
+                Gvr::parse("scans"),
+                Opts {
+                    source: Some((self.gvr.clone(), sel.unwrap_or_default())),
+                    ..Default::default()
+                },
+            ),
             Act::UsedBy => {
                 let Some(path) = sel else {
                     return Vec::new();
@@ -864,7 +1152,8 @@ impl Browser {
                 let Some(hk) = ctx.hotkeys.hot_keys.get(&name) else {
                     return Vec::new();
                 };
-                vec![ViewCmd::Command(self.env(ctx).substitute(&hk.command))]
+                let cmd = self.env(ctx).substitute(&hk.command);
+                vec![crate::ui::shell::plugins::hotkey_goto(cmd, hk.keep_history)]
             }
         }
     }
@@ -940,13 +1229,16 @@ impl Browser {
                     .map(|(i, o)| format!("{i}: {}", o.1))
                     .collect();
                 let deps = self.deps.clone();
-                let p = Picker::new(
-                    ctx,
-                    "Jump To",
-                    items,
-                    Box::new(move |ctx, idx, _| jump_owner(ctx, &deps, &ns, &owners[idx])),
-                );
-                vec![ViewCmd::Push(Box::new(p))]
+                // owner_extender.go: dialog.ShowSelection over the table; the
+                // picked list index addresses the owner list directly.
+                vec![ViewCmd::Dialog(Dialog::Selection {
+                    title: "Jump To".into(),
+                    options: items,
+                    on_select: Box::new(move |ctx, idx| match owners.get(idx) {
+                        Some(o) => jump_owner(ctx, &deps, &ns, o),
+                        None => Vec::new(),
+                    }),
+                })]
             }
             Msg::PickShell {
                 path,
@@ -970,8 +1262,24 @@ impl Browser {
                     .iter()
                     .map(|h| h.info.spec.local_port.to_string())
                     .collect();
-                for h in handles {
-                    ctx.port_forwards.insert(h.info.spec.id(), h);
+                for mut h in handles {
+                    let id = h.info.spec.id();
+                    if let Some(died) = h.died.take() {
+                        let tx = ctx.sender();
+                        let pid = id.clone();
+                        ctx.spawn(async move {
+                            if let Ok(err) = died.await {
+                                let _ = tx.send(AppEvent::Custom {
+                                    view: crate::ui::shell::SHELL_VIEW_ID,
+                                    payload: Box::new(crate::ui::app::PortForwardDied {
+                                        id: pid,
+                                        err,
+                                    }),
+                                });
+                            }
+                        });
+                    }
+                    ctx.port_forwards.insert(id, h);
                 }
                 self.dirty = true;
                 if ports.len() == 1 {
@@ -982,6 +1290,16 @@ impl Browser {
             }
             Msg::Text { name, title, body } => {
                 vec![ViewCmd::Push((self.deps.text)(ctx, name, title, body))]
+            }
+            Msg::Release {
+                title,
+                subject,
+                body,
+            } => vec![ViewCmd::Push((self.deps.release)(
+                ctx, title, subject, body,
+            ))],
+            Msg::Values { subject, user, all } => {
+                vec![ViewCmd::Push((self.deps.values)(ctx, subject, user, all))]
             }
             Msg::Refs { gvr, path } => {
                 let mut out = vec![info(format!("Viewing references for {gvr}::{path}"))];
@@ -1015,18 +1333,52 @@ impl Browser {
                 self.watch_failed = true;
                 vec![ViewCmd::Flash(FlashLevel::Err, e)]
             }
+            Msg::FilterCompleted => {
+                self.completion_pending = false;
+                self.filter_completed();
+                Vec::new()
+            }
+            Msg::ListAllNs(ok) => {
+                if self.list_all_ns != ok {
+                    self.list_all_ns = ok;
+                    self.refresh_actions(ctx);
+                }
+                Vec::new()
+            }
             Msg::Refresh => {
                 self.dirty = true;
                 self.spawn_load(ctx, true);
                 Vec::new()
             }
+            Msg::InitRefresh => {
+                if self.active {
+                    self.spawn_load(ctx, false);
+                }
+                Vec::new()
+            }
             Msg::BenchDone(res) => {
                 self.bench = None;
                 match res {
-                    Ok(_) => vec![info("Benchmark Completed!")],
-                    Err(e) => vec![err(format!("Benchmark failed {e}"))],
+                    Ok(_) => {
+                        // runBenchmark: completed status, cleared 2s later.
+                        let tx = ctx.sender();
+                        let id = self.id;
+                        ctx.spawn(async move {
+                            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                            post(&tx, id, Msg::ClearStatus);
+                        });
+                        vec![ViewCmd::Status(
+                            FlashLevel::Info,
+                            "Benchmark Completed!".into(),
+                        )]
+                    }
+                    Err(e) => vec![
+                        err(format!("Benchmark failed {e}")),
+                        ViewCmd::ClearStatus(false),
+                    ],
                 }
             }
+            Msg::ClearStatus => vec![ViewCmd::ClearStatus(true)],
         }
     }
 
@@ -1060,13 +1412,26 @@ impl Browser {
         };
         let nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
         let file = format!("{name}-{ns}-{nanos}.csv").to_lowercase();
+        let with_ns = !self.renderer.is_generic()
+            && td.header.index_of("NAMESPACE").is_none()
+            && self.renderer.header(NAMESPACE_ALL).index_of("NAMESPACE") == Some(0);
         let res = (|| -> Result<PathBuf> {
-            std::fs::create_dir_all(&dir)?;
+            crate::config::paths::ensure_full_path(&dir)?;
             let p = dir.join(&file);
-            let header: Vec<String> = td.header.iter().map(|h| h.name.clone()).collect();
-            let rows: Vec<Vec<String>> = td.rows.iter().map(|r| r.row.fields.clone()).collect();
+            let mut header: Vec<String> = td.header.iter().map(|h| h.name.clone()).collect();
+            let mut rows: Vec<Vec<String>> = td.rows.iter().map(|r| r.row.fields.clone()).collect();
+            // k9s typed renderers always carry NAMESPACE (only the view hides
+            // it); ours drop it outside all-namespaces, so put it back.
+            if with_ns {
+                header.insert(0, "NAMESPACE".into());
+                for (r, re) in rows.iter_mut().zip(td.rows.iter()) {
+                    r.insert(0, namespaced(&re.row.id).0.to_string());
+                }
+            }
+            // k9s OpenFile(O_CREATE|O_WRONLY, 0600): no truncation.
             let mut opts = std::fs::OpenOptions::new();
-            opts.create(true).write(true).truncate(true);
+            #[allow(clippy::suspicious_open_options)]
+            opts.create(true).write(true);
             #[cfg(unix)]
             {
                 use std::os::unix::fs::OpenOptionsExt;
@@ -1093,8 +1458,19 @@ impl Browser {
     }
 
     fn switch_ns(&mut self, ns: &str, ctx: &Ctx) -> Vec<ViewCmd> {
+        // browser.go switchNamespaceCmd: the user must list the resource there.
+        let (acc, g, n) = (ctx.accessor.clone(), self.gvr.clone(), ns.to_string());
+        match block_on(async move { acc.can(&g, &n, "list").await }) {
+            Ok(true) => {}
+            Ok(false) => return vec![err(format!("access denied for user on: {ns}/{}", self.gvr))],
+            Err(e) => return vec![err(e.to_string())],
+        }
         self.set_namespace(ns);
+        self.cc.set_active_namespace(ns);
         self.table.select_first();
+        // b.refresh() is Start: reset the first view counter and watch again.
+        self.first_view = false;
+        self.watch_checked = false;
         self.spawn_load(ctx, true);
         let msg = if is_cluster_scoped(ns) {
             format!("Viewing {}...", self.gvr)
@@ -1171,25 +1547,23 @@ impl Browser {
                 },
                 ctx,
             ),
+            // ns.go switchNs: useNamespace, then gotoResource("v1/pods <ns>",
+            // clearStack=false, pushCmd=true): the pods view lands in history.
             Kind::Namespace => {
                 let ns = namespaced(&path).1.to_string();
                 let mut out = Vec::new();
                 if print_namespace(&cleanse_namespace(&ctx.namespace)) != ns {
                     out.push(ViewCmd::SetNamespace(ns.clone()));
                 }
-                out.extend(self.push_child(
-                    ctx,
-                    pods_gvr(),
-                    Opts {
-                        ns: Some(ns),
-                        ..Default::default()
-                    },
-                ));
+                out.push(ViewCmd::Goto {
+                    cmd: format!("{} {ns}", pods_gvr()),
+                    path: String::new(),
+                });
                 out
             }
             // view/context.go useContext -> app.switchContext: the shell
             // switches, flashes and jumps to the context's last view.
-            Kind::Context => vec![ViewCmd::Command(format!("ctx {path}"))],
+            Kind::Context => vec![ViewCmd::UseContext(path)],
             Kind::Service => {
                 self.spawn(ctx, async move {
                     let o = acc.get(&gvr, &path).await?;
@@ -1218,21 +1592,12 @@ impl Browser {
                 });
                 Vec::new()
             }
-            Kind::Crd => {
-                let crd = namespaced(&path).1.to_string();
-                let (plural, group) = crd.split_once('.').unwrap_or((crd.as_str(), ""));
-                let found = ctx
-                    .resources
-                    .iter()
-                    .find(|m| m.gvr.r() == plural && m.gvr.g() == group)
-                    .map(|m| m.gvr.clone());
-                match found {
-                    Some(g) => self.push_child(ctx, g, Opts::default()),
-                    None => vec![ViewCmd::Dialog(Dialog::Error {
-                        msg: format!("`{crd}` command not found"),
-                    })],
-                }
-            }
+            // crd.go showCRD: gotoResource(crd name, "", false, true), i.e.
+            // the name runs as a command (aliases, history).
+            Kind::Crd => vec![ViewCmd::Goto {
+                cmd: namespaced(&path).1.to_string(),
+                path: String::new(),
+            }],
             Kind::ServiceAccount | Kind::User | Kind::Group => self.run(Act::Rules, ctx),
             Kind::Rules | Kind::Policy => Vec::new(),
             Kind::Alias => vec![ViewCmd::Command(Gvr::parse(&path).to_string())],
@@ -1276,7 +1641,7 @@ impl Browser {
                 }
                 self.push_child(
                     ctx,
-                    Gvr::parse("dir"),
+                    Gvr::parse("dirs"),
                     Opts {
                         dir: Some(PathBuf::from(&path)),
                         path,
@@ -1301,6 +1666,7 @@ impl Browser {
                     },
                 )
             }
+            Kind::ImageScan => view_cve(&path),
             Kind::Reference => {
                 let g = self.table.selected_cell("GVR").unwrap_or_default();
                 let (ns, _) = namespaced(&path);
@@ -1336,12 +1702,27 @@ impl Browser {
         let Some((gvr, path)) = self.target(&path) else {
             return vec![err(format!("unable to parse path: {path:?}"))];
         };
-        let (_, n) = namespaced(&path);
+        let (ns, n) = namespaced(&path);
         if n.is_empty() {
             return vec![err(format!("missing resource name in path {path:?}"))];
         }
+        // browser.go editRes: CanI patch first.
+        let ns = if is_cluster_scoped(ns) { "" } else { ns };
+        let (acc, g, ns2, n2) = (
+            ctx.accessor.clone(),
+            gvr.clone(),
+            ns.to_string(),
+            n.to_string(),
+        );
+        if !matches!(
+            block_on(async move { acc.can_named(&g, &ns2, &n2, "patch").await }),
+            Ok(true)
+        ) {
+            return vec![err(format!("current user can't edit resource {gvr}"))];
+        }
         vec![ViewCmd::Suspend {
             argv: ctx.accessor.edit_argv(&gvr, &path),
+            banner: String::new(),
             env: ctx.accessor.shell_env(),
             on_done: Some(Box::new(|_ctx, st| {
                 if st.success() {
@@ -1375,11 +1756,19 @@ impl Browser {
             argv.extend(self.kube_ctx_args(ctx));
             let (run, env) = (self.deps.run.clone(), ctx.accessor.shell_env());
             let title = if yaml { "YAML" } else { "Describe" };
+            // The selected path (release, or release:revision) is the subject.
+            let subject = if self.kind == Kind::Helm { rel } else { path };
             self.spawn(ctx, async move {
-                let body = run(argv, env).await?;
-                Ok(Msg::Text {
-                    name: title.into(),
-                    title: rel,
+                let out = run(argv, env).await?;
+                // Release.Info.Notes, without the CLI's "NOTES:" header.
+                let body = if yaml {
+                    out
+                } else {
+                    out.strip_prefix("NOTES:\n").unwrap_or(&out).to_string()
+                };
+                Ok(Msg::Release {
+                    title: title.into(),
+                    subject,
                     body,
                 })
             });
@@ -1402,6 +1791,24 @@ impl Browser {
         let Some((gvr, path)) = self.target(&path) else {
             return vec![err(format!("unable to parse path: {path:?}"))];
         };
+        // node.go yamlCmd: a one-shot YAML Details view, not a live view.
+        if yaml && self.kind == Kind::Node {
+            let acc = ctx.accessor.clone();
+            self.spawn(ctx, async move {
+                let body = acc.to_yaml(&gvr, &path, false).await.map_err(|e| {
+                    anyhow!(
+                        "Unable to get resource {} -- {e}",
+                        crate::ui::shell::text::go_quote(&gvr.to_string())
+                    )
+                })?;
+                Ok(Msg::Text {
+                    name: "YAML".into(),
+                    title: path,
+                    body,
+                })
+            });
+            return Vec::new();
+        }
         let v = if yaml {
             (self.deps.yaml)(ctx, gvr, path)
         } else {
@@ -1420,11 +1827,13 @@ impl Browser {
     }
 
     /// (release fqn, revision) of a helm row.
-    fn helm_target(&self, id: &str) -> (String, Option<String>) {
+    pub(super) fn helm_target(&self, id: &str) -> (String, Option<String>) {
         if self.kind == Kind::Helm {
             return (id.to_string(), None);
         }
-        let rev = id.rsplit_once(':').map(|(_, r)| r).unwrap_or(id);
+        // `name:revision`; anything else has no revision (helm_history.go).
+        let tt: Vec<&str> = namespaced(id).1.split(':').collect();
+        let rev = if tt.len() == 2 { tt[1] } else { "" };
         (self.path.clone(), Some(rev.to_string()))
     }
 
@@ -1517,15 +1926,33 @@ impl Browser {
             return Vec::new();
         };
         let mut base = self.logger(ctx, prev);
+        // showLogs: CanForResource(ns, pods, list) first.
+        let pods_ns = if self.kind == Kind::Container {
+            namespaced(&self.path).0.to_string()
+        } else {
+            namespaced(&path).0.to_string()
+        };
+        let can_list = |acc: SharedAccessor, ns: String| async move {
+            if !acc.can(&crate::k8s::known::pods(), &ns, "list").await? {
+                bail!("[list] access denied on resource {ns:?}:\"v1/pods\"");
+            }
+            Ok::<(), anyhow::Error>(())
+        };
         if self.kind == Kind::Container {
             let (ns, po) = namespaced(&self.path);
             base.namespace = ns.to_string();
             base.path = po.to_string();
             base.container = Some(path);
-            return vec![ViewCmd::Push((self.deps.logs)(ctx, base))];
+            let acc = ctx.accessor.clone();
+            self.spawn(ctx, async move {
+                can_list(acc, pods_ns).await?;
+                Ok(Msg::Logs(base))
+            });
+            return Vec::new();
         }
         let (acc, gvr, kind) = (ctx.accessor.clone(), self.gvr.clone(), self.kind);
         self.spawn(ctx, async move {
+            can_list(acc.clone(), pods_ns).await?;
             let o = acc.get(&gvr, &path).await?;
             let (ns, name) = namespaced(&path);
             base.namespace = ns.to_string();
@@ -1543,10 +1970,12 @@ impl Browser {
                         .and_then(map_selector_string)
                         .ok_or_else(|| anyhow!("no selector found on service {path}"))?;
                     base.all_containers = true;
+                    base.view_path = Some(path.clone());
                     Ok(Msg::Logs(base))
                 }
                 _ => {
                     base.path = workload_selector(&o)?;
+                    base.view_path = Some(path.clone());
                     let spec = pod_spec(&o).cloned().unwrap_or(Value::Null);
                     Ok(Msg::Logs(pod_log_options(&o, &spec, base)))
                 }
@@ -1586,34 +2015,10 @@ impl Browser {
                     current.push((name, image, init));
                 }
             }
-            let value = current
-                .iter()
-                .map(|(n, i, _)| format!("{n}={i}"))
-                .collect::<Vec<_>>()
-                .join(",");
-            Ok(Msg::Cmds(vec![ViewCmd::Dialog(Dialog::Prompt {
-                title: "<Set image>".into(),
-                label: format!("Set image {gvr} {path}"),
-                value,
-                on_ok: Box::new(move |ctx, text| {
-                    let mut specs = Vec::new();
-                    for pair in text.split([',', ' ']).filter(|p| !p.is_empty()) {
-                        let Some((n, img)) = pair.split_once('=') else {
-                            continue;
-                        };
-                        let img = img.trim();
-                        if let Some((_, old, init)) =
-                            current.iter().find(|(cn, _, _)| cn == n.trim())
-                        {
-                            if !img.is_empty() && img != old {
-                                specs.push(ImageSpec {
-                                    name: n.trim().to_string(),
-                                    docker_image: img.to_string(),
-                                    init: *init,
-                                });
-                            }
-                        }
-                    }
+            Ok(Msg::Cmds(vec![ViewCmd::Dialog(Dialog::SetImage {
+                msg: format!("Set image {gvr} {path}"),
+                containers: current,
+                on_ok: Box::new(move |ctx, specs| {
                     let acc = ctx.accessor.clone();
                     spawn_msg(ctx, id, async move {
                         acc.set_images(&gvr, &path, specs).await?;
@@ -1721,13 +2126,8 @@ impl Browser {
                 if st.pointer("/state/running").is_none() {
                     bail!("Container {path} is not running?");
                 }
-                let (ports, spec) = pf_choices(&pod, Some(&path), &address);
-                Ok(Msg::Cmds(vec![pf_dialog(
-                    id,
-                    format!("{pod_path}|{path}"),
-                    spec,
-                    ports,
-                )]))
+                let (ports, spec, prefill) = pf_choices(&pod, Some(&path), &address);
+                Ok(Msg::Cmds(vec![pf_dialog(id, spec, ports, prefill)]))
             });
             return Vec::new();
         }
@@ -1751,12 +2151,16 @@ impl Browser {
             if let Some(specs) = auto_forwards(&pod, &address) {
                 let mut hh = Vec::new();
                 for s in specs {
+                    // PFAnns.ToTunnels with IsPortFree.
+                    if !crate::ui::shell::dialog::port_free(&s.address, s.local_port) {
+                        bail!("port {} is not available on host", s.local_port);
+                    }
                     hh.push(acc.port_forward(s).await?);
                 }
                 return Ok(Msg::PfStarted(hh));
             }
-            let (ports, spec) = pf_choices(&pod, None, &address);
-            Ok(Msg::Cmds(vec![pf_dialog(id, pod_path, spec, ports)]))
+            let (ports, spec, prefill) = pf_choices(&pod, None, &address);
+            Ok(Msg::Cmds(vec![pf_dialog(id, spec, ports, prefill)]))
         });
         Vec::new()
     }
@@ -1833,15 +2237,16 @@ impl Browser {
         } else {
             format!("Restart {} {}?", singularize(gvr.r()), paths[0])
         };
-        vec![ViewCmd::Dialog(Dialog::Confirm {
+        vec![ViewCmd::Dialog(Dialog::Restart {
             title: "Confirm Restart".into(),
             msg,
-            on_ok: Box::new(move |ctx| {
+            field_manager: "kubectl-rollout".into(),
+            on_ok: Box::new(move |ctx, fm| {
                 let acc = ctx.accessor.clone();
                 let tx = ctx.sender();
                 ctx.spawn(async move {
                     for p in paths {
-                        match acc.restart(&gvr, &p).await {
+                        match acc.restart(&gvr, &p, &fm).await {
                             Ok(()) => post(
                                 &tx,
                                 id,
@@ -1942,59 +2347,72 @@ impl Browser {
         Vec::new()
     }
 
-    fn transfer(&mut self, sel: Option<String>) -> Vec<ViewCmd> {
+    fn transfer(&mut self, sel: Option<String>, ctx: &Ctx) -> Vec<ViewCmd> {
         let Some(path) = sel else {
             return Vec::new();
         };
         let (ns, n) = namespaced(&path);
         let pod = format!("{ns}/{n}:");
         let (id, run) = (self.id, self.deps.run.clone());
-        vec![ViewCmd::Dialog(Dialog::Prompt {
-            title: "Transfer".into(),
-            label: "Download Files (from to):".into(),
-            value: format!("{pod} ."),
-            on_ok: Box::new(move |ctx, text| {
-                let tt: Vec<&str> = text.split_whitespace().collect();
-                if tt.len() != 2 {
-                    return vec![err("transfer expects a source and a destination")];
+        let acc = ctx.accessor.clone();
+        self.spawn(ctx, async move {
+            let po = acc.get(&pods_gvr(), &path).await?;
+            let spec = po.data.get("spec").cloned().unwrap_or(Value::Null);
+            let containers = fetch_containers(&po, &spec, false);
+            let on_ok = move |ctx: &mut Ctx, args: crate::ui::TransferArgs| {
+                let local = if args.download { &args.to } else { &args.from };
+                if !args.download && !Path::new(local).exists() {
+                    return Err(format!("stat {local}: no such file or directory"));
                 }
-                let (from, to) = (tt[0].to_string(), tt[1].to_string());
-                let download = from.starts_with(&pod);
-                if !download && !Path::new(&from).exists() {
-                    return vec![err(format!("stat {from}: no such file or directory"))];
-                }
-                let argv = vec![
+                // pod.go transferCmd (including its repeated --retries).
+                let mut argv = vec![
                     "kubectl".to_string(),
                     "cp".into(),
-                    from,
-                    to,
-                    "--no-preserve=false".into(),
-                    "--retries=999".into(),
+                    args.from.trim().to_string(),
+                    args.to.trim().to_string(),
+                    format!("--no-preserve={}", args.no_preserve),
+                    format!("--retries={}", args.retries),
                 ];
+                if !args.container.is_empty() {
+                    argv.push(format!("-c={}", args.container));
+                }
+                argv.push(format!("--retries={}", args.retries));
                 let env = ctx.accessor.shell_env();
-                let op = if download { "Download" } else { "Upload" };
-                let fq = format!("{path}:");
+                let op = if args.download { "Download" } else { "Upload" };
+                let fq = format!("{path}:{}", args.container);
+                let run = run.clone();
                 spawn_msg(ctx, id, async move {
-                    run(argv, env).await?;
-                    Ok(Msg::Cmds(vec![info(format!("{op} successful on {fq}!"))]))
+                    // runK failures open the cow (App.cowCmd).
+                    Ok(match run(argv, env).await {
+                        Ok(_) => Msg::Cmds(vec![info(format!("{op} successful on {fq}!"))]),
+                        Err(e) => Msg::Text {
+                            name: "cow".into(),
+                            title: String::new(),
+                            body: format!("{e:#}"),
+                        },
+                    })
                 });
-                Vec::new()
-            }),
-        })]
+                Ok(Vec::new())
+            };
+            Ok(Msg::Cmds(vec![ViewCmd::Dialog(Dialog::Transfer {
+                pod,
+                containers,
+                retries: DEFAULT_TX_RETRIES,
+                on_ok: Box::new(on_ok),
+            })]))
+        });
+        Vec::new()
     }
 
     fn sanitize(&mut self) -> Vec<ViewCmd> {
         let (gvr, id, ns) = (self.gvr.clone(), self.id, self.ns.clone());
-        vec![ViewCmd::Dialog(Dialog::Prompt {
+        vec![ViewCmd::Dialog(Dialog::ConfirmAck {
             title: "Sanitize".into(),
-            label: format!(
+            msg: format!(
                 "Sanitize deletes all pods in completed/error state\nPlease enter [orange::b]{MAGIC_PROMPT}[-::-] to proceed."
             ),
-            value: String::new(),
-            on_ok: Box::new(move |ctx, text| {
-                if text.trim() != MAGIC_PROMPT {
-                    return Vec::new();
-                }
+            accept: MAGIC_PROMPT.into(),
+            on_ok: Box::new(move |ctx| {
                 let acc = ctx.accessor.clone();
                 spawn_msg(ctx, id, async move {
                     let mut ns = cleanse_namespace(&ns);
@@ -2114,10 +2532,13 @@ impl Browser {
             title,
             msg,
             on_ok: Box::new(move |ctx| {
-                let acc = ctx.accessor.clone();
+                let (acc, tx) = (ctx.accessor.clone(), ctx.sender());
                 spawn_msg(ctx, id, async move {
+                    // node.go toggleCordonCmd: flash each failure, keep going.
                     for s in &sels {
-                        acc.toggle_cordon(s, on).await?;
+                        if let Err(e) = acc.toggle_cordon(s, on).await {
+                            post_err(&tx, id, e);
+                        }
                     }
                     Ok(Msg::Refresh)
                 });
@@ -2131,32 +2552,38 @@ impl Browser {
         if sels.is_empty() {
             return Vec::new();
         }
-        let id = self.id;
+        let (id, text_view) = (self.id, self.deps.text);
+        // drain_dialog.go: "Drain <node>?" or "Drain (N) nodes?".
+        let node = if sels.len() == 1 {
+            sels[0].clone()
+        } else {
+            format!("({}) nodes", sels.len())
+        };
         vec![ViewCmd::Dialog(Dialog::Drain {
-            node: sels.join(","),
+            node,
             on_ok: Box::new(move |ctx, opts| {
-                let acc = ctx.accessor.clone();
-                let tx = ctx.sender();
+                // node.go drainNode: open "Drain Progress" first and stream into it.
+                let v = text_view(ctx, "Drain Progress".into(), "nodes".into(), String::new());
+                let (vid, tx, acc) = (v.id(), ctx.sender(), ctx.accessor.clone());
+                let log = Arc::new(std::sync::Mutex::new(String::new()));
+                let sink_tx = tx.clone();
+                let progress: crate::k8s::DrainProgress = Arc::new(move |s: &str| {
+                    let mut l = log.lock().unwrap();
+                    l.push_str(s);
+                    let _ = sink_tx.send(AppEvent::Text {
+                        view: vid,
+                        text: l.clone(),
+                    });
+                });
                 ctx.spawn(async move {
-                    let mut out = String::new();
                     for s in &sels {
-                        match acc.drain(s, opts.clone()).await {
-                            Ok(text) => out.push_str(&text),
-                            Err(e) => post_err(&tx, id, e),
+                        if let Err(e) = acc.drain(s, opts.clone(), progress.clone()).await {
+                            post_err(&tx, id, e);
                         }
                     }
-                    post(
-                        &tx,
-                        id,
-                        Msg::Text {
-                            name: "Drain Progress".into(),
-                            title: "nodes".into(),
-                            body: out,
-                        },
-                    );
                     post(&tx, id, Msg::Refresh);
                 });
-                Vec::new()
+                vec![ViewCmd::Push(v)]
             }),
         })]
     }
@@ -2174,25 +2601,40 @@ impl Browser {
         let name = format!("{K9S_SHELL}-{}", std::process::id());
         let pod_path = fqn(&cfg.namespace, &name);
         let manifest = shell_pod_manifest(&node, &name, &cfg);
-        let acc = ctx.accessor.clone();
-        let msg = format!("Launching node shell on {node}...");
+        let (acc, id, tx) = (ctx.accessor.clone(), self.id, ctx.sender());
+        let cancel = tokio_util::sync::CancellationToken::new();
         self.spawn(ctx, async move {
-            let pods = pods_gvr();
-            let _ = acc.delete(&pods, &pod_path, DeleteOptions::default()).await;
-            acc.apply_yaml(&pods, &pod_path, &serde_yaml::to_string(&manifest)?)
-                .await?;
-            let mut running = false;
-            for _ in 0..50 {
-                if let Ok(p) = acc.get(&pods, &pod_path).await {
-                    if p.data.pointer("/status/phase").and_then(|v| v.as_str()) == Some("Running") {
-                        running = true;
-                        break;
-                    }
-                }
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            // exec.go launchNodeShell: nuke a leftover shell pod first.
+            if let Err(e) = nuke_shell(&acc, &pod_path).await {
+                bail!("Cleaning node shell failed: {e}");
             }
-            if !running {
-                bail!("Launching node shell failed: unable to launch shell pod on node {node}");
+            let nuke_path = pod_path.clone();
+            let launch = Dialog::Launching {
+                title: "Launching".into(),
+                msg: format!("Launching node shell on {node}..."),
+                cancel: cancel.clone(),
+                on_cancel: Box::new(move |ctx| {
+                    let acc = ctx.accessor.clone();
+                    spawn_msg(ctx, id, async move {
+                        nuke_shell(&acc, &nuke_path)
+                            .await
+                            .map_err(|e| anyhow!("Cleaning node shell failed: {e}"))?;
+                        Ok(Msg::Cmds(Vec::new()))
+                    });
+                    Vec::new()
+                }),
+            };
+            post(&tx, id, Msg::Cmds(vec![ViewCmd::Dialog(launch)]));
+            let launched = tokio::select! {
+                // context.Canceled is not reported.
+                _ = cancel.cancelled() => return Ok(Msg::Cmds(Vec::new())),
+                r = launch_shell_pod(&acc, &pod_path, &manifest, &node) => r,
+            };
+            if let Err(e) = launched {
+                return Ok(Msg::Cmds(vec![
+                    ViewCmd::CloseDialog,
+                    err(format!("Launching node shell failed: {e}")),
+                ]));
             }
             let (ns, po) = namespaced(&pod_path);
             let mut argv = acc.exec_argv(ns, po, K9S_SHELL, "sh");
@@ -2206,27 +2648,33 @@ impl Browser {
                 }
             }
             let env = acc.shell_env();
-            Ok(Msg::Cmds(vec![ViewCmd::Suspend {
-                argv,
-                env,
-                on_done: Some(Box::new(move |ctx, _st| {
-                    let acc = ctx.accessor.clone();
-                    ctx.spawn(async move {
-                        let _ = acc
-                            .delete(&Gvr::parse("v1/pods"), &pod_path, DeleteOptions::default())
-                            .await;
-                    });
-                    Vec::new()
-                })),
-            }]))
+            Ok(Msg::Cmds(vec![
+                ViewCmd::CloseDialog,
+                ViewCmd::Suspend {
+                    argv,
+                    banner: shell_banner(&pod_path, K9S_SHELL),
+                    env,
+                    on_done: Some(Box::new(move |ctx, _st| {
+                        let acc = ctx.accessor.clone();
+                        ctx.spawn(async move {
+                            let _ = nuke_shell(&acc, &pod_path).await;
+                        });
+                        Vec::new()
+                    })),
+                },
+            ]))
         });
-        vec![info(msg)]
+        Vec::new()
     }
 
     fn bench(&mut self, sel: Option<String>, ctx: &Ctx) -> Vec<ViewCmd> {
         if let Some(h) = self.bench.take() {
             h.abort();
-            return vec![err("Benchmark Canceled!")];
+            // toggleBenchCmd: status then ClearStatus(true) right away.
+            return vec![
+                ViewCmd::Status(FlashLevel::Err, "Benchmark Canceled!".into()),
+                ViewCmd::ClearStatus(true),
+            ];
         }
         let Some(path) = sel else {
             return Vec::new();
@@ -2276,7 +2724,10 @@ impl Browser {
                     .map_err(|e| e.to_string());
                 post(&tx, id, Msg::BenchDone(r));
             }));
-            return vec![warn("Benchmark in progress...")];
+            return vec![ViewCmd::Status(
+                FlashLevel::Warn,
+                "Benchmark in progress...".into(),
+            )];
         }
         let Some(cfg) = lookup_bench(&file, &path, true) else {
             return vec![err(format!(
@@ -2323,7 +2774,10 @@ impl Browser {
             let r = run.await.map_err(|e| e.to_string());
             post(&tx, id, Msg::BenchDone(r));
         }));
-        vec![warn("Benchmark in progress...")]
+        vec![ViewCmd::Status(
+            FlashLevel::Warn,
+            "Benchmark in progress...".into(),
+        )]
     }
 
     fn pf_delete(&mut self) -> Vec<ViewCmd> {
@@ -2391,7 +2845,15 @@ impl Browser {
             spawn_msg(ctx, id, async move {
                 let body = match run(argv, env).await {
                     Ok(out) => format!("message:\n{}", fmt_results(&out)),
-                    Err(e) => format!("status:\n  {e}\nmessage:\n{}", fmt_results("")),
+                    // dir.go: status is the exit error, message keeps the output.
+                    Err(e) => match e.downcast_ref::<RunFailed>() {
+                        Some(f) => format!(
+                            "status:\n  {}\nmessage:\n{}",
+                            f.status,
+                            fmt_results(&f.output)
+                        ),
+                        None => format!("status:\n  {e}\nmessage:\n{}", fmt_results("")),
+                    },
                 };
                 Ok(Msg::Text {
                     name: title.into(),
@@ -2411,40 +2873,65 @@ impl Browser {
         })]
     }
 
-    fn helm_values(&mut self, sel: Option<String>, ctx: &Ctx) -> Vec<ViewCmd> {
+    pub(super) fn helm_values(&mut self, sel: Option<String>, ctx: &Ctx) -> Vec<ViewCmd> {
         let Some(id) = sel else {
             return Vec::new();
         };
+        // helm_history.go getValsCmd: the id must be `name:revision`.
+        if self.kind == Kind::HelmHistory && !namespaced(&id).1.contains(':') {
+            return vec![err(format!("unable to parse version in {id:?}"))];
+        }
         let (rel, rev) = self.helm_target(&id);
         let (ns, name) = namespaced(&rel);
-        let mut argv = vec![
-            "helm".to_string(),
-            "get".into(),
-            "values".into(),
-            name.to_string(),
-        ];
-        if !ns.is_empty() {
-            argv.extend(["-n".into(), ns.to_string()]);
-        }
-        if let Some(r) = &rev {
-            argv.extend(["--revision".into(), r.clone()]);
-        }
-        argv.extend(self.kube_ctx_args(ctx));
+        let (ns, name) = (ns.to_string(), name.to_string());
+        // The release (list) or release:revision (history) is the subject.
+        let subject = if self.kind == Kind::Helm {
+            rel.clone()
+        } else {
+            id.clone()
+        };
+        let get = |all: bool| {
+            let mut argv = vec![
+                "helm".to_string(),
+                "get".into(),
+                "values".into(),
+                name.clone(),
+                "-o".into(),
+                "json".into(),
+            ];
+            if !ns.is_empty() {
+                argv.extend(["-n".into(), ns.clone()]);
+            }
+            if let Some(r) = &rev {
+                argv.extend(["--revision".into(), r.clone()]);
+            }
+            if all {
+                argv.push("--all".into());
+            }
+            argv.extend(self.kube_ctx_args(ctx));
+            argv
+        };
+        let (user_argv, all_argv) = (get(false), get(true));
         let (run, env) = (self.deps.run.clone(), ctx.accessor.shell_env());
+        let acc = ctx.accessor.clone();
         self.spawn(ctx, async move {
-            let body = run(argv, env)
-                .await
-                .map_err(|e| anyhow!("Initializing the values model failed: {e}"))?;
-            Ok(Msg::Text {
-                name: "Values".into(),
-                title: rel,
-                body,
-            })
+            let fail = |e: anyhow::Error| anyhow!("Initializing the values model failed: {e}");
+            let user = values_yaml(&run(user_argv, env.clone()).await.map_err(fail)?)?;
+            let all = match rev {
+                // RevValues toggles to the chart's own values for that revision.
+                Some(r) => {
+                    let path = fqn(&ns, &format!("sh.helm.release.v1.{name}.v{r}"));
+                    let sec = acc.get(&Gvr::parse("v1/secrets"), &path).await?;
+                    crate::k8s::goyaml::to_yaml(&null_map(helm_chart_values(&sec)?))
+                }
+                None => values_yaml(&run(all_argv, env).await.map_err(fail)?)?,
+            };
+            Ok(Msg::Values { subject, user, all })
         });
         Vec::new()
     }
 
-    fn helm_rollback(&mut self, sel: Option<String>, ctx: &Ctx) -> Vec<ViewCmd> {
+    pub(super) fn helm_rollback(&mut self, sel: Option<String>, ctx: &Ctx) -> Vec<ViewCmd> {
         let Some(id) = sel else {
             return Vec::new();
         };
@@ -2470,6 +2957,12 @@ impl Browser {
             ),
             on_ok: Box::new(move |ctx| {
                 spawn_msg(ctx, vid, async move {
+                    // HelmHistory.Rollback: strconv.Atoi(rev).
+                    if rev.parse::<i64>().is_err() {
+                        bail!(
+                            "could not convert revision to a number: strconv.Atoi: parsing {rev:?}: invalid syntax"
+                        );
+                    }
                     run(argv, env).await?;
                     Ok(Msg::Cmds(vec![info(format!(
                         "Rollout restart in progress for char `{n}..."
@@ -2491,53 +2984,35 @@ impl Browser {
         }
         let env = self.env(ctx);
         let args: Vec<String> = p.args.iter().map(|a| env.substitute(a)).collect();
-        let mut argv = vec![p.command.clone()];
-        argv.extend(args.iter().cloned());
-        if !p.pipes.is_empty() {
-            let quote = |v: &[String]| {
-                v.iter()
-                    .map(|a| {
-                        shlex::try_quote(a)
-                            .map(|c| c.to_string())
-                            .unwrap_or_else(|_| a.clone())
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            };
-            let mut line = quote(&argv);
-            for pipe in &p.pipes {
-                line.push_str(" | ");
-                line.push_str(pipe);
-            }
-            argv = vec!["sh".into(), "-c".into(), line];
-        }
+        // exec.go execute: pipes split on spaces, short ones dropped.
+        let argv = crate::ui::shell::plugins::plugin_argv(&p, &args);
         let (run, id) = (self.deps.run.clone(), self.id);
         let shell_env = ctx.accessor.shell_env();
-        let desc = p.description.clone();
+        let cmd_str = crate::ui::shell::plugins::cmd_string(&p.command, &args);
         let exec = move |ctx: &mut Ctx| -> Vec<ViewCmd> {
             if p.background {
+                let overwrite = p.overwrite_output;
                 spawn_msg(ctx, id, async move {
-                    match run(argv, shell_env).await {
-                        Ok(out) if p.overwrite_output => Ok(Msg::Cmds(vec![info(
-                            out.trim().trim_start_matches("[output]").trim().to_string(),
-                        )])),
-                        Ok(_) => Ok(Msg::Cmds(vec![info(format!(
-                            "Plugin command launched successfully: {desc:?}"
-                        ))])),
-                        Err(e) => Ok(Msg::Cmds(vec![err(format!("Plugin command failed: {e}"))])),
-                    }
+                    // exec.go pipe: a failed background run is only logged.
+                    let out = match run(argv, shell_env).await {
+                        Ok(out) => out,
+                        Err(e) => {
+                            tracing::error!(error = %e, "Command exec failed");
+                            return Ok(Msg::Cmds(Vec::new()));
+                        }
+                    };
+                    let msg =
+                        crate::ui::shell::plugins::background_flash(&out, &cmd_str, overwrite);
+                    Ok(Msg::Cmds(msg.into_iter().map(info).collect()))
                 });
                 return Vec::new();
             }
             vec![ViewCmd::Suspend {
                 argv,
+                banner: String::new(),
                 env: shell_env,
                 on_done: Some(Box::new(move |_ctx, st| {
-                    if st.success() {
-                        Vec::new()
-                    } else {
-                        vec![info(format!("Plugin command failed: {desc:?}"))]
-                    }
+                    crate::ui::shell::plugins::foreground_done(&cmd_str, st)
                 })),
             }]
         };

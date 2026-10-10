@@ -15,9 +15,9 @@ use super::Def;
 use crate::render::helpers::*;
 
 /// tcell.ColorMediumSpringGreen.
-const MEDIUM_SPRING_GREEN: Color = Color::Rgb(0x00, 0xFA, 0x9A);
+const MEDIUM_SPRING_GREEN: Color = Color::Indexed(49);
 /// tcell.ColorCadetBlue.
-const CADET_BLUE: Color = Color::Rgb(0x5F, 0x9E, 0xA0);
+const CADET_BLUE: Color = Color::Indexed(73);
 
 const ALL_VERBS: &str = "*";
 const K8S_VERBS: [&str; 8] = [

@@ -5,7 +5,7 @@ use anyhow::Result;
 use kube::api::DynamicObject;
 use ratatui::style::Color;
 
-use crate::model::{Align, Header, HeaderColumn, RowEvent, NA_VALUE};
+use crate::model::{Align, Header, HeaderColumn, RowEvent};
 use crate::render::{default_colorer, Palette};
 
 use super::util;
@@ -25,9 +25,14 @@ fn vs() -> HeaderColumn {
     HeaderColumn::new("VS").vs()
 }
 
-/// k9s computeVulScore without an image scanner: always `n/a`.
-fn vul_score() -> String {
-    NA_VALUE.into()
+/// render.computeVulScore over the object's pod template.
+fn vul_score(o: &DynamicObject) -> String {
+    let spec = get_path(&o.data, "spec.template.spec").unwrap_or(&serde_json::Value::Null);
+    crate::vul::compute_vul_score(
+        obj_ns(o),
+        &o.metadata.labels.clone().unwrap_or_default(),
+        spec,
+    )
 }
 
 pub(super) struct Deployment;
@@ -64,7 +69,7 @@ impl Def for Deployment {
             vec![
                 obj_ns(o).to_string(),
                 obj_name(o).to_string(),
-                vul_score(),
+                vul_score(o),
                 format!("{avail}/{desired}"),
                 i64_at(d, "status.updatedReplicas").to_string(),
                 avail.to_string(),
@@ -129,7 +134,7 @@ impl Def for StatefulSet {
             vec![
                 obj_ns(o).to_string(),
                 obj_name(o).to_string(),
-                vul_score(),
+                vul_score(o),
                 format!("{ready}/{desired}"),
                 util::as_selector(get_path(d, "spec.selector")),
                 na(str_at(d, "spec.serviceName")),
@@ -176,7 +181,7 @@ impl Def for DaemonSet {
             vec![
                 obj_ns(o).to_string(),
                 obj_name(o).to_string(),
-                vul_score(),
+                vul_score(o),
                 desired.to_string(),
                 i64_at(d, "status.currentNumberScheduled").to_string(),
                 ready.to_string(),
@@ -232,7 +237,7 @@ impl Def for ReplicaSet {
             vec![
                 obj_ns(o).to_string(),
                 obj_name(o).to_string(),
-                vul_score(),
+                vul_score(o),
                 opt_i64_at(d, "spec.replicas").unwrap_or(0).to_string(),
                 replicas.to_string(),
                 ready.to_string(),

@@ -169,8 +169,8 @@ impl Target {
             }
         }
         let ua = match ua {
-            Some(u) if !u.is_empty() => format!("{u} k9s/{}", crate::version::VERSION),
-            _ => format!("k9s/{}", crate::version::VERSION),
+            Some(u) if !u.is_empty() => format!("{u} k9rs/{}", crate::version::VERSION),
+            _ => format!("k9rs/{}", crate::version::VERSION),
         };
         headers.push((USER_AGENT, HeaderValue::from_str(&ua)?));
         Ok(Target {
@@ -344,7 +344,8 @@ pub(crate) async fn load(spec: &BenchSpec) -> Result<(Vec<Sample>, f64)> {
     let per = spec.requests / c;
     let deadline = Instant::now() + BENCH_TIMEOUT;
     let start = Instant::now();
-    let mut tasks = Vec::with_capacity(c);
+    // Sizes come from benchmarks.yaml: never pre-allocate huge buffers.
+    let mut tasks = Vec::with_capacity(c.min(1024));
     for _ in 0..c {
         let target = target.clone();
         tasks.push(tokio::spawn(async move {
@@ -353,7 +354,7 @@ pub(crate) async fn load(spec: &BenchSpec) -> Result<(Vec<Sample>, f64)> {
                 sender: None,
                 marks: Arc::new(Mutex::new(Marks::default())),
             };
-            let mut out = Vec::with_capacity(per);
+            let mut out = Vec::with_capacity(per.min(1 << 16));
             for _ in 0..per {
                 let left = deadline.saturating_duration_since(Instant::now());
                 if left.is_zero() {
@@ -660,7 +661,7 @@ mod tests {
         assert_eq!(
             s,
             format!(
-                "POST /bench?x=1 ua=k9s/{} auth=Basic ZnJlZDpzZWNyZXQ= x=yes",
+                "POST /bench?x=1 ua=k9rs/{} auth=Basic ZnJlZDpzZWNyZXQ= x=yes",
                 crate::version::VERSION
             )
         );

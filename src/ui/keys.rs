@@ -152,10 +152,10 @@ pub fn parse_key(s: &str) -> Option<KeyEvent> {
 }
 
 fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
-    if s.len() > prefix.len() && s[..prefix.len()].eq_ignore_ascii_case(prefix) {
-        Some(&s[prefix.len()..])
-    } else {
-        None
+    // `get` keeps a multibyte char at the cut (user hotkeys) from panicking.
+    match (s.get(..prefix.len()), s.get(prefix.len()..)) {
+        (Some(h), Some(t)) if !t.is_empty() && h.eq_ignore_ascii_case(prefix) => Some(t),
+        _ => None,
     }
 }
 
@@ -194,6 +194,32 @@ pub(crate) fn same_key(a: &KeyEvent, b: &KeyEvent) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Hotkey files are user input: odd names must not panic.
+    #[test]
+    fn parse_key_never_panics() {
+        for s in [
+            "",
+            "ü",
+            "ctrlü-x",
+            "shifü",
+            "alt-",
+            "ctrl-",
+            "shift-",
+            "ctrl-🐶",
+            "shift-9",
+            "shiftéé",
+            "alt-ü",
+            "ctr",
+            "F",
+            "f99999999999",
+            "f0",
+            "🐶🐶🐶🐶🐶🐶🐶",
+        ] {
+            let _ = parse_key(s);
+        }
+        assert_eq!(parse_key("ctrlü-x"), None);
+    }
 
     fn k(code: KeyCode, m: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, m)

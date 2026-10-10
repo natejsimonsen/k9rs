@@ -52,6 +52,12 @@ pub fn fqn(ns: &str, name: &str) -> String {
     }
 }
 
+/// client.FQN(ClusterScope, name): k9s ids for some cluster-scoped kinds
+/// (namespaces, pvs, crds, storage classes, cluster roles/bindings).
+pub fn cluster_fqn(name: &str) -> String {
+    format!("{CLUSTER_SCOPE}/{name}")
+}
+
 /// Split an FQN into (namespace, name) (client.Namespaced).
 pub fn namespaced(path: &str) -> (&str, &str) {
     match path.split_once('/') {
