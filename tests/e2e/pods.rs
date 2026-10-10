@@ -2,7 +2,6 @@
 
 use crate::common::*;
 use crossterm::event::KeyCode;
-use k9rs::k8s::{Accessor, Gvr};
 use k9rs::ui::{Dialog, FlashLevel};
 
 async fn on_nginx() -> Harness {
@@ -24,11 +23,8 @@ async fn edit_shell_attach_suspend() {
     h.press('a').await;
     let argv: Vec<Vec<String>> = h.suspends.iter().map(|s| s.argv.clone()).collect();
     assert_eq!(argv.len(), 3, "{argv:?}");
-    assert_eq!(
-        argv[0],
-        h.acc
-            .edit_argv(&Gvr::parse("v1/pods"), &format!("default/{pod}"))
-    );
+    // Edit runs in-process (fetch, $EDITOR, patch).
+    assert_eq!(argv[0], ["<edit>", "v1/pods", &format!("default/{pod}")]);
     assert_eq!(
         argv[1],
         [

@@ -22,6 +22,7 @@ mod table;
 #[cfg(test)]
 mod tests;
 
+use crate::k8s::{ApiFailure, TtyProcess, TtyUnsupported};
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::{Arc, Mutex, RwLock};
@@ -1246,6 +1247,90 @@ impl Accessor for KubeAccessor {
             }
         }
         Ok(super::goyaml::to_yaml(&v))
+    }
+
+    async fn exec_tty(
+        &self,
+        ns: &str,
+        pod: &str,
+        container: &str,
+        command: Vec<String>,
+        attach: bool,
+    ) -> Result<TtyProcess> {
+        let api: kube::Api<Pod> = kube::Api::namespaced(self.stream_client()?, clean_ns(ns));
+        let mut ap = kube::api::AttachParams::interactive_tty();
+        if !container.is_empty() {
+            ap = ap.container(container);
+        }
+        let res = if attach {
+            api.attach(pod, &ap).await
+        } else {
+            api.exec(pod, command, &ap).await
+        };
+        let mut p = match res {
+            Ok(p) => p,
+            // The server answered: report it like kubectl would.
+            Err(e @ kube::Error::Api(_)) => return Err(kerr(e)),
+            // No websocket upgrade (proxies, old servers): use kubectl.
+            Err(e) => {
+                tracing::warn!("in-process exec failed, falling back to kubectl: {e}");
+                return Err(TtyUnsupported.into());
+            }
+        };
+        let (Some(stdin), Some(stdout), Some(status)) = (p.stdin(), p.stdout(), p.take_status())
+        else {
+            return Err(TtyUnsupported.into());
+        };
+        let resize = p.terminal_size();
+        Ok(TtyProcess {
+            stdin: Box::new(stdin),
+            stdout: Box::new(stdout),
+            resize,
+            status: Box::pin(async move {
+                let s = status.await;
+                drop(p);
+                s
+            }),
+        })
+    }
+
+    async fn patch_merge(
+        &self,
+        gvr: &Gvr,
+        path: &str,
+        patch: &Value,
+        field_manager: &str,
+    ) -> Result<()> {
+        let (r, _, n) = self.object_path(gvr, path).await?;
+        let pp = PatchParams {
+            field_manager: (!field_manager.is_empty()).then(|| field_manager.to_string()),
+            ..Default::default()
+        };
+        let req = r.patch(&n, &pp, &Patch::Merge(patch)).map_err(reqerr)?;
+        let c = self.client()?;
+        match self
+            .timed(async move { Ok(c.request::<Value>(req).await) })
+            .await?
+        {
+            Ok(_) => Ok(()),
+            Err(kube::Error::Api(s)) => Err(ApiFailure {
+                code: s.code,
+                reason: s.reason.clone(),
+                message: s.message.clone(),
+                causes: s
+                    .details
+                    .as_ref()
+                    .map(|d| {
+                        d.causes
+                            .iter()
+                            .map(|c| (c.field.clone(), c.message.clone()))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            }
+            .into()),
+            Err(e) => Err(kerr(e)),
+        }
     }
 
     async fn patch_json(&self, gvr: &Gvr, path: &str, patch: &Value) -> Result<()> {

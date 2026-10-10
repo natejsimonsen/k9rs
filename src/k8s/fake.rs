@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use kube::api::DynamicObject;
 
-use super::accessor::{Accessor, LogStream, PortForwardHandle};
+use super::accessor::{Accessor, ApiFailure, LogStream, PortForwardHandle};
 use super::types::*;
 use super::{fqn, is_all_namespaces, namespaced, Gvr};
 
@@ -32,6 +32,8 @@ pub struct FakeAccessor {
     pub unreachable: Mutex<Option<String>>,
     /// `(gvr, fqn)` pairs `can_named(.., "get")` refuses.
     pub denied_get: Mutex<Vec<(String, String)>>,
+    /// Next patch_merge fails with this.
+    pub patch_failure: Mutex<Option<ApiFailure>>,
     /// `(gvr, fqn)` pairs `can_named(.., "patch")` refuses.
     pub denied_patch: Mutex<Vec<(String, String)>>,
     /// GVRs whose `list` fails (RBAC forbidden).
@@ -432,6 +434,46 @@ impl Accessor for FakeAccessor {
     async fn to_yaml(&self, gvr: &Gvr, path: &str, _show_managed: bool) -> Result<String> {
         let v = serde_json::to_value(self.get(gvr, path).await?)?;
         Ok(super::goyaml::to_yaml(&v))
+    }
+    async fn patch_merge(
+        &self,
+        gvr: &Gvr,
+        path: &str,
+        patch: &serde_json::Value,
+        field_manager: &str,
+    ) -> Result<()> {
+        self.record(format!("patch_merge {gvr} {path} {patch} {field_manager}"));
+        if let Some(f) = self.patch_failure.lock().unwrap().take() {
+            return Err(f.into());
+        }
+        // Optimistic concurrency like the API server: a stale resourceVersion is a 409.
+        if let Some(want) = patch
+            .pointer("/metadata/resourceVersion")
+            .and_then(|v| v.as_str())
+        {
+            let (ns, name) = namespaced(path);
+            let have = self.objects.lock().unwrap().get(gvr).and_then(|v| {
+                v.iter()
+                    .find(|o| {
+                        o.metadata.name.as_deref() == Some(name)
+                            && o.metadata.namespace.as_deref().unwrap_or("") == ns
+                    })
+                    .and_then(|o| o.metadata.resource_version.clone())
+            });
+            if have.as_deref().is_some_and(|h| h != want) {
+                return Err(ApiFailure {
+                    code: 409,
+                    reason: "Conflict".into(),
+                    message: format!(
+                        "Operation cannot be fulfilled on {} {name:?}: the object has been modified; please apply your changes to the latest version and try again",
+                        gvr.r()
+                    ),
+                    causes: Vec::new(),
+                }
+                .into());
+            }
+        }
+        Ok(())
     }
     async fn patch_json(&self, gvr: &Gvr, path: &str, patch: &serde_json::Value) -> Result<()> {
         self.record(format!("patch_json {gvr} {path} {patch}"));

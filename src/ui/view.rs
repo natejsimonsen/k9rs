@@ -218,6 +218,28 @@ pub enum ViewCmd {
     },
     /// Change the active namespace (persisted to the context config).
     SetNamespace(String),
+    /// Interactive shell/attach (`kubectl exec -it` / `attach -it`), run
+    /// in-process over the API; `fallback` (a kubectl argv run with `env`)
+    /// is used only when the accessor can't. `label` prefixes errors
+    /// ("Shell exec failed: ...").
+    Exec {
+        ns: String,
+        pod: String,
+        container: String,
+        command: Vec<String>,
+        attach: bool,
+        banner: String,
+        label: String,
+        fallback: Vec<String>,
+        env: Vec<(String, String)>,
+        on_done: Option<Box<dyn FnOnce(&mut Ctx, std::process::ExitStatus) -> Vec<ViewCmd> + Send>>,
+    },
+    /// `kubectl edit` in-process: fetch, $EDITOR on a temp file, patch.
+    Edit {
+        gvr: crate::k8s::Gvr,
+        path: String,
+        on_done: Option<Box<dyn FnOnce(&mut Ctx, std::process::ExitStatus) -> Vec<ViewCmd> + Send>>,
+    },
     /// Dismiss the current dialog (dialog.dismiss).
     CloseDialog,
     /// Toggle header visibility (ctrl-e).

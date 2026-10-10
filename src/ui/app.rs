@@ -134,6 +134,24 @@ enum ShellEvent {
     NodeMetricsAccess(bool),
     /// clusterUpdater: the backoff budget ran out (BailOut).
     UpdaterGaveUp,
+    /// The in-process exec/attach connected.
+    TtyReady {
+        proc: Box<crate::k8s::TtyProcess>,
+        attach: bool,
+        banner: String,
+        on_done: Option<DoneFn>,
+    },
+    /// In-process exec isn't available: run kubectl instead.
+    TtyFallback {
+        argv: Vec<String>,
+        env: Vec<(String, String)>,
+        banner: String,
+        on_done: Option<DoneFn>,
+    },
+    /// The edit target was fetched and written to a temp file.
+    EditReady(std::result::Result<(tempfile::TempPath, String, serde_json::Value), String>),
+    /// The edited file was handled.
+    EditOutcome(crate::ui::shell::session::EditOutcome),
     /// ValidatePortForwards: forwards whose pod vanished or was recreated.
     StalePortForwards(Vec<String>),
     /// Cluster meta refreshed without a connection.
@@ -162,7 +180,32 @@ struct Suspend {
     env: Vec<(String, String)>,
     banner: String,
     on_done: Option<Box<dyn FnOnce(&mut Ctx, std::process::ExitStatus) -> Vec<ViewCmd> + Send>>,
+    kind: SuspendKind,
 }
+
+/// What runs while the TUI is suspended.
+enum SuspendKind {
+    /// A foreground process (argv).
+    Process,
+    /// The in-process edit loop's editor (argv) on the temp file.
+    Editor,
+    /// A connected in-process TTY session; `true` for attach.
+    Tty(Box<crate::k8s::TtyProcess>, bool),
+}
+
+/// The in-process `kubectl edit` loop.
+struct EditState {
+    gvr: crate::k8s::Gvr,
+    path: String,
+    file: Option<tempfile::TempPath>,
+    original_text: String,
+    original: serde_json::Value,
+    /// The previous attempt's file, when it is being retried after an error.
+    retry_of: Option<String>,
+    on_done: Option<Box<dyn FnOnce(&mut Ctx, std::process::ExitStatus) -> Vec<ViewCmd> + Send>>,
+}
+
+type DoneFn = Box<dyn FnOnce(&mut Ctx, std::process::ExitStatus) -> Vec<ViewCmd> + Send>;
 
 /// dao/registry.go: pseudo resources registered as Namespaced, so
 /// `:workloads kube-system` switches namespace like a real resource.
@@ -202,6 +245,7 @@ pub struct App {
     node_mx_ok: bool,
     exit_status: Option<String>,
     suspends: VecDeque<Suspend>,
+    edit: Option<EditState>,
     prev_info: ClusterInfo,
     /// Context switched: like k9s ClusterInfo.Reset, the next refresh diffs
     /// against an empty meta (zero CPU/MEM).
@@ -288,6 +332,7 @@ impl App {
             node_mx_ok: false,
             exit_status: None,
             suspends: VecDeque::new(),
+            edit: None,
             prev_info: ClusterInfo::default(),
             info_reset: false,
             info_padded: !opts.disconnected,
@@ -349,13 +394,22 @@ impl App {
             if self.quit {
                 break;
             }
-            if let Some(s) = self.suspends.pop_front() {
+            if let Some(mut s) = self.suspends.pop_front() {
                 drop(events);
-                let res = tui.suspend(|| {
-                    print!("{}", s.banner);
-                    let _ = io::Write::flush(&mut io::stdout());
-                    run_foreground(&s.argv, &s.env)
-                });
+                let res = match std::mem::replace(&mut s.kind, SuspendKind::Process) {
+                    SuspendKind::Tty(p, attach) => tui
+                        .suspend_tty(&s.banner, attach, *p)
+                        .await
+                        .map(|code| Ok(crate::ui::shell::session::exit_status(code))),
+                    kind => {
+                        s.kind = kind;
+                        tui.suspend(|| {
+                            print!("{}", s.banner);
+                            let _ = io::Write::flush(&mut io::stdout());
+                            run_foreground(&s.argv, &s.env)
+                        })
+                    }
+                };
                 events = EventStream::new();
                 self.after_suspend(s, res?);
                 dirty = true;
@@ -1226,6 +1280,32 @@ impl App {
             ShellEvent::Contexts(c) => self.contexts = c,
             // refreshCluster: connectivity is checked (and the status
             // cleared) before the slower cluster info refresh.
+            ShellEvent::TtyReady {
+                proc,
+                attach,
+                banner,
+                on_done,
+            } => self.suspends.push_back(Suspend {
+                argv: Vec::new(),
+                env: Vec::new(),
+                banner,
+                on_done,
+                kind: SuspendKind::Tty(proc, attach),
+            }),
+            ShellEvent::TtyFallback {
+                argv,
+                env,
+                banner,
+                on_done,
+            } => self.suspends.push_back(Suspend {
+                argv,
+                env,
+                banner,
+                on_done,
+                kind: SuspendKind::Process,
+            }),
+            ShellEvent::EditReady(res) => self.edit_ready(res),
+            ShellEvent::EditOutcome(o) => self.edit_outcome(o),
             ShellEvent::StalePortForwards(ids) => {
                 for id in ids {
                     tracing::warn!(path = %id, "Deleted portforward");
@@ -1414,7 +1494,23 @@ impl App {
                 env,
                 banner,
                 on_done,
+                kind: SuspendKind::Process,
             }),
+            ViewCmd::Exec {
+                ns,
+                pod,
+                container,
+                command,
+                attach,
+                banner,
+                label,
+                fallback,
+                env,
+                on_done,
+            } => self.start_exec(
+                ns, pod, container, command, attach, banner, label, fallback, env, on_done,
+            ),
+            ViewCmd::Edit { gvr, path, on_done } => self.start_edit(gvr, path, on_done),
             ViewCmd::SetNamespace(ns) => self.switch_ns(&ns),
             ViewCmd::CloseDialog => self.dialog = None,
             ViewCmd::ToggleHeader => self.show_header = !self.show_header,
@@ -1453,6 +1549,9 @@ impl App {
     }
 
     fn after_suspend(&mut self, s: Suspend, res: io::Result<std::process::ExitStatus>) {
+        if matches!(s.kind, SuspendKind::Editor) {
+            return self.editor_done(&s.argv, res);
+        }
         let status = match res {
             Ok(st) => st,
             Err(e) => {
@@ -1471,6 +1570,176 @@ impl App {
 
     // -----------------------------------------------------------------------
     // Commands (view/command.go)
+
+    /// Connect an exec/attach session in the background; the TUI suspends only
+    /// once the remote TTY is ready (or kubectl takes over).
+    #[allow(clippy::too_many_arguments)]
+    fn start_exec(
+        &mut self,
+        ns: String,
+        pod: String,
+        container: String,
+        command: Vec<String>,
+        attach: bool,
+        banner: String,
+        label: String,
+        fallback: Vec<String>,
+        env: Vec<(String, String)>,
+        on_done: Option<DoneFn>,
+    ) {
+        let (acc, tx) = (self.ctx.accessor.clone(), self.ctx.sender());
+        self.ctx.spawn(async move {
+            let ev = match acc.exec_tty(&ns, &pod, &container, command, attach).await {
+                Ok(p) => ShellEvent::TtyReady {
+                    proc: Box::new(p),
+                    attach,
+                    banner,
+                    on_done,
+                },
+                Err(e) if e.is::<crate::k8s::TtyUnsupported>() => ShellEvent::TtyFallback {
+                    argv: fallback,
+                    env,
+                    banner,
+                    on_done,
+                },
+                Err(e) => {
+                    let _ = tx.send(AppEvent::Error {
+                        view: SHELL_VIEW_ID,
+                        msg: format!("{label} exec failed: {e:#}"),
+                    });
+                    return;
+                }
+            };
+            let _ = tx.send(shell_event(ev));
+        });
+    }
+
+    /// kubectl edit, in-process: fetch the object into a private temp file.
+    fn start_edit(&mut self, gvr: crate::k8s::Gvr, path: String, on_done: Option<DoneFn>) {
+        if self.edit.is_some() {
+            return;
+        }
+        self.edit = Some(EditState {
+            gvr: gvr.clone(),
+            path: path.clone(),
+            file: None,
+            original_text: String::new(),
+            original: serde_json::Value::Null,
+            retry_of: None,
+            on_done,
+        });
+        let (acc, tx) = (self.ctx.accessor.clone(), self.ctx.sender());
+        self.ctx.spawn(async move {
+            let res = crate::ui::shell::session::edit_prepare(&acc, &gvr, &path).await;
+            let _ = tx.send(shell_event(ShellEvent::EditReady(
+                res.map_err(|e| format!("{e:#}")),
+            )));
+        });
+    }
+
+    fn edit_ready(
+        &mut self,
+        res: std::result::Result<(tempfile::TempPath, String, serde_json::Value), String>,
+    ) {
+        let Some(st) = self.edit.as_mut() else {
+            return;
+        };
+        match res {
+            Ok((file, text, original)) => {
+                st.original_text = text;
+                st.original = original;
+                let f = file.to_string_lossy().to_string();
+                st.file = Some(file);
+                self.open_editor(&f);
+            }
+            Err(e) => self.edit_finish(Some(e)),
+        }
+    }
+
+    fn open_editor(&mut self, file: &str) {
+        let argv = crate::ui::shell::session::editor_argv(|k| std::env::var(k).ok(), file);
+        self.suspends.push_back(Suspend {
+            argv,
+            env: Vec::new(),
+            banner: String::new(),
+            on_done: None,
+            kind: SuspendKind::Editor,
+        });
+    }
+
+    /// The editor exited: diff and patch in the background.
+    fn editor_done(&mut self, argv: &[String], res: io::Result<std::process::ExitStatus>) {
+        let Some(st) = self.edit.as_ref() else {
+            return;
+        };
+        let editor = argv.first().cloned().unwrap_or_default();
+        if !res.as_ref().is_ok_and(|s| s.success()) {
+            return self.edit_finish(Some(format!(
+                "there was a problem with the editor {}",
+                go_quote(&editor)
+            )));
+        }
+        let Some(file) = st.file.as_ref().map(|f| f.to_path_buf()) else {
+            return;
+        };
+        let job = crate::ui::shell::session::EditJob {
+            gvr: st.gvr.clone(),
+            path: st.path.clone(),
+            file,
+            original_text: st.original_text.clone(),
+            original: st.original.clone(),
+            retry_of: st.retry_of.clone(),
+        };
+        let (acc, tx) = (self.ctx.accessor.clone(), self.ctx.sender());
+        self.ctx.spawn(async move {
+            let o = crate::ui::shell::session::edit_apply(&acc, job).await;
+            let _ = tx.send(shell_event(ShellEvent::EditOutcome(o)));
+        });
+    }
+
+    fn edit_outcome(&mut self, o: crate::ui::shell::session::EditOutcome) {
+        use crate::ui::shell::session::EditOutcome;
+        match o {
+            EditOutcome::Reopen(edited) => {
+                let Some(st) = self.edit.as_mut() else {
+                    return;
+                };
+                st.retry_of = Some(edited);
+                let f = st.file.as_ref().map(|f| f.to_string_lossy().to_string());
+                if let Some(f) = f {
+                    self.open_editor(&f);
+                }
+            }
+            EditOutcome::Done(err) => self.edit_finish(err),
+        }
+    }
+
+    fn edit_finish(&mut self, err: Option<String>) {
+        let Some(mut st) = self.edit.take() else {
+            return;
+        };
+        let mut err = err;
+        // preservedFile: keep the changes when the edit failed after editing.
+        if let (Some(e), Some(f)) = (err.as_mut(), st.file.take()) {
+            if st.retry_of.is_some() || !st.original_text.is_empty() {
+                if let Ok(p) = f.keep() {
+                    e.push_str(&format!(
+                        ". A copy of your changes has been stored to {}",
+                        go_quote(&p.to_string_lossy())
+                    ));
+                }
+            }
+        }
+        let status = crate::ui::shell::session::exit_status(i32::from(err.is_some()));
+        if let Some(f) = st.on_done.take() {
+            let cmds = f(&mut self.ctx, status);
+            self.apply(cmds);
+        }
+        if let Some(e) = err {
+            self.flash
+                .set(FlashLevel::Err, format!("Edit command failed: {e}"));
+        }
+    }
 
     /// app.go BailOut -> nukeK9sShell: remove this process' node shell pod.
     async fn nuke_shell_pod(&self) {
@@ -2426,6 +2695,36 @@ impl Tui {
         )?;
         forget_frames(&mut self.term);
         Ok(r)
+    }
+}
+
+impl Tui {
+    /// Hand the terminal to a connected remote TTY until it ends; returns
+    /// the remote exit code.
+    async fn suspend_tty(
+        &mut self,
+        banner: &str,
+        attach: bool,
+        p: crate::k8s::TtyProcess,
+    ) -> io::Result<i32> {
+        restore_screen(self.mouse);
+        // k9s execute(): clear the screen before/after shelling out.
+        print!("\x1b[H\x1b[2J{banner}");
+        if attach {
+            println!("If you don't see a command prompt, try pressing enter.");
+        }
+        let _ = io::Write::flush(&mut io::stdout());
+        enable_raw_mode()?;
+        let code = crate::ui::shell::session::tty_bridge(p).await;
+        let _ = disable_raw_mode();
+        print!("\x1b[H\x1b[2J");
+        enter_screen(self.mouse)?;
+        execute!(
+            io::stdout(),
+            crossterm::terminal::Clear(crossterm::terminal::ClearType::All)
+        )?;
+        forget_frames(&mut self.term);
+        Ok(code)
     }
 }
 

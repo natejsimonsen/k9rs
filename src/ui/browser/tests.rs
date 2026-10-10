@@ -1108,7 +1108,20 @@ async fn containers_logs_and_shell() {
     co.handle_key(key('s'), &mut ctx);
     let cmds = until(&mut co, &mut ctx, &mut rx, is_custom).await;
     match &cmds[..] {
-        [ViewCmd::Suspend { argv, banner, .. }] => {
+        [ViewCmd::Exec {
+            fallback: argv,
+            banner,
+            command,
+            container,
+            attach: false,
+            ..
+        }] => {
+            // In-process exec of kubectl's command, kubectl argv as fallback.
+            assert_eq!(
+                command,
+                &["sh", "-c", SHELL_CHECK_FOR_TEST].map(String::from)
+            );
+            assert_eq!(container, "web");
             assert_eq!(
                 argv[..6],
                 ["kubectl", "exec", "-it", "-n", "default", "a"].map(String::from)
@@ -1128,7 +1141,12 @@ async fn containers_logs_and_shell() {
     }
     let cmds = co.handle_key(key('a'), &mut ctx);
     match &cmds[..] {
-        [ViewCmd::Suspend { argv, banner, .. }] => {
+        [ViewCmd::Exec {
+            fallback: argv,
+            banner,
+            attach: true,
+            ..
+        }] => {
             assert_eq!(argv.join(" "), "kubectl attach -it -n default a -c web");
             assert!(banner.contains("<<K9rs-Shell>> Pod: default/a | Container: web \n"));
         }
@@ -1296,7 +1314,7 @@ async fn kill_edit_and_copy() {
     assert_eq!(f.calls(), vec!["delete v1/pods default/a force=false"]);
     let cmds = b.handle_key(key('e'), &mut ctx);
     assert!(
-        matches!(&cmds[..], [ViewCmd::Suspend { argv, .. }] if argv.join(" ") == "kubectl edit pods/a -n default")
+        matches!(&cmds[..], [ViewCmd::Edit { gvr, path, .. }] if gvr.to_string() == "v1/pods" && path == "default/a")
     );
     assert_eq!(
         flashes(&b.handle_key(key('c'), &mut ctx)),
@@ -1442,7 +1460,7 @@ async fn edit_needs_patch_access() {
     b.handle_key(key('j'), &mut ctx);
     assert!(matches!(
         &b.handle_key(key('e'), &mut ctx)[..],
-        [ViewCmd::Suspend { .. }]
+        [ViewCmd::Edit { .. }]
     ));
 }
 

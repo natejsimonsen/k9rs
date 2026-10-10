@@ -435,34 +435,23 @@ impl DetailsView {
         Vec::new()
     }
 
-    fn run_edit(&mut self, ctx: &mut Ctx) -> Vec<ViewCmd> {
+    fn run_edit(&mut self, _ctx: &mut Ctx) -> Vec<ViewCmd> {
         let Some(gvr) = self.gvr().cloned() else {
             return Vec::new();
         };
         self.stop_watch();
-        let argv = ctx.accessor.edit_argv(&gvr, &self.subject);
-        let env = ctx.accessor.shell_env();
         let view = self.id;
-        vec![ViewCmd::Suspend {
-            argv,
-            banner: String::new(),
-            env,
-            on_done: Some(Box::new(
-                move |ctx: &mut Ctx, st: std::process::ExitStatus| {
-                    let _ = ctx.sender().send(AppEvent::Custom {
-                        view,
-                        payload: Box::new(Refetch),
-                    });
-                    if st.success() {
-                        Vec::new()
-                    } else {
-                        vec![util::flash(
-                            FlashLevel::Err,
-                            format!("Edit command failed: {st}"),
-                        )]
-                    }
-                },
-            )),
+        vec![ViewCmd::Edit {
+            gvr,
+            path: self.subject.clone(),
+            // live_view.go editCmd: Start again (re-fetch) once the edit ends.
+            on_done: Some(Box::new(move |ctx: &mut Ctx, _st| {
+                let _ = ctx.sender().send(AppEvent::Custom {
+                    view,
+                    payload: Box::new(Refetch),
+                });
+                Vec::new()
+            })),
         }]
     }
 }
@@ -1260,7 +1249,7 @@ mod tests {
                 break v.on_event(&ev, &mut ctx);
             }
         };
-        assert!(matches!(&cmds[..], [ViewCmd::Suspend { .. }]));
+        assert!(matches!(&cmds[..], [ViewCmd::Edit { .. }]));
     }
 
     #[tokio::test]

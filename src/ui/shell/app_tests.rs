@@ -1268,6 +1268,7 @@ fn suspend_queue_and_completion() {
         env: vec![],
         banner: String::new(),
         on_done: None,
+        kind: SuspendKind::Process,
     };
     let res = run_foreground(&s.argv, &s.env);
     assert!(res.is_err());
@@ -1989,4 +1990,37 @@ fn exec_panic_falls_back_to_last_view() {
     h.app.cmd_history = Default::default();
     h.goto("cm");
     assert_eq!(h.names(), ["pods"]);
+}
+
+/// Shell runs in-process when the accessor can; otherwise the kubectl argv.
+#[tokio::test]
+async fn exec_falls_back_to_kubectl() {
+    let mut h = harness_with(FakeAccessor::new());
+    let mut rx = h.app.rx.take().unwrap();
+    h.app.apply(vec![ViewCmd::Exec {
+        ns: "default".into(),
+        pod: "p".into(),
+        container: "c".into(),
+        command: vec!["sh".into()],
+        attach: false,
+        banner: String::new(),
+        label: "Shell".into(),
+        fallback: vec!["kubectl".into(), "exec".into()],
+        env: vec![],
+        on_done: None,
+    }]);
+    assert!(
+        h.app.take_suspends().is_empty(),
+        "nothing runs before the connect"
+    );
+    let ev = next_shell_event(&mut rx, Duration::from_secs(5), |e| {
+        matches!(e, ShellEvent::TtyFallback { .. })
+    })
+    .await
+    .expect("fallback");
+    h.app.handle_event(ev);
+    assert_eq!(
+        h.app.take_suspends(),
+        [(vec!["kubectl".to_string(), "exec".to_string()], vec![])]
+    );
 }

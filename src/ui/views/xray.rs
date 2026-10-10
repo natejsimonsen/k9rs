@@ -1308,16 +1308,26 @@ impl XrayView {
                 }
                 a.push(pod.to_string());
                 if !co.is_empty() {
-                    a.extend(["-c".into(), co]);
+                    a.extend(["-c".into(), co.clone()]);
                 }
                 a
             } else {
                 acc.exec_argv(ns, pod, &co, "sh")
             };
             let what = if attach { "Attach" } else { "Shell" };
-            vec![ViewCmd::Suspend {
-                argv,
+            let command = match argv.iter().position(|a| a == "--") {
+                Some(i) if !attach => argv[i + 1..].to_vec(),
+                _ => Vec::new(),
+            };
+            vec![ViewCmd::Exec {
+                ns: ns.to_string(),
+                pod: pod.to_string(),
+                container: co.clone(),
+                command,
+                attach,
                 banner,
+                label: what.into(),
+                fallback: argv,
                 env: acc.shell_env(),
                 on_done: Some(Box::new(
                     move |_ctx: &mut Ctx, st: std::process::ExitStatus| {
@@ -1683,20 +1693,10 @@ impl XrayView {
                 let Some(s) = spec else {
                     return Vec::new();
                 };
-                let argv = ctx.accessor.edit_argv(&Gvr::parse(s.gvr()), s.path());
-                vec![ViewCmd::Suspend {
-                    argv,
-                    banner: String::new(),
-                    env: ctx.accessor.shell_env(),
-                    on_done: Some(Box::new(|_ctx: &mut Ctx, st: std::process::ExitStatus| {
-                        match crate::ui::browser::exec_failure(&st) {
-                            Some(e) => vec![util::flash(
-                                FlashLevel::Err,
-                                format!("Edit exec failed: {e}"),
-                            )],
-                            None => Vec::new(),
-                        }
-                    })),
+                vec![ViewCmd::Edit {
+                    gvr: Gvr::parse(s.gvr()),
+                    path: s.path().to_string(),
+                    on_done: None,
                 }]
             }
             "ctrl-d" if meta.as_ref().is_some_and(|m| Self::can(m, &["delete"])) => match spec {
@@ -2116,7 +2116,7 @@ mod tests {
             &mut c,
         );
         assert!(
-            matches!(&cmds[0], ViewCmd::Suspend { argv, .. } if argv.contains(&"nginx".to_string()))
+            matches!(&cmds[0], ViewCmd::Exec { container, fallback, .. } if container == "nginx" && fallback.contains(&"nginx".to_string()))
         );
         // yaml opens a details view asynchronously.
         v.handle_key(

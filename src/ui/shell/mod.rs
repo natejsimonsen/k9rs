@@ -13,6 +13,7 @@ pub(crate) mod help;
 pub(crate) mod palette;
 pub mod plugins;
 pub(crate) mod prompt;
+pub(crate) mod session;
 pub(crate) mod splash;
 pub(crate) mod text;
 pub(crate) mod title;

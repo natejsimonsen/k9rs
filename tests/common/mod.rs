@@ -272,6 +272,16 @@ impl Harness {
             ViewCmd::SetNamespace(ns) => {
                 self.ctx.namespace = if ns == "-" { String::new() } else { ns };
             }
+            // The harness records what would run; in-process sessions use
+            // the kubectl argv they fall back to.
+            ViewCmd::Exec { fallback, env, .. } => self.suspends.push(Suspended {
+                argv: fallback,
+                env,
+            }),
+            ViewCmd::Edit { gvr, path, .. } => self.suspends.push(Suspended {
+                argv: vec!["<edit>".into(), gvr.to_string(), path],
+                env: Vec::new(),
+            }),
             ViewCmd::CloseDialog => {
                 self.dialogs.pop();
             }

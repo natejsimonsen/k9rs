@@ -182,9 +182,20 @@ pub(crate) fn exec_cmd(ctx: &Ctx, path: &str, co: &str, attach: bool, os: &str) 
         }
     }
     let what = if attach { "Attach" } else { "Shell" };
-    ViewCmd::Suspend {
-        argv,
+    // The remote command is what kubectl gets after `--`.
+    let command = match argv.iter().position(|a| a == "--") {
+        Some(i) if !attach => argv[i + 1..].to_vec(),
+        _ => Vec::new(),
+    };
+    ViewCmd::Exec {
+        ns: ns.to_string(),
+        pod: po.to_string(),
+        container: co.to_string(),
+        command,
+        attach,
         banner: shell_banner(path, co),
+        label: what.into(),
+        fallback: argv,
         env: ctx.accessor.shell_env(),
         on_done: Some(Box::new(move |_ctx, st| match exec_failure(&st) {
             Some(e) => vec![err(format!("{what} exec failed: {e}"))],
@@ -1720,17 +1731,10 @@ impl Browser {
         ) {
             return vec![err(format!("current user can't edit resource {gvr}"))];
         }
-        vec![ViewCmd::Suspend {
-            argv: ctx.accessor.edit_argv(&gvr, &path),
-            banner: String::new(),
-            env: ctx.accessor.shell_env(),
-            on_done: Some(Box::new(|_ctx, st| {
-                if st.success() {
-                    Vec::new()
-                } else {
-                    vec![err(format!("Edit command failed: {st}"))]
-                }
-            })),
+        vec![ViewCmd::Edit {
+            gvr,
+            path,
+            on_done: None,
         }]
     }
 
@@ -2648,11 +2652,21 @@ impl Browser {
                 }
             }
             let env = acc.shell_env();
+            let command = match argv.iter().position(|a| a == "--") {
+                Some(i) => argv[i + 1..].to_vec(),
+                None => Vec::new(),
+            };
             Ok(Msg::Cmds(vec![
                 ViewCmd::CloseDialog,
-                ViewCmd::Suspend {
-                    argv,
+                ViewCmd::Exec {
+                    ns: ns.to_string(),
+                    pod: po.to_string(),
+                    container: K9S_SHELL.into(),
+                    command,
+                    attach: false,
                     banner: shell_banner(&pod_path, K9S_SHELL),
+                    label: "Shell".into(),
+                    fallback: argv,
                     env,
                     on_done: Some(Box::new(move |ctx, _st| {
                         let acc = ctx.accessor.clone();

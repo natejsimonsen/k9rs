@@ -160,6 +160,29 @@ pub trait Accessor: Send + Sync {
     /// Build the argv used to shell out for an interactive exec (k9s shells to
     /// `kubectl exec`).
     fn exec_argv(&self, ns: &str, pod: &str, container: &str, shell: &str) -> Vec<String>;
+    /// In-process `pods/exec` (or `pods/attach` when `attach`) with a TTY, on
+    /// the already-authenticated client. `Err(TtyUnsupported)` means use kubectl.
+    async fn exec_tty(
+        &self,
+        _ns: &str,
+        _pod: &str,
+        _container: &str,
+        _command: Vec<String>,
+        _attach: bool,
+    ) -> Result<TtyProcess> {
+        Err(TtyUnsupported.into())
+    }
+    /// JSON merge patch (kubectl edit for unregistered types); API failures
+    /// come back as `ApiFailure`.
+    async fn patch_merge(
+        &self,
+        _gvr: &Gvr,
+        _path: &str,
+        _patch: &serde_json::Value,
+        _field_manager: &str,
+    ) -> Result<()> {
+        Err(anyhow::anyhow!("merge patch is not supported"))
+    }
     /// Build the argv used to shell out for `kubectl edit`.
     fn edit_argv(&self, gvr: &Gvr, path: &str) -> Vec<String>;
     /// Environment overrides (KUBECONFIG, etc.) for shell outs.
@@ -173,6 +196,50 @@ pub trait Accessor: Send + Sync {
 }
 
 /// Running port-forward; dropping it stops the forward.
+/// A connected TTY session (kube AttachedProcess parts).
+pub struct TtyProcess {
+    pub stdin: Box<dyn tokio::io::AsyncWrite + Send + Unpin>,
+    pub stdout: Box<dyn tokio::io::AsyncRead + Send + Unpin>,
+    /// Terminal size updates (width, height).
+    pub resize: Option<futures::channel::mpsc::Sender<kube::api::TerminalSize>>,
+    /// The remote command status once it ends.
+    pub status: futures::future::BoxFuture<
+        'static,
+        Option<k8s_openapi::apimachinery::pkg::apis::meta::v1::Status>,
+    >,
+}
+
+/// The accessor cannot run a TTY session in-process; fall back to kubectl.
+#[derive(Debug)]
+pub struct TtyUnsupported;
+
+impl std::fmt::Display for TtyUnsupported {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("in-process tty is not supported")
+    }
+}
+
+impl std::error::Error for TtyUnsupported {}
+
+/// An API server rejection (metav1.Status), kept structured for kubectl
+/// edit's retry header.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApiFailure {
+    pub code: u16,
+    pub reason: String,
+    pub message: String,
+    /// (field, message) from status.details.causes.
+    pub causes: Vec<(String, String)>,
+}
+
+impl std::fmt::Display for ApiFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ApiFailure {}
+
 /// Live drain output sink (k9s streams it into "Drain Progress").
 pub type DrainProgress = Arc<dyn Fn(&str) + Send + Sync>;
 
