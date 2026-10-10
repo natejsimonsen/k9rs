@@ -1441,7 +1441,15 @@ async fn apply_yaml_replaces() {
 
 #[tokio::test]
 async fn client_errors_are_kept_until_used() {
-    let cfg = LoadedConfig::from_kubeconfig(Kubeconfig::from_yaml(KC).unwrap(), Default::default());
+    // A real file: contexts() re-reads the kubeconfig from disk.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config");
+    std::fs::write(&path, KC).unwrap();
+    let cfg = LoadedConfig::load(ConnectOptions {
+        kubeconfig: Some(path.display().to_string()),
+        ..Default::default()
+    })
+    .unwrap();
     let acc = KubeAccessor::from_conn(Conn {
         clients: Err("auth error: token expired".into()),
         build_failed: false,
